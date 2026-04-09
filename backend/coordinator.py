@@ -115,10 +115,10 @@ class Coordinator:
                             },
                         }))
 
-        # 4. Evaluate entry signals — cooldown of 30 ticks after an exit
+        # 4. Evaluate entry signals — cooldown of 100 ticks (~2+ min) after exit
         if not self.paper_trader.has_position:
             ticks_since_exit = self._tick_count - self._last_exit_tick
-            if ticks_since_exit > 30:
+            if ticks_since_exit > 100:
                 self._evaluate_entry(symbol, state, features, regime)
 
         # 5. Broadcast to dashboard
@@ -209,6 +209,10 @@ class Coordinator:
     def _check_exits(self, state, features, regime: str) -> Optional[str]:
         pos = self.paper_trader.position
         if pos is None:
+            return None
+
+        # Must hold for at least 1 candle before any exit (except volatility spike)
+        if pos.candles_held < 1 and regime != "HIGH":
             return None
 
         current_price = self._get_exit_price(state)
