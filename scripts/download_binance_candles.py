@@ -16,38 +16,58 @@ from pathlib import Path
 
 import httpx
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+ENDPOINTS = [
+    "https://api.binance.us/api/v3/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api.binance.com/api/v3/klines",
+]
 SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
 LIMIT = 1000
 
 
+def _pick_endpoint() -> str:
+    for url in ENDPOINTS:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.get(url, params={"symbol": SYMBOL, "interval": INTERVAL, "limit": 1})
+                if r.status_code == 200:
+                    print(f"  Using endpoint: {url}")
+                    return url
+        except Exception:
+            continue
+    raise RuntimeError("All Binance endpoints blocked. Try a VPN or download CSVs from data.binance.vision.")
+
+
 def fetch_candles(start_ms: int, end_ms: int) -> list[list]:
-    """Fetch up to 1000 candles from Binance REST API."""
+    """Fetch up to 1000 candles per request, paginating until done."""
+    base_url = _pick_endpoint()
     all_candles = []
     current = start_ms
+    client = httpx.Client(timeout=30.0)
 
-    while current < end_ms:
-        params = {
-            "symbol": SYMBOL,
-            "interval": INTERVAL,
-            "startTime": current,
-            "endTime": end_ms,
-            "limit": LIMIT,
-        }
-
-        with httpx.Client(timeout=30.0) as client:
-            r = client.get(BINANCE_KLINES_URL, params=params)
+    try:
+        while current < end_ms:
+            params = {
+                "symbol": SYMBOL,
+                "interval": INTERVAL,
+                "startTime": current,
+                "endTime": end_ms,
+                "limit": LIMIT,
+            }
+            r = client.get(base_url, params=params)
             r.raise_for_status()
             data = r.json()
 
-        if not data:
-            break
+            if not data:
+                break
 
-        all_candles.extend(data)
-        current = int(data[-1][0]) + 1
-        print(f"  Fetched {len(all_candles)} candles so far...")
-        time.sleep(0.5)
+            all_candles.extend(data)
+            current = int(data[-1][0]) + 1
+            print(f"  Fetched {len(all_candles)} candles so far...")
+            time.sleep(0.4)
+    finally:
+        client.close()
 
     return all_candles
 

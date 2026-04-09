@@ -58,7 +58,7 @@ class SpotPriceClient:
             settings.spot.coinbase_ws_url,
             ping_interval=20,
             ping_timeout=10,
-            extra_headers={"User-Agent": "KBTC/1.0"},
+            additional_headers={"User-Agent": "KBTC/1.0"},
         ) as ws:
             await ws.send(
                 json.dumps(

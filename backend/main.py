@@ -18,6 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from coordinator import Coordinator
 
+import logging
+
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -28,7 +38,7 @@ structlog.configure(
         else structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(
-        structlog.get_level_from_name(settings.bot.log_level)
+        _LOG_LEVELS.get(settings.bot.log_level.upper(), logging.INFO)
     ),
 )
 
