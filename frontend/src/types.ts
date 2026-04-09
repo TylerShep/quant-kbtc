@@ -6,6 +6,7 @@ export interface MarketState {
   best_ask: number | null;
   mid: number | null;
   spread: number | null;
+  obi?: number | null;
   time_remaining_sec: number | null;
   volume: number | null;
 }

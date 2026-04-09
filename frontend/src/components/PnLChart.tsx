@@ -68,13 +68,23 @@ export function PnLChart({ data }: PnLChartProps) {
   }, []);
 
   useEffect(() => {
-    if (seriesRef.current && data.length > 0) {
-      const chartData = data.map((d) => ({
-        time: (d.time / 1000) as any,
-        value: d.value,
-      }));
+    if (!seriesRef.current || data.length === 0) return;
 
-      const isPositive = data[data.length - 1].value >= 0;
+    try {
+      const seen = new Set<number>();
+      const chartData = data
+        .filter((d) => {
+          const t = d.time;
+          if (seen.has(t)) return false;
+          seen.add(t);
+          return true;
+        })
+        .sort((a, b) => a.time - b.time)
+        .map((d) => ({ time: d.time as any, value: d.value }));
+
+      if (chartData.length === 0) return;
+
+      const isPositive = chartData[chartData.length - 1].value >= 0;
       seriesRef.current.applyOptions({
         lineColor: isPositive ? '#0ecb81' : '#f6465d',
         topColor: isPositive ? '#0ecb8133' : '#f6465d33',
@@ -82,6 +92,8 @@ export function PnLChart({ data }: PnLChartProps) {
       });
 
       seriesRef.current.setData(chartData);
+    } catch {
+      // lightweight-charts can throw on edge-case data; ignore
     }
   }, [data]);
 
