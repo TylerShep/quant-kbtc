@@ -16,5 +16,4 @@ services:
           memory: 512M
 
   db:
-    # In production, use DO Managed DB — remove this service
-    profiles: ["local-only"]
+    restart: always
