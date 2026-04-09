@@ -271,6 +271,12 @@ class DataManager:
                 cb(symbol, state)
             except Exception as e:
                 logger.error("data_manager.listener_error", error=str(e))
+                import asyncio
+                from notifications import get_notifier
+                asyncio.create_task(get_notifier().unhandled_exception(
+                    location="data_manager.listener",
+                    error=str(e),
+                ))
 
     async def _tick_loop(self):
         while True:

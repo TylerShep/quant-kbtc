@@ -61,6 +61,70 @@ export interface PaperTrade {
   exit_time: string;
 }
 
+export interface DBTrade {
+  timestamp: string;
+  ticker: string;
+  direction: string;
+  contracts: number;
+  entry_price: number | null;
+  exit_price: number | null;
+  pnl: number;
+  pnl_pct: number;
+  fees: number;
+  exit_reason: string;
+  conviction: string;
+  regime_at_entry: string;
+  candles_held: number;
+  closed_at: string | null;
+}
+
+export interface TradesResponse {
+  trades: DBTrade[];
+  total: number;
+  page: number;
+  per_page: number;
+  total_pages: number;
+}
+
+export interface ErroredTrade extends DBTrade {
+  error_reason: string;
+  flagged_at: string | null;
+}
+
+export interface ErroredTradesResponse {
+  trades: ErroredTrade[];
+  total: number;
+  page: number;
+  per_page: number;
+  total_pages: number;
+}
+
+export interface EquityPoint {
+  time: number;
+  bankroll: number;
+  peak_bankroll: number;
+  drawdown_pct: number;
+  daily_pnl: number;
+  trade_count: number;
+}
+
+export interface EquityResponse {
+  equity: EquityPoint[];
+}
+
+export interface CumulativeStats {
+  initial_bankroll: number;
+  total_trades: number;
+  total_pnl: number;
+  equity: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  best_trade: number;
+  worst_trade: number;
+  avg_pnl: number;
+}
+
 export interface PaperState {
   has_position: boolean;
   position: PaperPosition | null;

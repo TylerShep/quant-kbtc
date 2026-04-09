@@ -178,6 +178,7 @@ class KalshiWebSocketClient:
                 await self._subscribe(self._ws)
 
     async def _run_forever(self):
+        from notifications import get_notifier
         attempt = 0
         while self._running:
             try:
@@ -187,6 +188,12 @@ class KalshiWebSocketClient:
                 attempt += 1
                 wait = min(2**attempt, 60)
                 logger.warning("kalshi_ws.disconnected", error=str(e), retry_in=wait)
+                if attempt >= 3:
+                    asyncio.create_task(get_notifier().ws_disconnected(
+                        feed="Kalshi",
+                        error=str(e),
+                        attempt=attempt,
+                    ))
                 if self._running:
                     await asyncio.sleep(wait)
 

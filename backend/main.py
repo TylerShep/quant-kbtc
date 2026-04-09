@@ -5,6 +5,7 @@ Entry point: FastAPI app with lifespan managing all subsystems.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 
 import structlog
@@ -21,6 +22,7 @@ from fastapi.responses import FileResponse
 
 from config import settings
 from coordinator import Coordinator
+from notifications import init_notifier
 
 import logging
 
@@ -50,18 +52,140 @@ logger = structlog.get_logger(__name__)
 
 coordinator = Coordinator()
 
+_start_time: float = 0.0
+_heartbeat_task: asyncio.Task = None
+_summary_task: asyncio.Task = None
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    mins, s = divmod(s, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m")
+    return " ".join(parts)
+
+
+async def _heartbeat_loop(notifier):
+    """Send a heartbeat ping every 30 minutes."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            uptime = _format_uptime(time.monotonic() - _start_time)
+            state = coordinator.data_manager.states.get(settings.bot.market)
+            spot = state.spot_price if state else None
+            ticker = state.kalshi_ticker if state else None
+            await notifier.heartbeat_ping(
+                uptime_str=uptime,
+                spot_price=spot,
+                ticker=ticker,
+                has_position=coordinator.paper_trader.has_position,
+                bankroll=coordinator.position_sizer.bankroll,
+            )
+        except Exception as e:
+            logger.warning("heartbeat.failed", error=str(e))
+        await asyncio.sleep(1800)
+
+
+async def _periodic_summary_loop(notifier):
+    """Send a performance summary every 4 hours and a daily summary at midnight UTC."""
+    last_daily = -1
+    interval_hours = 4
+    await asyncio.sleep(300)
+    while True:
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+
+            # Daily summary at midnight UTC (hour 0)
+            if now.hour == 0 and last_daily != now.day:
+                last_daily = now.day
+                trades = coordinator.paper_trader.trades
+                today_trades = trades  # all trades since boot; refine once daily resets are in
+                wins = sum(1 for t in today_trades if t.pnl >= 0)
+                losses = len(today_trades) - wins
+                gross = sum(t.pnl for t in today_trades)
+                best = max((t.pnl for t in today_trades), default=0.0)
+                worst = min((t.pnl for t in today_trades), default=0.0)
+                await notifier.daily_summary(
+                    total_trades=len(today_trades),
+                    wins=wins,
+                    losses=losses,
+                    gross_pnl=gross,
+                    best_trade_pnl=best,
+                    worst_trade_pnl=worst,
+                    start_bankroll=coordinator.position_sizer.daily_start_bankroll,
+                    end_bankroll=coordinator.position_sizer.bankroll,
+                    peak_drawdown_pct=coordinator.position_sizer.current_drawdown,
+                )
+
+            # Periodic summary every N hours
+            if now.hour % interval_hours == 0 and now.minute < 5:
+                sizer = coordinator.position_sizer
+                trades = coordinator.paper_trader.trades
+                wins = sum(1 for t in trades if t.pnl >= 0)
+                losses = len(trades) - wins
+                net_pnl = sum(t.pnl for t in trades)
+                pos = coordinator.paper_trader.position
+                await notifier.periodic_summary(
+                    hours=interval_hours,
+                    trades_count=len(trades),
+                    wins=wins,
+                    losses=losses,
+                    net_pnl=net_pnl,
+                    bankroll=sizer.bankroll,
+                    drawdown_pct=sizer.current_drawdown,
+                    has_position=coordinator.paper_trader.has_position,
+                    position_ticker=pos.ticker if pos else None,
+                )
+        except Exception as e:
+            logger.warning("periodic_summary.failed", error=str(e))
+        await asyncio.sleep(300)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _start_time, _heartbeat_task, _summary_task
+    _start_time = time.monotonic()
+
     logger.info(
         "kbtc.starting",
         env=settings.bot.env,
         market=settings.bot.market,
         mode=settings.bot.trading_mode,
     )
+
+    notifier = init_notifier()
     await coordinator.start()
+
+    await notifier.bot_started(
+        market=settings.bot.market,
+        mode=settings.bot.trading_mode,
+        bankroll=settings.bot.initial_bankroll,
+    )
+
+    _heartbeat_task = asyncio.create_task(_heartbeat_loop(notifier))
+    _summary_task = asyncio.create_task(_periodic_summary_loop(notifier))
+
     yield
+
     logger.info("kbtc.shutting_down")
+
+    if _heartbeat_task:
+        _heartbeat_task.cancel()
+    if _summary_task:
+        _summary_task.cancel()
+
+    uptime = _format_uptime(time.monotonic() - _start_time)
+    await notifier.bot_stopped(
+        uptime_str=uptime,
+        bankroll=coordinator.position_sizer.bankroll,
+    )
     await coordinator.stop()
 
 

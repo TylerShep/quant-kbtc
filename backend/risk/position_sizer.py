@@ -40,6 +40,14 @@ class PositionSizer:
         self.trades_today.append(pnl)
         self.trades_this_week.append(pnl)
 
+    def reverse_trade(self, pnl: float):
+        """Undo a trade's effect on bankroll (used when quarantining errored trades)."""
+        self.bankroll -= pnl
+        if self.trades_today and self.trades_today[-1] == pnl:
+            self.trades_today.pop()
+        if self.trades_this_week and self.trades_this_week[-1] == pnl:
+            self.trades_this_week.pop()
+
     def reset_daily(self):
         self.daily_start_bankroll = self.bankroll
         self.trades_today = []

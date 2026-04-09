@@ -1,13 +1,14 @@
-import type { RiskState, PaperState, Features } from '../types';
+import type { RiskState, PaperState, Features, CumulativeStats } from '../types';
 
 interface SidebarProps {
   risk: RiskState | null;
   paper: PaperState | null;
   features: Features | null;
+  stats: CumulativeStats | null;
 }
 
-export function Sidebar({ risk, paper, features }: SidebarProps) {
-  const bankroll = risk?.bankroll ?? 0;
+export function Sidebar({ risk, paper, features, stats }: SidebarProps) {
+  const equity = stats?.equity ?? risk?.bankroll ?? 0;
   const drawdown = risk?.drawdown_pct ?? 0;
   const dailyLoss = risk?.daily_loss_pct ?? 0;
   const canTrade = risk?.can_trade ?? false;
@@ -18,12 +19,12 @@ export function Sidebar({ risk, paper, features }: SidebarProps) {
   const obiDirection = obi >= 0.65 ? 'LONG' : obi <= 0.35 ? 'SHORT' : 'NEUTRAL';
   const obiColor = obiDirection === 'LONG' ? 'var(--green)' : obiDirection === 'SHORT' ? 'var(--red)' : 'var(--text-muted)';
 
-  const unrealizedPnl = bankroll - (risk?.peak_bankroll ?? bankroll);
-  const roePct = risk?.peak_bankroll ? (unrealizedPnl / risk.peak_bankroll) * 100 : 0;
+  const totalPnl = stats?.total_pnl ?? 0;
+  const winRate = stats?.win_rate ?? 0;
 
   return (
     <aside className="w-56 border-r border-[var(--border)] bg-[var(--bg-secondary)] flex flex-col p-3 gap-4 overflow-y-auto">
-      <StatBlock label="Equity" value={`$${bankroll.toLocaleString('en-US', { minimumFractionDigits: 2 })}`} />
+      <StatBlock label="Equity" value={`$${equity.toLocaleString('en-US', { minimumFractionDigits: 2 })}`} />
 
       <div>
         <div className="flex justify-between text-xs mb-1">
@@ -51,18 +52,15 @@ export function Sidebar({ risk, paper, features }: SidebarProps) {
       </div>
 
       <div>
-        <div className="text-xs text-[var(--text-muted)] mb-1">Unrealized PnL</div>
+        <div className="text-xs text-[var(--text-muted)] mb-1">Cumulative PnL</div>
         <div
           className="text-lg font-semibold"
-          style={{ color: unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)' }}
+          style={{ color: totalPnl >= 0 ? 'var(--green)' : 'var(--red)' }}
         >
-          ${unrealizedPnl.toFixed(2)}
+          {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
         </div>
-        <div
-          className="text-xs"
-          style={{ color: roePct >= 0 ? 'var(--green)' : 'var(--red)' }}
-        >
-          {roePct >= 0 ? '+' : ''}{roePct.toFixed(2)}% ROE
+        <div className="text-xs text-[var(--text-muted)]">
+          Win Rate: {(winRate * 100).toFixed(1)}%
         </div>
       </div>
 
@@ -71,7 +69,7 @@ export function Sidebar({ risk, paper, features }: SidebarProps) {
       <StatBlock label="Drawdown" value={`${drawdown.toFixed(2)}%`} color={drawdown > 10 ? 'var(--red)' : 'var(--text-primary)'} />
       <StatBlock label="Daily Loss" value={`${dailyLoss.toFixed(2)}%`} color={dailyLoss > 4 ? 'var(--red)' : 'var(--text-primary)'} />
       <StatBlock label="Trades Today" value={String(risk?.trades_today ?? 0)} />
-      <StatBlock label="Total Trades" value={String(paper?.total_trades ?? 0)} />
+      <StatBlock label="Total Trades" value={String(stats?.total_trades ?? paper?.total_trades ?? 0)} />
 
       <div className="mt-auto">
         <div

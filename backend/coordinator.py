@@ -24,6 +24,7 @@ from risk.circuit_breaker import CircuitBreaker
 from execution.paper_trader import PaperTrader
 from api.ws import ws_manager
 from database import get_pool, close_pool
+from notifications import get_notifier
 
 logger = structlog.get_logger(__name__)
 
@@ -44,14 +45,20 @@ class Coordinator:
         self._tick_count = 0
         self._last_decision = None
         self._last_exit_tick = -999
+        self._last_regime: Optional[str] = None
+        self._cb_was_halted = False
+        self._recent_exit_times: list[float] = []
+        self._rapid_fire_count = 0
 
     async def start(self):
         self._pool = await get_pool()
+        await self._restore_state()
         self.data_manager.add_listener(self._on_market_update)
         await self.data_manager.start()
         logger.info("coordinator.started")
 
     async def stop(self):
+        await self._save_state()
         await self.data_manager.stop()
         await close_pool()
         logger.info("coordinator.stopped")
@@ -76,13 +83,27 @@ class Coordinator:
 
         # 2. On candle close: update ATR regime
         if completed_candle:
+            old_regime = self.atr_filter.current_regime
             self.atr_filter.update(
                 completed_candle.high,
                 completed_candle.low,
                 completed_candle.close,
             )
+            new_regime = self.atr_filter.current_regime
             if self.paper_trader.has_position:
                 self.paper_trader.position.candles_held += 1
+
+            if self._last_regime is not None and new_regime != old_regime:
+                atr_val = (
+                    sum(self.atr_filter.atr_pct_history) / len(self.atr_filter.atr_pct_history)
+                    if self.atr_filter.atr_pct_history else None
+                )
+                asyncio.create_task(get_notifier().atr_regime_changed(
+                    old_regime=old_regime,
+                    new_regime=new_regime,
+                    atr_value=atr_val,
+                ))
+            self._last_regime = new_regime
 
             logger.info(
                 "candle.closed",
@@ -90,7 +111,7 @@ class Coordinator:
                 h=round(completed_candle.high, 2),
                 l=round(completed_candle.low, 2),
                 c=round(completed_candle.close, 2),
-                regime=self.atr_filter.current_regime,
+                regime=new_regime,
             )
 
         # 3. Check exits on every tick (not just candle close)
@@ -104,6 +125,8 @@ class Coordinator:
                     if trade:
                         self._last_exit_tick = self._tick_count
                         asyncio.create_task(self._persist_trade(trade))
+                        asyncio.create_task(self._persist_equity())
+                        asyncio.create_task(self._save_state())
                         asyncio.create_task(ws_manager.broadcast({
                             "type": "trade_exit",
                             "symbol": symbol,
@@ -114,6 +137,18 @@ class Coordinator:
                                 "exit_reason": trade.exit_reason,
                             },
                         }))
+                        asyncio.create_task(get_notifier().trade_closed(
+                            ticker=trade.ticker,
+                            direction=trade.direction,
+                            contracts=trade.contracts,
+                            entry_price=trade.entry_price,
+                            exit_price=trade.exit_price,
+                            pnl=trade.pnl,
+                            pnl_pct=trade.pnl_pct,
+                            exit_reason=trade.exit_reason,
+                            candles_held=trade.candles_held,
+                            bankroll=self.position_sizer.bankroll,
+                        ))
 
         # 4. Evaluate entry signals — cooldown of 100 ticks (~2+ min) after exit
         if not self.paper_trader.has_position:
@@ -136,8 +171,30 @@ class Coordinator:
         if self._tick_count % 10 == 0 and self._pool is not None:
             asyncio.create_task(self._persist_snapshot(symbol, state, features))
 
+        # 7. Persist equity snapshot every ~60 ticks and save state every ~300 ticks
+        if self._tick_count % 60 == 0 and self._pool is not None:
+            asyncio.create_task(self._persist_equity())
+        if self._tick_count % 300 == 0 and self._pool is not None:
+            asyncio.create_task(self._save_state())
+
     def _evaluate_entry(self, symbol: str, state, features, regime: str) -> None:
         can_trade, halt_reason = self.circuit_breaker.can_trade()
+
+        if not can_trade and not self._cb_was_halted:
+            self._cb_was_halted = True
+            sizer = self.position_sizer
+            asyncio.create_task(get_notifier().circuit_breaker_tripped(
+                reason=halt_reason or "UNKNOWN",
+                daily_loss_pct=sizer.daily_loss,
+                weekly_loss_pct=sizer.weekly_loss,
+                drawdown_pct=sizer.current_drawdown,
+                bankroll=sizer.bankroll,
+            ))
+        elif can_trade and self._cb_was_halted:
+            self._cb_was_halted = False
+            asyncio.create_task(get_notifier().circuit_breaker_cleared(
+                bankroll=self.position_sizer.bankroll,
+            ))
 
         obi_history = self.feature_engine.obi_history(symbol)
         total_vol = features.total_bid_vol + features.total_ask_vol
@@ -201,6 +258,21 @@ class Coordinator:
                             "conviction": pos.conviction,
                         },
                     }))
+                    asyncio.create_task(get_notifier().trade_opened(
+                        ticker=pos.ticker,
+                        direction=pos.direction,
+                        contracts=pos.contracts,
+                        entry_price=pos.entry_price,
+                        conviction=pos.conviction,
+                        obi=features.obi,
+                        roc=roc_val,
+                    ))
+                else:
+                    asyncio.create_task(get_notifier().position_sizing_failed(
+                        size_dollars=self.position_sizer.calculate_size(decision.conviction.value),
+                        price=entry_price,
+                        bankroll=self.position_sizer.bankroll,
+                    ))
         elif decision.skip_reason and self._tick_count % 60 == 0:
             asyncio.create_task(self._persist_signal(
                 state, features, decision, decision.skip_reason
@@ -306,12 +378,67 @@ class Coordinator:
                 )
         except Exception as e:
             logger.error("coordinator.persist_failed", error=str(e))
+            asyncio.create_task(get_notifier().db_error("persist_snapshot", str(e)))
+
+    def _detect_rapid_fire(self) -> bool:
+        """Returns True if we're in a rapid-fire loop (3+ exits in 60s)."""
+        now = time.time()
+        self._recent_exit_times = [t for t in self._recent_exit_times if now - t < 60]
+        self._recent_exit_times.append(now)
+        if len(self._recent_exit_times) >= 3:
+            self._rapid_fire_count += 1
+            return True
+        self._rapid_fire_count = 0
+        return False
 
     async def _persist_trade(self, trade) -> None:
         try:
             pool = self._pool
             if pool is None:
                 return
+
+            is_rapid = self._detect_rapid_fire()
+            error_reason = None
+            if is_rapid:
+                error_reason = "RAPID_FIRE_LOOP"
+            elif trade.candles_held == 0 and trade.exit_reason == "STOP_LOSS":
+                error_reason = "INSTANT_STOP_LOSS"
+
+            if error_reason:
+                self.position_sizer.reverse_trade(trade.pnl)
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO errored_trades
+                           (timestamp, ticker, direction, side, contracts, entry_price,
+                            exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
+                            regime_at_entry, candles_held, entry_obi, entry_roc,
+                            closed_at, error_reason, flagged_at)
+                           VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW())""",
+                        (
+                            trade.ticker, trade.direction,
+                            "yes" if trade.direction == "long" else "no",
+                            trade.contracts, trade.entry_price, trade.exit_price,
+                            trade.pnl, trade.pnl_pct, trade.fees, trade.exit_reason,
+                            trade.conviction, trade.regime_at_entry, trade.candles_held,
+                            0.0, 0.0, error_reason,
+                        ),
+                    )
+                logger.warning(
+                    "coordinator.trade_quarantined",
+                    ticker=trade.ticker,
+                    reason=error_reason,
+                    pnl=trade.pnl,
+                    rapid_count=self._rapid_fire_count,
+                )
+                asyncio.create_task(get_notifier().trade_quarantined(
+                    ticker=trade.ticker,
+                    direction=trade.direction,
+                    pnl=trade.pnl,
+                    error_reason=error_reason,
+                    rapid_count=self._rapid_fire_count,
+                ))
+                return
+
             async with pool.connection() as conn:
                 await conn.execute(
                     """INSERT INTO trades
@@ -330,6 +457,7 @@ class Coordinator:
                 )
         except Exception as e:
             logger.error("coordinator.persist_trade_failed", error=str(e))
+            asyncio.create_task(get_notifier().db_error("persist_trade", str(e)))
 
     async def _persist_signal(self, state, features, decision, action: str) -> None:
         try:
@@ -356,6 +484,84 @@ class Coordinator:
                 )
         except Exception as e:
             logger.error("coordinator.persist_signal_failed", error=str(e))
+            asyncio.create_task(get_notifier().db_error("persist_signal", str(e)))
+
+    async def _persist_equity(self) -> None:
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            sizer = self.position_sizer
+            async with pool.connection() as conn:
+                await conn.execute(
+                    """INSERT INTO bankroll_history
+                       (timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count)
+                       VALUES (NOW(), %s, %s, %s, %s, %s)""",
+                    (
+                        sizer.bankroll,
+                        sizer.peak_bankroll,
+                        round(sizer.current_drawdown * 100, 4),
+                        round(sum(sizer.trades_today), 4),
+                        len(self.paper_trader.trades),
+                    ),
+                )
+        except Exception as e:
+            logger.error("coordinator.persist_equity_failed", error=str(e))
+
+    async def _save_state(self) -> None:
+        """Persist bankroll state to bot_state table for recovery after restart."""
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            import json
+            state = {
+                "bankroll": self.position_sizer.bankroll,
+                "peak_bankroll": self.position_sizer.peak_bankroll,
+                "daily_start_bankroll": self.position_sizer.daily_start_bankroll,
+                "weekly_start_bankroll": self.position_sizer.weekly_start_bankroll,
+            }
+            async with pool.connection() as conn:
+                await conn.execute(
+                    """INSERT INTO bot_state (key, value, updated_at)
+                       VALUES ('sizer_state', %s::jsonb, NOW())
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                    (json.dumps(state),),
+                )
+            logger.info("coordinator.state_saved", bankroll=state["bankroll"])
+        except Exception as e:
+            logger.error("coordinator.save_state_failed", error=str(e))
+
+    async def _restore_state(self) -> None:
+        """Restore bankroll from bot_state, or reconstruct from trade history."""
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            import json
+            async with pool.connection() as conn:
+                row = await conn.execute(
+                    "SELECT value FROM bot_state WHERE key = 'sizer_state'"
+                )
+                result = await row.fetchone()
+
+            if result:
+                state = result[0] if isinstance(result[0], dict) else json.loads(result[0])
+                self.position_sizer.bankroll = state.get("bankroll", settings.bot.initial_bankroll)
+                self.position_sizer.peak_bankroll = state.get("peak_bankroll", self.position_sizer.bankroll)
+                self.position_sizer.daily_start_bankroll = state.get("daily_start_bankroll", self.position_sizer.bankroll)
+                self.position_sizer.weekly_start_bankroll = state.get("weekly_start_bankroll", self.position_sizer.bankroll)
+                logger.info("coordinator.state_restored", bankroll=self.position_sizer.bankroll)
+            else:
+                async with pool.connection() as conn:
+                    row = await conn.execute("SELECT COALESCE(SUM(pnl), 0) FROM trades")
+                    total_pnl = float((await row.fetchone())[0])
+                if total_pnl != 0:
+                    self.position_sizer.bankroll = settings.bot.initial_bankroll + total_pnl
+                    self.position_sizer.peak_bankroll = max(self.position_sizer.bankroll, settings.bot.initial_bankroll)
+                    logger.info("coordinator.state_reconstructed", bankroll=self.position_sizer.bankroll, total_pnl=total_pnl)
+        except Exception as e:
+            logger.warning("coordinator.restore_state_failed", error=str(e))
 
 
 def _serialize_state(state) -> dict:

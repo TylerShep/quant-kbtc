@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS pipeline_health (
 );
 SELECT create_hypertable('pipeline_health', 'timestamp', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);
 
+-- Errored trades (quarantined from main trades table)
+CREATE TABLE IF NOT EXISTS errored_trades (LIKE trades INCLUDING ALL);
+ALTER TABLE errored_trades ADD COLUMN IF NOT EXISTS error_reason VARCHAR(100);
+ALTER TABLE errored_trades ADD COLUMN IF NOT EXISTS flagged_at TIMESTAMPTZ DEFAULT NOW();
+
 -- Bot state (key-value for heartbeat, bankroll persistence, etc.)
 CREATE TABLE IF NOT EXISTS bot_state (
     key             VARCHAR(60)     PRIMARY KEY,

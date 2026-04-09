@@ -37,6 +37,7 @@ class SpotPriceClient:
         return self._latest.get(symbol.upper())
 
     async def _run_forever(self):
+        from notifications import get_notifier
         attempt = 0
         while self._running:
             try:
@@ -46,6 +47,12 @@ class SpotPriceClient:
                 attempt += 1
                 wait = min(2**attempt, 60)
                 logger.warning("spot_client.disconnected", error=str(e), retry_in=wait)
+                if attempt >= 3:
+                    asyncio.create_task(get_notifier().ws_disconnected(
+                        feed="Coinbase",
+                        error=str(e),
+                        attempt=attempt,
+                    ))
                 if self._running:
                     await asyncio.sleep(wait)
 

@@ -136,7 +136,10 @@ class BotConfig:
     trading_mode: str = field(default_factory=lambda: _env("TRADING_MODE", "paper"))
     initial_bankroll: float = field(default_factory=lambda: _env_float("INITIAL_BANKROLL", 1000.0))
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
-    alert_webhook_url: str = field(default_factory=lambda: _env("ALERT_WEBHOOK_URL"))
+    discord_trades_webhook: str = field(default_factory=lambda: _env("DISCORD_TRADES_WEBHOOK"))
+    discord_risk_webhook: str = field(default_factory=lambda: _env("DISCORD_RISK_WEBHOOK"))
+    discord_heartbeat_webhook: str = field(default_factory=lambda: _env("DISCORD_HEARTBEAT_WEBHOOK"))
+    discord_errors_webhook: str = field(default_factory=lambda: _env("DISCORD_ERRORS_WEBHOOK"))
     cors_origins: str = field(
         default_factory=lambda: _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
     )
