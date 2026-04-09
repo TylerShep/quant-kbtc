@@ -34,13 +34,13 @@ CREATE TABLE IF NOT EXISTS signal_log (
     timestamp       TIMESTAMPTZ     NOT NULL,
     ticker          VARCHAR(60),
     obi_value       NUMERIC(6,4),
-    obi_direction   VARCHAR(10),
+    obi_direction   VARCHAR(20),
     roc_value       NUMERIC(10,4),
-    roc_direction   VARCHAR(10),
-    atr_regime      VARCHAR(10),
-    decision        VARCHAR(10),
-    conviction      VARCHAR(10),
-    skip_reason     VARCHAR(40),
+    roc_direction   VARCHAR(20),
+    atr_regime      VARCHAR(20),
+    decision        VARCHAR(40),
+    conviction      VARCHAR(20),
+    skip_reason     VARCHAR(60),
     size_mult       NUMERIC(4,2)
 );
 SELECT create_hypertable('signal_log', 'timestamp', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);

@@ -43,6 +43,7 @@ class Coordinator:
         self._pool = None
         self._tick_count = 0
         self._last_decision = None
+        self._last_exit_tick = -999
 
     async def start(self):
         self._pool = await get_pool()
@@ -101,6 +102,7 @@ class Coordinator:
                 if exit_price is not None:
                     trade = self.paper_trader.exit(exit_price, exit_reason)
                     if trade:
+                        self._last_exit_tick = self._tick_count
                         asyncio.create_task(self._persist_trade(trade))
                         asyncio.create_task(ws_manager.broadcast({
                             "type": "trade_exit",
@@ -113,9 +115,11 @@ class Coordinator:
                             },
                         }))
 
-        # 4. Evaluate entry signals on every tick
+        # 4. Evaluate entry signals — cooldown of 30 ticks after an exit
         if not self.paper_trader.has_position:
-            self._evaluate_entry(symbol, state, features, regime)
+            ticks_since_exit = self._tick_count - self._last_exit_tick
+            if ticks_since_exit > 30:
+                self._evaluate_entry(symbol, state, features, regime)
 
         # 5. Broadcast to dashboard
         asyncio.create_task(
@@ -212,7 +216,9 @@ class Coordinator:
             return None
 
         d = 1 if pos.direction == "long" else -1
-        pnl_pct = d * (current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+        pnl_per_contract = d * (current_price - pos.entry_price) / 100
+        notional = pos.contracts * pos.entry_price / 100
+        pnl_pct = (pnl_per_contract * pos.contracts) / notional if notional > 0 else 0
 
         exit_reason = check_obi_exit(
             direction=pos.direction,
