@@ -23,6 +23,9 @@ rsync -avz --progress \
     --exclude='.cursor' \
     . "${REMOTE}:${PROJECT_DIR}/"
 
+echo "=== Fixing ports for production ==="
+ssh "${REMOTE}" "cd ${PROJECT_DIR} && sed -i 's/\"5433:5432\"/\"5432:5432\"/' docker-compose.yml && sed -i 's/\"8001:8000\"/\"8000:8000\"/' docker-compose.yml"
+
 echo "=== Building and restarting on remote ==="
 ssh "${REMOTE}" "cd ${PROJECT_DIR} && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build"
 
