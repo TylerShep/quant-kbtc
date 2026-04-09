@@ -12,8 +12,12 @@ import uvloop
 
 uvloop.install()
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from config import settings
 from coordinator import Coordinator
@@ -82,6 +86,18 @@ app.include_router(api_router, prefix="/api")
 app.include_router(ws_router, prefix="/api")
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "kbtc"}
+FRONTEND_DIR = Path(__file__).parent / "static"
+
+if FRONTEND_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="static-assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        file_path = FRONTEND_DIR / full_path
+        if full_path and file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(FRONTEND_DIR / "index.html")
+else:
+    @app.get("/")
+    async def root():
+        return {"status": "ok", "service": "kbtc"}
