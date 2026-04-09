@@ -216,7 +216,6 @@ class DataManager:
             state.volume = data.get("volume", state.volume)
             if data.get("close_time"):
                 try:
-                    from datetime import datetime
                     state.expiry_time = datetime.fromisoformat(
                         data["close_time"].replace("Z", "+00:00")
                     )

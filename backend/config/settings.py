@@ -37,13 +37,13 @@ class KalshiConfig:
     @property
     def base_url(self) -> str:
         if self.env == "prod":
-            return "https://trading-api.kalshi.com/trade-api/v2"
+            return "https://api.elections.kalshi.com/trade-api/v2"
         return "https://demo-api.kalshi.co/trade-api/v2"
 
     @property
     def ws_url(self) -> str:
         if self.env == "prod":
-            return "wss://trading-api.kalshi.com/trade-api/ws/v2"
+            return "wss://api.elections.kalshi.com/trade-api/ws/v2"
         return "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 

@@ -4,7 +4,7 @@ set -euo pipefail
 # Deploy KBTC bot to DigitalOcean droplet
 # Usage: ./scripts/deploy.sh [user@host]
 
-REMOTE="${1:-botuser@your-droplet-ip}"
+REMOTE="${1:-botuser@64.23.133.157}"
 PROJECT_DIR="/home/botuser/kbtc"
 
 echo "=== Deploying KBTC to ${REMOTE} ==="

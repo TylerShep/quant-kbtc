@@ -108,9 +108,14 @@ CREATE TABLE IF NOT EXISTS bot_state (
     updated_at      TIMESTAMPTZ     DEFAULT NOW()
 );
 
--- Compression policies (ob_snapshots and latency compress after 7 days)
+-- Enable compression on hypertables then add policies
+ALTER TABLE ob_snapshots SET (timescaledb.compress, timescaledb.compress_segmentby = 'ticker');
 SELECT add_compression_policy('ob_snapshots', INTERVAL '7 days', if_not_exists => TRUE);
+
+ALTER TABLE latency_metrics SET (timescaledb.compress, timescaledb.compress_segmentby = 'operation');
 SELECT add_compression_policy('latency_metrics', INTERVAL '3 days', if_not_exists => TRUE);
+
+ALTER TABLE pipeline_health SET (timescaledb.compress, timescaledb.compress_segmentby = 'source');
 SELECT add_compression_policy('pipeline_health', INTERVAL '14 days', if_not_exists => TRUE);
 
 -- Retention policies (latency and pipeline health kept 90 days)
