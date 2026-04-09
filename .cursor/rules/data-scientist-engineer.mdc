@@ -1,0 +1,205 @@
+---
+name: data-scientist-engineer
+description: Role context for the Data Scientist/Engineer on the Kalshi BTC 15min trading bot. Use this skill when building data ingestion pipelines, cleaning and validating historical data, managing data storage schemas, building feature stores, or sourcing alternative datasets for signal research.
+---
+
+# Data Scientist / Engineer (DS/DE)
+
+## Role Purpose
+The DS/DE owns all data — from raw ingestion to clean, validated, research-ready datasets. Without reliable data, OBI and ROC signals are meaningless. This role ensures the pipeline is complete, accurate, and queryable by both QR (research) and QD (live signals).
+
+## Primary Responsibilities
+- Ingest and store real-time and historical BTC OHLCV + order book data
+- Clean, validate, and normalize datasets for research and backtesting
+- Build and maintain the feature store used by ML Quant models
+- Source and evaluate alternative data (external BTC feeds, on-chain data)
+- Maintain data quality metrics and alert on ingestion failures
+- Own the database schema for candles, order book snapshots, and trade logs
+
+## Data Architecture Overview
+```
+External Sources              Internal Pipeline              Consumers
+─────────────────          ─────────────────────────       ──────────────
+Kalshi WebSocket ──────→  WebSocket Collector              Bot (live)
+                          (real-time OB + trades)
+                                   ↓
+Binance REST API ──────→  Candle Collector         →  TimescaleDB  →  QR Backtest
+                          (15min OHLCV, external)                     QD Signals
+                                   ↓                                  ML Training
+Coinbase REST ──────────→ Candle Normalizer        →  Feature Store → ML Inference
+                          (dedup, validate, align)
+                                   ↓
+On-chain (optional) ────→ Alt Data Collector       →  research/alt_data/
+```
+
+## Data Collection: Kalshi Order Book
+```python
+# data/collectors/kalshi_ob_collector.py
+import asyncio, json, time
+from kalshi.websocket import OrderBookStream
+from data.storage.db import insert_ob_snapshot
+
+class KalshiOBCollector:
+    def __init__(self, ticker: str, snapshot_interval_sec: int = 30):
+        self.ticker = ticker
+        self.interval = snapshot_interval_sec
+        self.last_snapshot_time = 0
+
+    async def on_book_update(self, book: dict):
+        """Save a snapshot every N seconds, not every tick."""
+        now = time.time()
+        if now - self.last_snapshot_time >= self.interval:
+            await insert_ob_snapshot({
+                "ticker":    self.ticker,
+                "timestamp": now,
+                "bids":      json.dumps(book["bids"][:10]),
+                "asks":      json.dumps(book["asks"][:10]),
+                "obi":       self._calc_obi(book),
+            })
+            self.last_snapshot_time = now
+
+    def _calc_obi(self, book):
+        bid_vol = sum(b["size"] for b in book["bids"][:10])
+        ask_vol = sum(a["size"] for a in book["asks"][:10])
+        return bid_vol / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0.5
+```
+
+## Data Collection: External BTC Candles
+```python
+# data/collectors/btc_candle_collector.py
+# Pull 15min OHLCV from Binance as reference price feed
+
+import requests
+
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+
+def fetch_btc_candles(symbol="BTCUSDT", interval="15m", limit=500) -> list[dict]:
+    resp = requests.get(BINANCE_URL, params={
+        "symbol":   symbol,
+        "interval": interval,
+        "limit":    limit,
+    }, timeout=10)
+    resp.raise_for_status()
+    return [
+        {
+            "timestamp":  row[0],
+            "open":       float(row[1]),
+            "high":       float(row[2]),
+            "low":        float(row[3]),
+            "close":      float(row[4]),
+            "volume":     float(row[5]),
+            "source":     "binance",
+        }
+        for row in resp.json()
+    ]
+```
+
+## Database Schema (TimescaleDB / PostgreSQL)
+```sql
+-- Candles table (hypertable for time-series efficiency)
+CREATE TABLE candles (
+    timestamp   TIMESTAMPTZ NOT NULL,
+    source      VARCHAR(20) NOT NULL,   -- 'binance', 'coinbase', 'kalshi'
+    symbol      VARCHAR(20) NOT NULL,
+    open        DECIMAL(12,4),
+    high        DECIMAL(12,4),
+    low         DECIMAL(12,4),
+    close       DECIMAL(12,4),
+    volume      DECIMAL(20,4),
+    PRIMARY KEY (timestamp, source, symbol)
+);
+SELECT create_hypertable('candles', 'timestamp');
+
+-- Order book snapshots
+CREATE TABLE ob_snapshots (
+    id          BIGSERIAL PRIMARY KEY,
+    timestamp   TIMESTAMPTZ NOT NULL,
+    ticker      VARCHAR(50) NOT NULL,
+    bids        JSONB,       -- top 10 levels
+    asks        JSONB,
+    obi         DECIMAL(6,4),
+    book_volume DECIMAL(20,4)
+);
+SELECT create_hypertable('ob_snapshots', 'timestamp');
+CREATE INDEX ON ob_snapshots (ticker, timestamp DESC);
+
+-- Feature store (pre-computed features for ML)
+CREATE TABLE features (
+    timestamp           TIMESTAMPTZ NOT NULL,
+    ticker              VARCHAR(50),
+    obi                 DECIMAL(6,4),
+    roc_3               DECIMAL(8,4),
+    roc_5               DECIMAL(8,4),
+    roc_10              DECIMAL(8,4),
+    atr_14_pct          DECIMAL(8,4),
+    volume_ratio_5      DECIMAL(8,4),
+    green_candles_3     SMALLINT,
+    spread_pct          DECIMAL(8,6),
+    bid_top3_ratio      DECIMAL(6,4),
+    ask_top3_ratio      DECIMAL(6,4),
+    label               SMALLINT,     -- -1, 0, 1 (set after outcome is known)
+    PRIMARY KEY (timestamp, ticker)
+);
+SELECT create_hypertable('features', 'timestamp');
+```
+
+## Data Validation Pipeline
+```python
+class DataValidator:
+    """Run after every ingestion batch to catch quality issues early."""
+
+    def validate_candles(self, candles: list[dict]) -> list[str]:
+        errors = []
+        for i, c in enumerate(candles):
+            if c["high"] < c["low"]:
+                errors.append(f"Row {i}: high < low ({c['high']} < {c['low']})")
+            if c["close"] < 0 or c["open"] < 0:
+                errors.append(f"Row {i}: negative price")
+            if c["volume"] < 0:
+                errors.append(f"Row {i}: negative volume")
+            # Gap detection
+            if i > 0:
+                gap_sec = (c["timestamp"] - candles[i-1]["timestamp"]) / 1000
+                if gap_sec > 900 * 2:   # Missing candles (> 2 intervals)
+                    errors.append(f"Row {i}: gap of {gap_sec/60:.1f} minutes")
+        return errors
+
+    def validate_ob_snapshot(self, ob: dict) -> list[str]:
+        errors = []
+        if not ob["bids"] or not ob["asks"]:
+            errors.append("Empty order book")
+        if ob["bids"][0]["price"] >= ob["asks"][0]["price"]:
+            errors.append("Crossed book: best bid >= best ask")
+        total_vol = sum(b["size"] for b in ob["bids"]) + sum(a["size"] for a in ob["asks"])
+        if total_vol < 100:
+            errors.append(f"Suspiciously thin book: total volume = {total_vol}")
+        return errors
+```
+
+## Data Quality Metrics (Tracked Daily)
+```python
+DAILY_DATA_HEALTH = {
+    "candle_completeness_pct":    ...,   # % of expected 15min slots with data
+    "ob_snapshot_count":          ...,   # Snapshots collected today
+    "avg_ob_staleness_sec":       ...,   # How fresh are snapshots
+    "validation_errors_today":    ...,   # Count of validation failures
+    "gap_events_today":           ...,   # Missing candle gaps detected
+    "feature_store_lag_min":      ...,   # How far behind is the feature store
+}
+```
+
+## Data Retention Policy
+```
+ob_snapshots:    Keep 90 days full resolution, then aggregate to 1-hour summaries
+candles (15min): Keep indefinitely — small footprint, high research value
+features:        Keep indefinitely — pre-computed for training efficiency
+trade_logs:      Keep indefinitely — compliance and backtesting
+raw_websocket:   Keep 7 days — too large to store longer
+```
+
+## Guardrails
+- Never delete historical data without a written retention policy decision
+- Always validate data before writing to feature store — garbage in = garbage model
+- External price feeds (Binance/Coinbase) are supplementary — Kalshi data is primary
+- All data collection failures must alert immediately — silent failure is the worst failure
+- Timestamps must always be stored in UTC — no local time in database

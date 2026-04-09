@@ -1,0 +1,180 @@
+---
+name: multi-market-expansion
+description: Rules and process for expanding the Kalshi trading bot from BTC-only to additional markets (ETH, other Kalshi prediction markets). Use this skill when evaluating whether to add a new market, validating signals on new market data, managing correlated risk across markets, or designing the capital allocation framework for a multi-market bot.
+---
+
+# Multi-Market Expansion
+
+## Role Purpose
+Defines when and how to expand from the initial BTC-only bot to additional markets (starting with ETH), without cannibalizing capital, creating correlated blow-up risk, or diluting attention before the BTC strategy is proven. Expansion is a reward for sustained BTC profitability — not a hedge against it.
+
+## Expansion Prerequisites (Must Clear ALL Before Adding Any Market)
+```python
+EXPANSION_GATES = {
+    # BTC bot must be mature and proven
+    "btc_live_weeks":           12,     # 3 months of live BTC trading
+    "btc_deployment_stage":     "standard",  # At 50%+ bankroll deployment
+    "btc_rolling_sharpe_90d":   1.0,    # 90-day live Sharpe > 1.0
+    "btc_max_drawdown_live":    0.15,   # No more than 15% drawdown in live period
+
+    # New market must be independently validated
+    "new_market_oos_sharpe":    1.0,    # OOS backtest Sharpe on new market
+    "new_market_oos_trades":    200,    # Minimum OOS trades for significance
+    "new_market_paper_weeks":   4,      # Paper trading on new market before live
+
+    # Combined risk must stay within limits
+    "max_combined_exposure":    0.15,   # BTC + ETH combined never > 15% at risk
+    "max_correlated_positions": 1,      # Never long BTC and long ETH simultaneously
+}
+
+def can_expand(btc_live_stats: dict, new_market_backtest: dict) -> tuple[bool, list[str]]:
+    failures = []
+    for gate, threshold in EXPANSION_GATES.items():
+        if gate.startswith("btc_") and btc_live_stats.get(gate.replace("btc_","")) < threshold:
+            failures.append(f"BTC gate not met: {gate} = {btc_live_stats.get(gate.replace('btc_',''))} < {threshold}")
+        if gate.startswith("new_market_") and new_market_backtest.get(gate.replace("new_market_","")) < threshold:
+            failures.append(f"New market gate not met: {gate}")
+    return len(failures) == 0, failures
+```
+
+## Market Correlation Analysis
+```python
+import numpy as np
+from scipy import stats
+
+def analyze_market_correlation(btc_returns: list, eth_returns: list) -> dict:
+    """
+    Compute correlation between BTC and ETH trade returns.
+    High correlation means adding ETH adds risk, not diversification.
+    Target: correlation < 0.5 for meaningful diversification benefit.
+    """
+    corr, p = stats.pearsonr(btc_returns, eth_returns)
+    return {
+        "pearson_correlation": round(corr, 3),
+        "p_value":             round(p, 4),
+        "diversification_benefit": corr < 0.5,
+        "recommendation": (
+            "PROCEED — meaningful diversification" if corr < 0.3 else
+            "CAUTION — moderate correlation, reduce combined size" if corr < 0.5 else
+            "DO NOT ADD — too correlated, no real diversification benefit"
+        ),
+    }
+
+# BTC and ETH are typically 0.7–0.9 correlated on short timeframes.
+# This means adding ETH provides limited diversification on 15-min signals.
+# The primary reason to add ETH is additional trade opportunity, not risk reduction.
+# Size both markets conservatively when correlation is high.
+```
+
+## Signal Validation on New Market
+```python
+# Before adding ETH, validate OBI and ROC signals on ETH-specific data
+# ETH has different microstructure than BTC — don't assume signals transfer
+
+ETH_VALIDATION_CHECKLIST = [
+    "OBI signal IC on ETH > 0.03 on OOS data",
+    "ROC signal IC on ETH > 0.03 on OOS data",
+    "ATR thresholds calibrated for ETH volatility (ETH is typically more volatile than BTC)",
+    "OBI thresholds may need adjustment — ETH book tends to be thinner than BTC",
+    "Paper trading confirmed on ETH for minimum 4 weeks",
+    "Session liquidity analysis completed for ETH on Kalshi",
+    "Walk-forward optimization completed with ETH-specific parameters",
+]
+
+# ETH-specific parameter adjustments (starting hypotheses — validate empirically)
+ETH_PARAMETER_ADJUSTMENTS = {
+    "OBI_LONG_THRESHOLD":  0.67,   # Slightly stricter — ETH book noisier
+    "OBI_SHORT_THRESHOLD": 0.33,
+    "ATR_HIGH_THRESHOLD":  0.60,   # ETH more volatile — raise HIGH threshold
+    "ROC_MAX_CAP":         3.0,    # ETH moves bigger — raise blow-off cap
+    "MIN_BOOK_VOLUME":     800,    # ETH may have thinner books — calibrate empirically
+}
+```
+
+## Multi-Market Capital Allocation
+```python
+MULTI_MARKET_ALLOCATION = {
+    # Phase 1: BTC proven, ETH just added
+    "phase_1": {
+        "btc_capital_pct":  0.70,   # 70% of deployable capital to BTC
+        "eth_capital_pct":  0.30,   # 30% to ETH (new, unproven live)
+        "trigger":          "ETH paper trading complete, entering micro live",
+    },
+    # Phase 2: ETH proven with 8+ weeks live
+    "phase_2": {
+        "btc_capital_pct":  0.55,
+        "eth_capital_pct":  0.45,
+        "trigger":          "ETH live Sharpe > 1.0 over 8 weeks",
+    },
+    # Phase 3: Equal allocation once both proven
+    "phase_3": {
+        "btc_capital_pct":  0.50,
+        "eth_capital_pct":  0.50,
+        "trigger":          "Both markets stable, > 6 months combined live history",
+    },
+}
+```
+
+## Correlated Position Rules
+```python
+# When running BTC + ETH simultaneously, positions must be managed together
+# to avoid inadvertently doubling up on the same directional bet
+
+class MultiMarketPositionManager:
+
+    def can_enter(self, new_market: str, new_direction: str, open_positions: dict) -> tuple[bool, str]:
+        """
+        Prevent correlated positions that double directional risk.
+        BTC long + ETH long = effectively one large long bet on crypto.
+        """
+        for market, position in open_positions.items():
+            if market == new_market:
+                return False, "ALREADY_IN_THIS_MARKET"
+
+            # BTC and ETH — check for direction conflict
+            if {market, new_market} == {"BTC", "ETH"}:
+                if position["direction"] == new_direction:
+                    return False, "CORRELATED_POSITION_BLOCK"
+                # Opposite directions (BTC long + ETH short) is allowed — natural hedge
+
+        # Check combined exposure
+        current_exposure = sum(p["risk_amount"] for p in open_positions.values())
+        max_combined     = self.bankroll * EXPANSION_GATES["max_combined_exposure"]
+        if current_exposure >= max_combined:
+            return False, "MAX_COMBINED_EXPOSURE"
+
+        return True, None
+```
+
+## Expansion Roadmap
+```
+Stage 0 — BTC only (current)
+  → Validate OBI + ROC on BTC
+  → Reach "standard" deployment (50% bankroll)
+  → 12 weeks live with Sharpe > 1.0
+
+Stage 1 — Add ETH (paper first)
+  → Run ETH-specific backtest and walk-forward
+  → Paper trade ETH for 4 weeks concurrently with live BTC
+  → 70/30 BTC/ETH capital split
+
+Stage 2 — ETH micro live
+  → ETH at 10% bankroll deployment
+  → Monitor ETH live for 8 weeks
+  → Correlation check: if > 0.7, keep ETH smaller
+
+Stage 3 — Equal allocation
+  → Both markets at standard deployment
+  → Consider adding a third uncorrelated market (non-crypto Kalshi contracts?)
+
+Stage 4 — Non-BTC/ETH expansion
+  → Only after Stage 3 is stable for 6+ months
+  → Different asset class preferred (reduces crypto correlation risk)
+```
+
+## Guardrails
+- Never add a new market while BTC is in drawdown — fix the primary strategy first
+- Never run more than 2 correlated markets at the same market exposure simultaneously
+- ETH parameters must be independently optimized — do not copy BTC parameters directly
+- Capital allocation to a new market starts at 10% and scales up slowly — same staged approach as BTC
+- Combined exposure across all markets must never exceed max_combined_exposure, regardless of how good the signals look

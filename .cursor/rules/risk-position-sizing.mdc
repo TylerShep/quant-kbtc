@@ -1,0 +1,182 @@
+---
+name: risk-position-sizing
+description: Implement risk management and position sizing for Kalshi trading bot. Use this skill when building or modifying anything related to bet sizing, bankroll management, drawdown protection, daily loss limits, or position exposure rules. Never size positions without consulting this skill.
+---
+
+# Risk Management & Position Sizing
+
+## What This Skill Covers
+All logic related to how much to risk per trade, protecting the overall bankroll, enforcing daily/weekly loss limits, and scaling size up or down based on strategy confidence and recent performance.
+
+## Core Sizing Model: Fixed Fractional
+```python
+# Risk a fixed % of current bankroll per trade
+position_size = current_bankroll * RISK_PER_TRADE_PCT
+
+# Example: $1000 bankroll, 2% risk = $20 max loss per trade
+# With 2% stop loss: position = $20 / 0.02 = $1000 notional
+# But Kalshi contracts are binary — size = contracts to buy
+```
+
+## Parameters (Tunable)
+```python
+RISK_PER_TRADE_PCT       = 0.02    # 2% of bankroll per trade baseline
+MAX_RISK_PER_TRADE_PCT   = 0.03    # Hard ceiling — never exceed 3%
+MIN_RISK_PER_TRADE_PCT   = 0.005   # Minimum during drawdown protection
+
+DAILY_LOSS_LIMIT_PCT     = 0.06    # Stop trading today if down 6% on the day
+WEEKLY_LOSS_LIMIT_PCT    = 0.15    # Stop trading this week if down 15%
+MAX_DRAWDOWN_PCT         = 0.20    # Pause entire bot if down 20% from peak
+
+MAX_CONCURRENT_POSITIONS = 1       # One position at a time per market
+MAX_TOTAL_EXPOSURE_PCT   = 0.10    # Never have more than 10% of bankroll at risk simultaneously
+
+# Confidence multipliers (applied to base risk)
+HIGH_CONVICTION_MULT     = 1.3     # OBI + ROC both agree
+SINGLE_SIGNAL_MULT       = 0.7     # Only one strategy firing
+DRAWDOWN_REDUCTION_MULT  = 0.5     # Reduce size when in drawdown
+```
+
+## Position Sizing Logic
+```python
+class PositionSizer:
+    def __init__(self, initial_bankroll):
+        self.bankroll = initial_bankroll
+        self.peak_bankroll = initial_bankroll
+        self.daily_start_bankroll = initial_bankroll
+        self.weekly_start_bankroll = initial_bankroll
+        self.trades_today = []
+        self.trades_this_week = []
+
+    def calculate_size(self, signal_confidence, strategy_name):
+        """
+        signal_confidence: "HIGH" (both signals agree) | "NORMAL" | "LOW"
+        Returns: dollar amount to risk on this trade
+        """
+        if not self.can_trade():
+            return 0
+
+        base_risk = self.bankroll * RISK_PER_TRADE_PCT
+
+        # Apply confidence multiplier
+        multipliers = {
+            "HIGH":   HIGH_CONVICTION_MULT,
+            "NORMAL": 1.0,
+            "LOW":    SINGLE_SIGNAL_MULT,
+        }
+        adjusted_risk = base_risk * multipliers.get(signal_confidence, 1.0)
+
+        # Apply drawdown reduction
+        drawdown = self._current_drawdown()
+        if drawdown > 0.10:
+            adjusted_risk *= DRAWDOWN_REDUCTION_MULT
+
+        # Clamp to hard limits
+        max_risk = self.bankroll * MAX_RISK_PER_TRADE_PCT
+        min_risk = self.bankroll * MIN_RISK_PER_TRADE_PCT
+        final_risk = max(min_risk, min(max_risk, adjusted_risk))
+
+        return round(final_risk, 2)
+
+    def can_trade(self):
+        """Check all circuit breakers before allowing any trade."""
+        if self._daily_loss() >= DAILY_LOSS_LIMIT_PCT:
+            return False, "DAILY_LOSS_LIMIT"
+        if self._weekly_loss() >= WEEKLY_LOSS_LIMIT_PCT:
+            return False, "WEEKLY_LOSS_LIMIT"
+        if self._current_drawdown() >= MAX_DRAWDOWN_PCT:
+            return False, "MAX_DRAWDOWN_HALT"
+        if self._current_exposure() >= MAX_TOTAL_EXPOSURE_PCT:
+            return False, "MAX_EXPOSURE"
+        return True, None
+
+    def _current_drawdown(self):
+        self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
+        return (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+
+    def _daily_loss(self):
+        return (self.daily_start_bankroll - self.bankroll) / self.daily_start_bankroll
+
+    def _weekly_loss(self):
+        return (self.weekly_start_bankroll - self.bankroll) / self.weekly_start_bankroll
+
+    def _current_exposure(self):
+        # Sum of all open position risk amounts / bankroll
+        return sum(p["risk_amount"] for p in open_positions()) / self.bankroll
+
+    def record_trade(self, pnl):
+        """Call after every trade closes."""
+        self.bankroll += pnl
+        self.trades_today.append(pnl)
+        self.trades_this_week.append(pnl)
+
+    def reset_daily(self):
+        """Call at start of each trading day."""
+        self.daily_start_bankroll = self.bankroll
+        self.trades_today = []
+
+    def reset_weekly(self):
+        """Call at start of each trading week."""
+        self.weekly_start_bankroll = self.bankroll
+        self.trades_this_week = []
+```
+
+## Circuit Breakers — Never Override These
+```
+Daily Loss > 6%      → Stop all trading, resume tomorrow
+Weekly Loss > 15%    → Stop all trading, resume next Monday
+Drawdown > 20%       → Full bot pause, manual review required
+Exposure > 10%       → No new positions until existing ones close
+```
+
+## Bankroll Update Flow
+```python
+# On every trade close:
+1. Calculate actual PnL (after Kalshi fees)
+2. Call position_sizer.record_trade(pnl)
+3. Log new bankroll to persistent state
+4. Check circuit breakers — halt if triggered
+5. Persist state to disk (never rely on in-memory only)
+```
+
+## Implementation Structure
+```
+risk/
+  __init__.py
+  position_sizer.py    # PositionSizer class
+  circuit_breaker.py   # Daily/weekly/drawdown halt logic
+  bankroll.py          # Persistent bankroll state (read/write to disk)
+  config.py            # All risk parameters
+  logger.py            # Risk event logging
+```
+
+## Kalshi-Specific Considerations
+- Kalshi contracts are binary (yes/no) — "position size" means number of contracts × price per contract
+- Factor in Kalshi's fee structure when calculating actual PnL
+- Contracts have a fixed max payout ($1.00) — size accordingly
+- Be aware of market liquidity: large orders may not fill at expected price
+
+## Common Pitfalls to Avoid
+- **Martingale instinct**: Never increase size after a loss to "make it back" — this is the fastest way to blow up
+- **Ignoring fees**: Kalshi fees reduce effective PnL — always model net-of-fees returns
+- **In-memory only state**: If bot crashes, bankroll state must survive — always persist to disk after every trade
+- **Skipping circuit breakers**: They feel annoying when you're on a losing streak. That's exactly when they matter most.
+- **Fixed dollar sizing**: Always size as % of current bankroll, never fixed dollar — fixed dollar doesn't account for bankroll changes
+
+## Logging Requirements
+```python
+{
+  "timestamp": ...,
+  "event": "SIZE_CALC | TRADE_CLOSE | CIRCUIT_BREAK | RESET_DAILY | RESET_WEEKLY",
+  "bankroll": ...,
+  "peak_bankroll": ...,
+  "current_drawdown_pct": ...,
+  "daily_loss_pct": ...,
+  "weekly_loss_pct": ...,
+  "risk_amount": ...,
+  "confidence_level": ...,
+  "multiplier_applied": ...,
+  "circuit_breaker_triggered": True/False,
+  "halt_reason": "...",
+}
+```

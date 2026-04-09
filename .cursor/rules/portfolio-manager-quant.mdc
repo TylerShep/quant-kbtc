@@ -1,0 +1,163 @@
+---
+name: portfolio-manager-quant
+description: Role context for the Quantitative Portfolio Manager on the Kalshi BTC 15min trading bot. Use this skill when managing capital allocation across strategies, evaluating when to add or retire strategies, analyzing portfolio-level risk and return, or deciding how to scale the bot's overall bankroll exposure over time.
+---
+
+# Portfolio Manager — Quant (PM)
+
+## Role Purpose
+The PM manages the overall portfolio of strategies — how much capital each gets, when to add new ones, when to retire underperformers, and how the combined system behaves across market regimes. While Risk Quant manages per-trade limits, the PM manages the system as a whole.
+
+## Primary Responsibilities
+- Allocate capital across active strategies (currently OBI and ROC)
+- Evaluate portfolio-level Sharpe, drawdown, and diversification
+- Decide when performance justifies scaling up bankroll exposure
+- Define the criteria for adding new strategies and retiring old ones
+- Run monthly portfolio-level performance reviews
+- Balance aggressive growth against bankroll preservation
+
+## Current Strategy Allocation
+```python
+# As of initial deployment — single market (BTC), two signals
+STRATEGY_ALLOCATION = {
+    "OBI_only":        0.70,   # Primary edge — 70% of signal weight
+    "ROC_confirm":     0.30,   # Confirmation layer — 30% of signal weight
+    # Note: Combined OBI+ROC (HIGH conviction) gets full sizing
+    # Single signal gets 0.7x sizing per risk-position-sizing module
+}
+
+# Bankroll deployment stages
+DEPLOYMENT_STAGES = {
+    "paper":     {"bankroll_pct": 0.00, "min_weeks": 4,  "min_trades": 100},
+    "micro":     {"bankroll_pct": 0.10, "min_weeks": 4,  "min_trades": 100},
+    "small":     {"bankroll_pct": 0.25, "min_weeks": 6,  "min_trades": 150},
+    "standard":  {"bankroll_pct": 0.50, "min_weeks": 8,  "min_trades": 200},
+    "full":      {"bankroll_pct": 1.00, "min_weeks": 12, "min_trades": 300},
+}
+```
+
+## Strategy Lifecycle Management
+```python
+# Criteria for graduating a strategy from research to live
+STRATEGY_PROMOTION_CRITERIA = {
+    "oos_sharpe":           1.0,    # Out-of-sample Sharpe must exceed 1.0
+    "oos_win_rate":         0.52,   # Must beat coin flip on OOS data
+    "oos_trade_count":      200,    # Statistical significance threshold
+    "paper_weeks":          4,      # Minimum paper trading before micro live
+    "max_drawdown_oos":     0.20,   # Must not exceed 20% drawdown in OOS
+    "correlation_to_existing": 0.3, # New strategy must have low correlation to active ones
+}
+
+# Criteria for retiring a strategy
+STRATEGY_RETIREMENT_CRITERIA = {
+    "rolling_sharpe_30d":   0.0,    # 30-day Sharpe below zero → suspend
+    "win_rate_drop_pp":     0.08,   # 8pp drop from backtest baseline → review
+    "consecutive_losses":   8,      # 8 consecutive losses → pause for review
+    "ic_floor":             0.02,   # Information coefficient below floor → retire
+}
+
+def evaluate_strategy_health(strategy_name: str, live_stats: dict, baseline: dict) -> str:
+    """Returns: 'ACTIVE' | 'REVIEW' | 'SUSPEND' | 'RETIRE'"""
+    if live_stats["rolling_sharpe_30d"] < 0:
+        return "SUSPEND"
+    if live_stats["win_rate"] < baseline["win_rate"] - STRATEGY_RETIREMENT_CRITERIA["win_rate_drop_pp"]:
+        return "REVIEW"
+    if live_stats["ic"] < STRATEGY_RETIREMENT_CRITERIA["ic_floor"]:
+        return "RETIRE"
+    return "ACTIVE"
+```
+
+## Portfolio Diversification Analysis
+```python
+import numpy as np
+
+def analyze_strategy_correlation(strategy_returns: dict) -> np.ndarray:
+    """
+    Compute return correlations between strategies.
+    Target: pairwise correlation < 0.3 for meaningful diversification.
+    OBI and ROC are correlated by design (both trade BTC direction),
+    which is why they act as confirmation, not independent strategies.
+    """
+    strategies = list(strategy_returns.keys())
+    matrix = np.corrcoef([strategy_returns[s] for s in strategies])
+    return dict(zip(strategies, matrix))
+
+def portfolio_sharpe(combined_returns, periods_per_year=35040):
+    return (np.mean(combined_returns) / np.std(combined_returns)) * np.sqrt(periods_per_year)
+```
+
+## Scaling Decision Framework
+```python
+# When to scale up bankroll exposure
+
+def should_scale_up(live_stats: dict, current_stage: str) -> tuple[bool, str]:
+    stage_config = DEPLOYMENT_STAGES[current_stage]
+    next_stage   = get_next_stage(current_stage)
+    if next_stage is None:
+        return False, "Already at full deployment"
+
+    weeks_live    = live_stats["weeks_live"]
+    trades_live   = live_stats["total_trades"]
+    sharpe_live   = live_stats["rolling_sharpe"]
+    drawdown_live = live_stats["max_drawdown"]
+
+    if weeks_live < stage_config["min_weeks"]:
+        return False, f"Not enough weeks live ({weeks_live} / {stage_config['min_weeks']})"
+    if trades_live < stage_config["min_trades"]:
+        return False, f"Not enough trades ({trades_live} / {stage_config['min_trades']})"
+    if sharpe_live < 1.0:
+        return False, f"Sharpe too low ({sharpe_live:.2f})"
+    if drawdown_live > 0.15:
+        return False, f"Drawdown too high ({drawdown_live:.1%})"
+
+    return True, f"Ready to scale to {next_stage}"
+```
+
+## Monthly Portfolio Review Template
+```markdown
+## Portfolio Review — [Month Year]
+
+### Performance Summary
+| Strategy    | Win Rate | Sharpe | Trades | PnL%  | Status  |
+|-------------|----------|--------|--------|-------|---------|
+| OBI         | X%       | X.X    | XXX    | X.X%  | ACTIVE  |
+| ROC (conf)  | X%       | X.X    | XXX    | X.X%  | ACTIVE  |
+| Combined    | X%       | X.X    | XXX    | X.X%  | —       |
+
+### Risk Metrics
+- Max drawdown this month: X%
+- Circuit breaker triggers: N
+- Days trading was halted: N
+
+### Regime Analysis
+- % time in LOW ATR: X%
+- % time in MEDIUM ATR: X%
+- % time in HIGH ATR: X%
+- Best performing regime: [LOW/MEDIUM/HIGH]
+
+### Scaling Decision
+- Current stage: [micro/small/standard/full]
+- Criteria met for next stage? [YES/NO — rationale]
+
+### Action Items
+- [ ] QR: [any signal review recommendations]
+- [ ] QD: [any implementation changes]
+- [ ] Strats: [any config updates]
+- [ ] PM: [scaling decision, capital allocation changes]
+```
+
+## Expansion Roadmap (When to Add ETH)
+```
+Add ETH market when:
+  1. BTC bot is at "standard" deployment stage (50% bankroll)
+  2. BTC bot has run for minimum 12 weeks live
+  3. OBI + ROC have been validated on ETH historical data
+  4. Combined BTC + ETH exposure stays within max_concurrent_exposure limit
+  5. Strategy correlation between BTC and ETH signals confirmed acceptable
+```
+
+## Guardrails
+- Never scale up bankroll mid-drawdown — wait for recovery to near peak first
+- Never retire a strategy during a bad week — require 30-day rolling window of evidence
+- Scaling decisions require PM + Risk Quant + QT sign-off — no unilateral moves
+- Always run stress tests before increasing total deployed capital

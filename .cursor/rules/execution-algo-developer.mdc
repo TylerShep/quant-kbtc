@@ -1,0 +1,222 @@
+---
+name: execution-algo-developer
+description: Role context for the Execution Algo Developer on the Kalshi BTC 15min trading bot. Use this skill when building order entry/exit logic, handling partial fills, implementing stop-loss mechanics for final-minutes-of-contract scenarios, managing order state machines, or tuning how the bot enters and exits positions on the Kalshi exchange.
+---
+
+# Execution Algo Developer
+
+## Role Purpose
+The Execution Algo Developer owns the logic between "signal says trade" and "position is filled and managed." This includes how orders are priced, how partial fills are handled, how stop-losses execute in the final minutes of a Kalshi contract, and how the bot recovers from fill failures.
+
+## Primary Responsibilities
+- Implement and maintain all order placement and cancellation logic
+- Handle the full order lifecycle: submitted → acknowledged → filled / partial / rejected
+- Build stop-loss and take-profit execution mechanics
+- Manage the "final 3 minutes" problem unique to Kalshi's expiring contracts
+- Tune order pricing to maximize fill rate without excessive slippage
+- Build the position state machine that tracks what the bot currently holds
+
+## Order State Machine
+```python
+from enum import Enum, auto
+
+class OrderState(Enum):
+    PENDING     = auto()   # Signal fired, order not yet submitted
+    SUBMITTED   = auto()   # HTTP request sent, awaiting acknowledgment
+    ACKNOWLEDGED = auto()  # Exchange confirmed receipt
+    PARTIALLY_FILLED = auto()
+    FILLED      = auto()   # Fully filled — position is live
+    CANCELING   = auto()   # Cancel request sent
+    CANCELED    = auto()   # Exchange confirmed cancellation
+    REJECTED    = auto()   # Exchange rejected the order
+    EXPIRED     = auto()   # Contract expired before fill
+
+class PositionState(Enum):
+    FLAT        = auto()   # No open position
+    ENTERING    = auto()   # Order submitted, not yet filled
+    OPEN        = auto()   # Position fully open
+    EXITING     = auto()   # Exit order submitted
+    CLOSED      = auto()   # Position closed, PnL recorded
+```
+
+## Order Entry Logic
+```python
+class ExecutionManager:
+    async def enter_position(self, signal: Signal, size_dollars: float) -> Order | None:
+        """
+        Submit an entry order with smart pricing.
+        Uses limit orders slightly inside the spread for better fill rate.
+        """
+        book    = self.book_store.latest()
+        direction = signal.direction   # "long" or "short"
+
+        # Price the order: bid at slightly above best bid (for long)
+        # to get priority without crossing the spread unnecessarily
+        if direction == "long":
+            best_bid    = book["bids"][0]["price"]
+            best_ask    = book["asks"][0]["price"]
+            spread_cents = best_ask - best_bid
+            order_price  = min(best_bid + max(1, spread_cents // 3), best_ask - 1)
+            side         = "yes"
+        else:
+            best_ask    = book["asks"][0]["price"]
+            best_bid    = book["bids"][0]["price"]
+            spread_cents = best_ask - best_bid
+            order_price  = max(best_ask - max(1, spread_cents // 3), best_bid + 1)
+            side         = "no"
+
+        contracts = self._dollars_to_contracts(size_dollars, order_price)
+        if contracts < 1:
+            logger.warning("Position too small for even 1 contract — skipping")
+            return None
+
+        order = await self.kalshi.place_order(
+            ticker=self.ticker,
+            side=side,
+            contracts=contracts,
+            price=order_price,
+        )
+        self.active_order = order
+        self._set_order_state(order.id, OrderState.SUBMITTED)
+
+        # Set expiry timeout — cancel if not filled within N seconds
+        asyncio.create_task(self._cancel_if_unfilled(order.id, timeout_sec=30))
+        return order
+
+    def _dollars_to_contracts(self, dollars: float, price_cents: int) -> int:
+        """
+        Kalshi contract payout = $1.00. Cost = price_cents / 100.
+        contracts = dollars / cost_per_contract
+        """
+        cost_per_contract = price_cents / 100
+        return int(dollars / cost_per_contract)
+```
+
+## Partial Fill Handling
+```python
+async def handle_partial_fill(self, order: Order, filled_contracts: int, total_contracts: int):
+    """
+    When a limit order is partially filled, decide:
+    - Wait for remaining fill?
+    - Accept partial and cancel remainder?
+    - Chase with market order?
+    """
+    fill_pct = filled_contracts / total_contracts
+
+    # If > 80% filled, accept partial — don't chase the rest
+    if fill_pct >= 0.80:
+        await self.kalshi.cancel_order(order.id)
+        self.position = Position(
+            contracts=filled_contracts,
+            direction=order.direction,
+            entry_price=order.avg_fill_price,
+        )
+        logger.info(f"Accepted partial fill: {fill_pct:.0%} of order")
+        return
+
+    # If < 80% filled and signal is still valid — wait up to 20 more seconds
+    if fill_pct < 0.80 and self.signal_still_valid():
+        await asyncio.sleep(20)
+        updated = await self.kalshi.get_order_status(order.id)
+        if updated.state == "partially_filled":
+            # Give up — cancel remainder, proceed with what we have
+            await self.kalshi.cancel_order(order.id)
+            if updated.filled_contracts > 0:
+                self.position = Position(contracts=updated.filled_contracts, ...)
+            return
+
+    # Signal no longer valid — cancel entire order, don't enter
+    await self.kalshi.cancel_order(order.id)
+    logger.info("Partial fill canceled — signal decayed during fill wait")
+```
+
+## Final 3 Minutes Contract Expiry Logic
+```python
+# Kalshi 15-minute contracts expire at fixed intervals.
+# In the final 3 minutes, market microstructure changes:
+# - Liquidity thins dramatically
+# - Spreads widen
+# - Fill rates drop
+# - Risk of being stuck at unfavorable settlement price increases
+
+EXPIRY_RISK_WINDOW_MIN = 3
+
+def time_until_expiry(ticker: str) -> float:
+    """Returns minutes until this contract expires."""
+    # Parse expiry from ticker or fetch from market metadata
+    ...
+
+async def manage_expiry_risk(self):
+    """
+    Called on each candle close. If position is open and contract is
+    expiring soon, close immediately rather than waiting for signal exit.
+    """
+    mins_left = time_until_expiry(self.ticker)
+
+    if self.position.is_open and mins_left <= EXPIRY_RISK_WINDOW_MIN:
+        logger.warning(f"Contract expiring in {mins_left:.1f} min — force closing position")
+        await self.exit_position(reason="CONTRACT_EXPIRY_RISK", aggressive=True)
+
+async def exit_position(self, reason: str, aggressive: bool = False):
+    """
+    Submit exit order.
+    aggressive=True: cross the spread to guarantee fill (used near expiry).
+    aggressive=False: limit order at favorable price, cancel if unfilled in 30s.
+    """
+    book = self.book_store.latest()
+
+    if aggressive:
+        # Market-like limit: set at best ask for long exit (guaranteed fill)
+        if self.position.direction == "long":
+            exit_price = book["bids"][0]["price"]   # Sell at best bid (taker)
+        else:
+            exit_price = book["asks"][0]["price"]   # Buy back at best ask
+    else:
+        # Passive limit: try to get a better price
+        if self.position.direction == "long":
+            exit_price = book["bids"][0]["price"] + 1   # 1 cent better than best bid
+        else:
+            exit_price = book["asks"][0]["price"] - 1
+
+    order = await self.kalshi.place_order(
+        ticker=self.ticker,
+        side="no" if self.position.direction == "long" else "yes",
+        contracts=self.position.contracts,
+        price=exit_price,
+    )
+    # Set aggressive cancel-and-retry if passive order doesn't fill in 30s
+    if not aggressive:
+        asyncio.create_task(self._escalate_exit_if_unfilled(order.id, timeout_sec=30))
+```
+
+## Order Rejection Handling
+```python
+async def handle_rejection(self, order: Order, rejection_code: str):
+    """Handle common Kalshi order rejection reasons."""
+    REJECTION_ACTIONS = {
+        "INSUFFICIENT_FUNDS":   self._handle_insufficient_funds,
+        "MARKET_CLOSED":        self._handle_market_closed,
+        "PRICE_OUT_OF_RANGE":   self._handle_price_out_of_range,
+        "RATE_LIMITED":         self._handle_rate_limit,
+        "INVALID_CONTRACTS":    self._handle_invalid_size,
+    }
+    handler = REJECTION_ACTIONS.get(rejection_code, self._handle_unknown_rejection)
+    await handler(order)
+
+async def _handle_price_out_of_range(self, order):
+    """Re-price and retry once if our price was outside Kalshi's accepted range."""
+    book        = self.book_store.latest()
+    new_price   = book["bids"][0]["price"] if order.side == "yes" else book["asks"][0]["price"]
+    logger.info(f"Re-pricing order from {order.price} to {new_price}")
+    await self.kalshi.place_order(
+        ticker=self.ticker, side=order.side,
+        contracts=order.contracts, price=new_price,
+    )
+```
+
+## Guardrails
+- Every open position must have a stop-loss submitted at order entry — never leave a position unprotected
+- Never retry a rejected order more than twice — repeated rejections indicate a systemic problem
+- Always close open positions before contract expiry — never let Kalshi settle an unfavorable position for you
+- Log every order state transition with full context (price, contracts, book snapshot, reason)
+- Partial fills of < 30% of intended size should be canceled — the edge doesn't apply at that size

@@ -1,0 +1,260 @@
+---
+name: devops-security-specialist
+description: Role context for the DevOps/Security Specialist on the Kalshi BTC 15min trading bot. Use this skill when managing API key security, implementing Kalshi's RSA request signing, rotating credentials, encrypting secrets, hardening server infrastructure, managing SSH access, configuring firewalls, or building secure CI/CD pipelines.
+---
+
+# DevOps / Security Specialist
+
+## Role Purpose
+Kalshi requires RSA key-based request signing for all trading API calls. A compromised API key means unauthorized access to the trading account and potential financial loss. This role encrypts credentials, manages key rotation, hardens the server, and ensures the entire system is defensible against external threats.
+
+## Primary Responsibilities
+- Manage Kalshi RSA API key lifecycle (generation, storage, rotation)
+- Implement and maintain request signing in all API calls
+- Harden DigitalOcean Droplet and restrict access surface
+- Manage encrypted secret storage (never plaintext credentials in code or env files)
+- Build secure CI/CD pipeline with secret injection
+- Monitor for anomalous API usage that could indicate key compromise
+- Conduct quarterly security reviews
+
+## Kalshi API Key Management
+```python
+# Kalshi uses RSA-256 key pairs for request authentication
+# Private key must never leave the server — generate on server, register public key with Kalshi
+
+# --- KEY GENERATION (run on server, not locally) ---
+# openssl genrsa -out kalshi_private.pem 4096
+# openssl rsa -in kalshi_private.pem -pubout -out kalshi_public.pem
+# → Upload kalshi_public.pem to Kalshi dashboard
+# → kalshi_private.pem stays on server ONLY, permissions 600
+
+# --- REQUEST SIGNING IMPLEMENTATION ---
+import base64
+import hashlib
+import time
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+class KalshiRequestSigner:
+    def __init__(self, api_key_id: str, private_key_path: str):
+        self.api_key_id = api_key_id
+        with open(private_key_path, "rb") as f:
+            self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    def sign_request(self, method: str, path: str, body: str = "") -> dict:
+        """
+        Generate Kalshi-compliant request signature.
+        Signature = RSA-SHA256 over (timestamp + method + path + body)
+        """
+        timestamp = str(int(time.time() * 1000))
+        message   = f"{timestamp}{method.upper()}{path}{body}"
+
+        signature = self.private_key.sign(
+            message.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        sig_b64 = base64.b64encode(signature).decode("utf-8")
+
+        return {
+            "KALSHI-ACCESS-KEY":       self.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "Content-Type":            "application/json",
+        }
+```
+
+## Secret Storage (No Plaintext Anywhere)
+```bash
+# NEVER store secrets in:
+# - .env files committed to git
+# - Environment variables in docker-compose.yml
+# - Hardcoded in Python source code
+# - Unencrypted files on disk
+
+# CORRECT secret storage hierarchy:
+
+# 1. RSA Private Key — on disk with restricted permissions
+sudo mkdir -p /run/secrets
+sudo cp kalshi_private.pem /run/secrets/kalshi_key.pem
+sudo chmod 600 /run/secrets/kalshi_key.pem
+sudo chown botuser:botuser /run/secrets/kalshi_key.pem
+# Mount as Docker secret — never as env var
+
+# 2. Database credentials — DigitalOcean Managed DB connection string
+# Retrieved from DO API at deploy time, injected as environment variable
+# Never stored in code or committed config files
+
+# 3. API key ID (not secret, but don't broadcast it)
+# Store in /etc/environment (root-readable only)
+echo "KALSHI_API_KEY_ID=your_key_id" | sudo tee -a /etc/environment
+sudo chmod 600 /etc/environment
+
+# 4. Webhook URLs, third-party tokens
+# Store in DO Spaces encrypted, pull at deploy time via deploy script
+```
+
+## Key Rotation Procedure
+```bash
+#!/bin/bash
+# /opt/kalshi/scripts/rotate_api_key.sh
+# Run on schedule or immediately if compromise suspected
+# Kalshi may require periodic rotation per their security policy
+
+set -euo pipefail
+LOG="/var/log/kalshi/key_rotation.log"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG"; }
+
+log "Starting API key rotation"
+
+# Step 1: Pause the bot (prevents auth failures during rotation)
+docker exec kalshi-bot python -c "
+from tools.admin_cli import bot_control
+bot_control.set_mode('PAUSE_ENTRIES')
+"
+log "Bot paused"
+
+# Step 2: Generate new RSA key pair ON THE SERVER
+openssl genrsa -out /tmp/kalshi_new_private.pem 4096
+openssl rsa -in /tmp/kalshi_new_private.pem -pubout -out /tmp/kalshi_new_public.pem
+log "New key pair generated"
+
+# Step 3: Register new public key with Kalshi API
+# (Requires current valid credentials to authenticate this request)
+NEW_PUBLIC_KEY=$(cat /tmp/kalshi_new_public.pem)
+curl -X POST "https://trading-api.kalshi.com/trade-api/v2/account/api-keys" \
+     $(python3 -c "from kalshi.auth import KalshiAuth; a=KalshiAuth(); print(' '.join([f'-H \"{k}: {v}\"' for k,v in a.get_headers('POST', '/trade-api/v2/account/api-keys').items()]))") \
+     -d "{\"public_key\": \"$NEW_PUBLIC_KEY\"}"
+log "New public key registered with Kalshi"
+
+# Step 4: Install new private key
+cp /run/secrets/kalshi_key.pem /run/secrets/kalshi_key.pem.backup.$(date +%Y%m%d)
+cp /tmp/kalshi_new_private.pem /run/secrets/kalshi_key.pem
+chmod 600 /run/secrets/kalshi_key.pem
+chown botuser:botuser /run/secrets/kalshi_key.pem
+log "New private key installed"
+
+# Step 5: Test new key before retiring old one
+python3 -c "
+from kalshi.auth import KalshiAuth
+from kalshi.client import KalshiClient
+client = KalshiClient(KalshiAuth('$KALSHI_API_KEY_ID', '/run/secrets/kalshi_key.pem'))
+balance = client.get_balance()
+print(f'New key validated. Balance: \${balance:.2f}')
+"
+log "New key validated successfully"
+
+# Step 6: Clean up and resume
+shred -u /tmp/kalshi_new_private.pem /tmp/kalshi_new_public.pem
+docker restart kalshi-bot
+log "Key rotation complete. Bot restarted."
+
+# Alert the team
+curl -s -X POST "$ALERT_WEBHOOK_URL" \
+     -d "{\"text\": \"[SECURITY] API key rotation completed successfully at $(date -u)\"}"
+```
+
+## Server Hardening Checklist
+```bash
+# --- SSH HARDENING ---
+# /etc/ssh/sshd_config
+PasswordAuthentication no
+PermitRootLogin no
+MaxAuthTries 3
+AllowUsers botuser
+Protocol 2
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# --- UFW FIREWALL (absolute minimum surface) ---
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow from YOUR_HOME_IP to any port 22   # SSH from your IP only — NOT 0.0.0.0/0
+ufw allow from YOUR_OFFICE_IP to any port 22
+# No other inbound ports — bot only makes outbound connections
+ufw enable
+
+# --- FAIL2BAN (brute force protection) ---
+apt install fail2ban
+# /etc/fail2ban/jail.local
+# [sshd]
+# enabled = true
+# maxretry = 3
+# bantime = 3600
+
+# --- AUTOMATIC SECURITY UPDATES ---
+apt install unattended-upgrades
+dpkg-reconfigure -plow unattended-upgrades
+
+# --- AUDIT LOGGING ---
+apt install auditd
+auditctl -w /run/secrets/ -p r -k secret_access   # Log any read of secrets dir
+auditctl -w /home/botuser/kalshi-bot/ -p w -k code_modified
+```
+
+## Secret Scanning (Pre-commit)
+```bash
+# Install pre-commit hook to prevent secrets in git commits
+pip install detect-secrets
+detect-secrets scan > .secrets.baseline
+# Add to .pre-commit-config.yaml:
+# - repo: https://github.com/Yelp/detect-secrets
+#   rev: v1.4.0
+#   hooks:
+#     - id: detect-secrets
+#       args: ['--baseline', '.secrets.baseline']
+
+# What it catches:
+# - API keys in Python files
+# - Passwords in config files
+# - Private key material in any file
+# - Database connection strings with credentials
+```
+
+## Compromise Response Playbook
+```
+If API key compromise suspected (unusual trades, unauthorized access):
+
+IMMEDIATE (< 5 minutes):
+  1. SSH to server: docker stop kalshi-bot
+  2. Kalshi dashboard: revoke the compromised API key
+  3. Review Kalshi trade history for unauthorized activity
+  4. Alert team via out-of-band channel (phone/Signal, not Slack)
+
+SHORT-TERM (< 1 hour):
+  5. Run key rotation script with newly generated key pair
+  6. Review server auth logs: sudo journalctl -u sshd --since "24 hours ago"
+  7. Check auditd logs for secret access: ausearch -k secret_access
+  8. Rotate DO API tokens if server was compromised
+  9. Scan all committed code for accidental secret exposure
+
+RECOVERY:
+  10. Only restart bot after confirming clean server state
+  11. Document incident with timeline for compliance record
+  12. Consider whether bankroll review is needed
+```
+
+## Security Review Schedule
+```
+Monthly:
+  [ ] Review SSH auth logs for unusual access patterns
+  [ ] Verify fail2ban is active and blocking attempts
+  [ ] Check UFW logs for unexpected inbound connection attempts
+  [ ] Confirm no API keys in codebase (run detect-secrets)
+
+Quarterly:
+  [ ] Rotate Kalshi API key (proactive rotation)
+  [ ] Review DigitalOcean account: active SSH keys, API tokens, team members
+  [ ] Test disaster recovery: can we rebuild from scratch in < 2 hours?
+  [ ] Audit who has SSH access — remove stale keys immediately
+  [ ] Review and update server packages (security patches)
+```
+
+## Guardrails
+- RSA private key files must always be 600 permissions, owned by botuser — enforce via cron check
+- Never SSH as root — botuser only, with sudo for specific commands
+- SSH access restricted to known IPs only — never open to 0.0.0.0/0
+- All key rotations must be tested before the old key is invalidated
+- Secret compromise must trigger immediate bot halt — never "wait and see"
+- All security incidents must be documented, even minor ones — compliance record

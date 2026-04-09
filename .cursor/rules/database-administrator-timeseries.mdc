@@ -1,0 +1,310 @@
+---
+name: database-administrator-timeseries
+description: Role context for the Database Administrator (Time-Series Specialist) on the Kalshi BTC 15min trading bot. Use this skill when designing or optimizing database schemas, managing TimescaleDB hypertables, writing efficient time-series queries for backtesting, configuring data retention policies, building indexes for trade log analysis, or ensuring the database can handle high-frequency ingestion without degrading query performance.
+---
+
+# Database Administrator — Time-Series Specialist
+
+## Role Purpose
+Manages the high-performance time-series database that stores every candle, order book snapshot, signal evaluation, and trade result. Ensures researchers can backtest against years of 15-minute micro-spike data efficiently, and that the live bot's logging never becomes a bottleneck.
+
+## Primary Responsibilities
+- Design and maintain all database schemas (TimescaleDB on PostgreSQL)
+- Configure hypertable chunking, compression, and retention policies
+- Build and maintain indexes for fast backtest queries
+- Monitor query performance and optimize slow queries
+- Manage connection pooling (PgBouncer) for concurrent bot + research access
+- Maintain point-in-time recovery and backup validation
+
+## Technology Stack
+```
+Database:       PostgreSQL 16 + TimescaleDB 2.x
+Connection Pool: PgBouncer (transaction mode)
+Hosting:        DigitalOcean Managed PostgreSQL (production)
+                Docker local PostgreSQL (development)
+ORM/Query:      psycopg3 (async) for bot, pandas read_sql for research
+Migrations:     Alembic
+```
+
+## Full Schema
+```sql
+-- ============================================================
+-- EXTENSION
+-- ============================================================
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+-- ============================================================
+-- RAW MARKET DATA
+-- ============================================================
+
+-- 15-minute OHLCV candles from all sources
+CREATE TABLE candles (
+    timestamp       TIMESTAMPTZ     NOT NULL,
+    source          VARCHAR(20)     NOT NULL,   -- 'binance', 'coinbase', 'kalshi'
+    symbol          VARCHAR(20)     NOT NULL,   -- 'BTCUSDT', 'BTC-USD'
+    open            NUMERIC(14,4)   NOT NULL,
+    high            NUMERIC(14,4)   NOT NULL,
+    low             NUMERIC(14,4)   NOT NULL,
+    close           NUMERIC(14,4)   NOT NULL,
+    volume          NUMERIC(22,6)   NOT NULL,
+    PRIMARY KEY (timestamp, source, symbol)
+);
+SELECT create_hypertable('candles', 'timestamp', chunk_time_interval => INTERVAL '7 days');
+CREATE INDEX ON candles (symbol, source, timestamp DESC);
+
+-- Order book snapshots (every 30 seconds)
+CREATE TABLE ob_snapshots (
+    id              BIGSERIAL       PRIMARY KEY,
+    timestamp       TIMESTAMPTZ     NOT NULL,
+    ticker          VARCHAR(60)     NOT NULL,
+    bids            JSONB           NOT NULL,   -- top 10 levels [{price, size}, ...]
+    asks            JSONB           NOT NULL,
+    obi             NUMERIC(6,4),
+    total_bid_vol   NUMERIC(20,2),
+    total_ask_vol   NUMERIC(20,2),
+    spread_cents    SMALLINT
+);
+SELECT create_hypertable('ob_snapshots', 'timestamp', chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX ON ob_snapshots (ticker, timestamp DESC);
+
+-- ============================================================
+-- SIGNAL & BOT STATE
+-- ============================================================
+
+-- Every signal evaluation (entry + exit checks)
+CREATE TABLE signal_log (
+    id              BIGSERIAL       PRIMARY KEY,
+    timestamp       TIMESTAMPTZ     NOT NULL,
+    market          VARCHAR(60)     NOT NULL,
+    strategy        VARCHAR(30)     NOT NULL,   -- 'OBI', 'ROC', 'COORDINATOR'
+    obi_value       NUMERIC(6,4),
+    roc_value       NUMERIC(8,4),
+    atr_regime      VARCHAR(10),               -- 'LOW', 'MEDIUM', 'HIGH'
+    atr_pct         NUMERIC(8,4),
+    action          VARCHAR(20)     NOT NULL,   -- 'ENTER_LONG', 'SKIP', 'EXIT', etc.
+    skip_reason     VARCHAR(60),
+    exit_reason     VARCHAR(60),
+    confidence      VARCHAR(10),               -- 'HIGH', 'NORMAL', 'LOW'
+    created_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+SELECT create_hypertable('signal_log', 'timestamp', chunk_time_interval => INTERVAL '7 days');
+CREATE INDEX ON signal_log (market, strategy, timestamp DESC);
+CREATE INDEX ON signal_log (action, timestamp DESC);
+
+-- Bot persistent key-value state (bankroll, circuit breakers, heartbeat)
+CREATE TABLE bot_state (
+    key             VARCHAR(100)    PRIMARY KEY,
+    value           JSONB           NOT NULL,
+    updated_at      TIMESTAMPTZ     DEFAULT NOW()
+);
+
+-- ============================================================
+-- TRADES
+-- ============================================================
+
+CREATE TABLE trades (
+    id                  BIGSERIAL       PRIMARY KEY,
+    entry_timestamp     TIMESTAMPTZ     NOT NULL,
+    exit_timestamp      TIMESTAMPTZ,
+    market              VARCHAR(60)     NOT NULL,
+    strategy            VARCHAR(30)     NOT NULL,
+    direction           VARCHAR(10)     NOT NULL,   -- 'long', 'short'
+    entry_price_cents   SMALLINT        NOT NULL,
+    exit_price_cents    SMALLINT,
+    contracts           INTEGER         NOT NULL,
+    risk_dollars        NUMERIC(10,2),
+    pnl_cents           INTEGER,                    -- net of fees
+    pnl_pct             NUMERIC(8,4),
+    fees_cents          INTEGER,
+    exit_reason         VARCHAR(40),
+    obi_at_entry        NUMERIC(6,4),
+    roc_at_entry        NUMERIC(8,4),
+    atr_regime_entry    VARCHAR(10),
+    candles_held        SMALLINT,
+    confidence          VARCHAR(10),
+    created_at          TIMESTAMPTZ     DEFAULT NOW()
+);
+SELECT create_hypertable('trades', 'entry_timestamp', chunk_time_interval => INTERVAL '30 days');
+CREATE INDEX ON trades (market, strategy, entry_timestamp DESC);
+CREATE INDEX ON trades (exit_reason, entry_timestamp DESC);
+CREATE INDEX ON trades (direction, atr_regime_entry, entry_timestamp DESC);
+
+-- ============================================================
+-- RISK & BANKROLL
+-- ============================================================
+
+CREATE TABLE bankroll_snapshots (
+    timestamp           TIMESTAMPTZ     PRIMARY KEY,
+    bankroll_dollars    NUMERIC(12,2)   NOT NULL,
+    peak_bankroll       NUMERIC(12,2),
+    drawdown_pct        NUMERIC(6,4),
+    daily_pnl_pct       NUMERIC(8,4),
+    weekly_pnl_pct      NUMERIC(8,4),
+    open_exposure_pct   NUMERIC(6,4)
+);
+SELECT create_hypertable('bankroll_snapshots', 'timestamp', chunk_time_interval => INTERVAL '30 days');
+
+-- ============================================================
+-- PERFORMANCE & HEALTH
+-- ============================================================
+
+CREATE TABLE latency_log (
+    timestamp           TIMESTAMPTZ     NOT NULL,
+    component           VARCHAR(40)     NOT NULL,   -- 'obi_calc', 'order_submit', etc.
+    latency_ms          NUMERIC(8,3)    NOT NULL,
+    budget_ms           NUMERIC(8,3),
+    breach              BOOLEAN         DEFAULT FALSE
+);
+SELECT create_hypertable('latency_log', 'timestamp', chunk_time_interval => INTERVAL '1 day');
+
+CREATE TABLE pipeline_health (
+    timestamp           TIMESTAMPTZ     NOT NULL,
+    source              VARCHAR(20)     NOT NULL,
+    lag_seconds         NUMERIC(8,2),
+    candle_gaps         INTEGER         DEFAULT 0,
+    ob_snapshot_count   INTEGER         DEFAULT 0,
+    validation_errors   INTEGER         DEFAULT 0
+);
+SELECT create_hypertable('pipeline_health', 'timestamp', chunk_time_interval => INTERVAL '7 days');
+```
+
+## Compression & Retention Policies
+```sql
+-- Compress chunks older than 7 days (80-95% storage reduction on time-series)
+SELECT add_compression_policy('candles',       INTERVAL '7 days');
+SELECT add_compression_policy('ob_snapshots',  INTERVAL '3 days');
+SELECT add_compression_policy('signal_log',    INTERVAL '7 days');
+SELECT add_compression_policy('latency_log',   INTERVAL '2 days');
+
+-- Data retention — drop old chunks automatically
+SELECT add_retention_policy('ob_snapshots',   INTERVAL '90 days');
+SELECT add_retention_policy('latency_log',    INTERVAL '30 days');
+SELECT add_retention_policy('pipeline_health',INTERVAL '60 days');
+-- candles and trades: KEEP INDEFINITELY (no retention policy)
+
+-- Verify compression savings
+SELECT hypertable_name,
+       pg_size_pretty(before_compression_total_bytes) AS before,
+       pg_size_pretty(after_compression_total_bytes)  AS after,
+       compression_ratio
+FROM chunk_compression_stats('ob_snapshots');
+```
+
+## Critical Backtest Queries (Optimized)
+```sql
+-- Fetch all 15min candles for a date range (QR backtest)
+SELECT timestamp, open, high, low, close, volume
+FROM candles
+WHERE source = 'binance'
+  AND symbol = 'BTCUSDT'
+  AND timestamp BETWEEN '2024-01-01' AND '2024-12-31'
+ORDER BY timestamp;
+
+-- Join candles with OB snapshots aligned to nearest 30s boundary
+SELECT
+    c.timestamp AS candle_ts,
+    c.close,
+    o.obi,
+    o.total_bid_vol + o.total_ask_vol AS book_volume
+FROM candles c
+LEFT JOIN LATERAL (
+    SELECT obi, total_bid_vol, total_ask_vol
+    FROM ob_snapshots
+    WHERE ticker = 'BTC-15MIN-...'
+      AND timestamp <= c.timestamp
+    ORDER BY timestamp DESC
+    LIMIT 1
+) o ON TRUE
+WHERE c.source = 'binance'
+  AND c.timestamp BETWEEN '2024-06-01' AND '2024-09-01'
+ORDER BY c.timestamp;
+
+-- Trade performance by regime (monthly review query)
+SELECT
+    atr_regime_entry,
+    direction,
+    COUNT(*)                                AS trades,
+    ROUND(AVG(pnl_pct) * 100, 2)           AS avg_pnl_pct,
+    ROUND(SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END)::NUMERIC / COUNT(*) * 100, 1) AS win_rate,
+    ROUND(AVG(candles_held), 1)             AS avg_hold_candles
+FROM trades
+WHERE entry_timestamp >= NOW() - INTERVAL '30 days'
+GROUP BY atr_regime_entry, direction
+ORDER BY atr_regime_entry, direction;
+
+-- Signal conflict rate (how often OBI and ROC disagree)
+SELECT
+    DATE_TRUNC('day', timestamp)            AS day,
+    COUNT(*) FILTER (WHERE skip_reason = 'CONFLICT')        AS conflicts,
+    COUNT(*) FILTER (WHERE action LIKE 'ENTER%')            AS entries,
+    COUNT(*)                                                AS total_evals,
+    ROUND(COUNT(*) FILTER (WHERE skip_reason = 'CONFLICT')::NUMERIC / COUNT(*) * 100, 1) AS conflict_pct
+FROM signal_log
+WHERE timestamp >= NOW() - INTERVAL '30 days'
+GROUP BY 1
+ORDER BY 1;
+```
+
+## Connection Pool (PgBouncer) Configuration
+```ini
+# /etc/pgbouncer/pgbouncer.ini
+[databases]
+kalshi = host=db.private.do.com port=25060 dbname=kalshi
+
+[pgbouncer]
+listen_port         = 6432
+listen_addr         = 127.0.0.1
+auth_type           = md5
+pool_mode           = transaction      # Transaction pooling for async bot
+max_client_conn     = 100
+default_pool_size   = 20
+reserve_pool_size   = 5
+reserve_pool_timeout = 3
+server_idle_timeout = 600
+log_connections     = 0               # Reduce log noise in production
+```
+
+## Index Strategy
+```sql
+-- Indexes already defined in schema above cover:
+-- Time-range queries (hypertable partitioning handles this)
+-- Market + strategy + time filter (composite indexes)
+-- Exit reason analysis
+-- Direction + regime breakdown
+
+-- Additional index for ML feature retrieval
+CREATE INDEX ON signal_log (obi_value, roc_value, atr_regime)
+    WHERE action LIKE 'ENTER%';   -- Partial index — only indexed entries
+
+-- Monitor index usage monthly
+SELECT schemaname, tablename, indexname,
+       idx_scan, idx_tup_read,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+ORDER BY idx_scan ASC;  -- Low scan count = potentially unused index
+```
+
+## Database Health Monitoring
+```sql
+-- Run daily — check table sizes and chunk counts
+SELECT hypertable_name,
+       num_chunks,
+       pg_size_pretty(hypertable_size(format('%I', hypertable_name)::regclass)) AS total_size
+FROM timescaledb_information.hypertables
+ORDER BY hypertable_name;
+
+-- Slow query log — queries > 1 second
+SELECT query, calls, mean_exec_time, max_exec_time
+FROM pg_stat_statements
+WHERE mean_exec_time > 1000
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+```
+
+## Guardrails
+- All schema changes go through Alembic migrations — never ALTER TABLE in production manually
+- Always test compression policy on dev data before applying to production
+- Keep candles and trades indefinitely — they are the research asset
+- Validate backups weekly: restore a chunk to dev and confirm row counts match
+- Connection pool must be sized so the bot never waits for a DB connection — latency budget is tight
+- Never run heavy backtest queries directly against production — use a read replica or restored snapshot

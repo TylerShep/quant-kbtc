@@ -1,0 +1,168 @@
+---
+name: atr-regime-filter
+description: Implement the ATR-based volatility regime filter for Kalshi trading strategies. Use this skill when building or modifying the regime detection system that gates OBI and ROC strategy entries. This is the always-running gatekeeper module — never bypass it.
+---
+
+# ATR Volatility Regime Filter
+
+## What This Skill Covers
+The ATR regime filter runs continuously and classifies market conditions as LOW, MEDIUM, or HIGH volatility. It gates all strategy entries — OBI works best in LOW/MEDIUM, ROC works best in MEDIUM/HIGH, and HIGH chaos shuts everything down.
+
+## Core Formula
+```python
+# True Range for each candle
+TR = max(
+    high - low,
+    abs(high - prev_close),
+    abs(low - prev_close)
+)
+
+# ATR = exponential or simple moving average of TR
+ATR = EMA(TR, period=ATR_PERIOD)
+
+# Normalized ATR (as % of price, for comparability)
+ATR_PCT = (ATR / current_close) * 100
+```
+
+## Parameters (Tunable)
+```python
+ATR_PERIOD           = 14        # Rolling candle period for ATR calculation
+ATR_LOW_THRESHOLD    = 0.15      # Below this % = LOW volatility regime
+ATR_HIGH_THRESHOLD   = 0.50      # Above this % = HIGH volatility regime
+# Between low and high thresholds = MEDIUM
+ATR_SMOOTH_PERIOD    = 3         # Smooth ATR_PCT over N readings to avoid flapping
+REGIME_CONFIRM_BARS  = 2         # Candles regime must persist before switching label
+```
+
+## Regime Definitions
+```python
+# LOW:    ATR_PCT < 0.15%   → Dead market. OBI ok, ROC skip.
+# MEDIUM: 0.15% ≤ ATR_PCT ≤ 0.50% → Normal. Both strategies active.
+# HIGH:   ATR_PCT > 0.50%   → Chaos. ALL strategies suspended.
+
+REGIME_STRATEGY_MAP = {
+    "LOW":    {"obi": True,  "roc": False},
+    "MEDIUM": {"obi": True,  "roc": True},
+    "HIGH":   {"obi": False, "roc": False},
+}
+```
+
+## Implementation
+```python
+from collections import deque
+
+class ATRRegimeFilter:
+    def __init__(self):
+        self.tr_history = deque(maxlen=ATR_PERIOD)
+        self.atr_pct_history = deque(maxlen=ATR_SMOOTH_PERIOD)
+        self.regime_history = deque(maxlen=REGIME_CONFIRM_BARS)
+        self.prev_close = None
+        self.current_regime = "MEDIUM"  # Safe default on startup
+
+    def update(self, high, low, close):
+        if self.prev_close is None:
+            self.prev_close = close
+            return self.current_regime
+
+        tr = max(
+            high - low,
+            abs(high - self.prev_close),
+            abs(low - self.prev_close)
+        )
+        self.tr_history.append(tr)
+        self.prev_close = close
+
+        if len(self.tr_history) < ATR_PERIOD:
+            return self.current_regime  # Not enough data yet
+
+        atr = sum(self.tr_history) / len(self.tr_history)
+        atr_pct = (atr / close) * 100
+        self.atr_pct_history.append(atr_pct)
+
+        smoothed_atr_pct = sum(self.atr_pct_history) / len(self.atr_pct_history)
+        raw_regime = self._classify(smoothed_atr_pct)
+
+        self.regime_history.append(raw_regime)
+
+        # Only switch regime if confirmed for REGIME_CONFIRM_BARS consecutive bars
+        if all(r == raw_regime for r in self.regime_history):
+            self.current_regime = raw_regime
+
+        return self.current_regime
+
+    def _classify(self, atr_pct):
+        if atr_pct < ATR_LOW_THRESHOLD:
+            return "LOW"
+        elif atr_pct > ATR_HIGH_THRESHOLD:
+            return "HIGH"
+        return "MEDIUM"
+
+    def strategy_allowed(self, strategy_name):
+        return REGIME_STRATEGY_MAP[self.current_regime].get(strategy_name, False)
+
+    def get_state(self):
+        return {
+            "regime": self.current_regime,
+            "atr_pct": list(self.atr_pct_history)[-1] if self.atr_pct_history else None,
+            "smoothed": sum(self.atr_pct_history) / len(self.atr_pct_history) if self.atr_pct_history else None,
+        }
+```
+
+## Usage By Other Modules
+```python
+# In OBI and ROC entry checks:
+regime_filter = ATRRegimeFilter()  # Singleton, shared across strategies
+
+# Every new candle — update first, then check strategies
+regime = regime_filter.update(candle.high, candle.low, candle.close)
+
+if regime_filter.strategy_allowed("obi"):
+    obi_module.evaluate()
+
+if regime_filter.strategy_allowed("roc"):
+    roc_module.evaluate()
+
+# Also check mid-trade for emergency exits
+if regime == "HIGH" and position.is_open:
+    exit_position("VOLATILITY_SPIKE")
+```
+
+## Implementation Structure
+```
+filters/
+  atr_regime/
+    __init__.py
+    filter.py        # ATRRegimeFilter class
+    config.py        # All thresholds and periods
+    visualizer.py    # Optional: plot regime over price history
+```
+
+## Common Pitfalls to Avoid
+- **Startup cold start**: Need `ATR_PERIOD` candles before regime is reliable — default to MEDIUM (safe) until warmed up
+- **Threshold flapping**: Without `REGIME_CONFIRM_BARS`, the regime will flip back and forth on borderline ATR values, causing noisy entry/exit
+- **Using raw ATR instead of ATR_PCT**: Raw ATR is not comparable across price levels — always normalize as % of price
+- **Bypassing in "obvious" conditions**: Never hardcode regime overrides — the filter exists precisely for moments you think you know better
+- **Forgetting mid-trade checks**: Regime can change while you're in a position — always re-check on each candle close
+
+## Logging Requirements
+```python
+{
+  "timestamp": ...,
+  "candle_high": ...,
+  "candle_low": ...,
+  "candle_close": ...,
+  "true_range": ...,
+  "atr_raw": ...,
+  "atr_pct": ...,
+  "atr_pct_smoothed": ...,
+  "regime": "LOW | MEDIUM | HIGH",
+  "obi_allowed": True/False,
+  "roc_allowed": True/False,
+}
+```
+
+## Calibration Notes
+- These thresholds are starting points — recalibrate after 30+ days of live data
+- BTC 15min ATR_PCT typically ranges 0.10%–0.80% in normal conditions
+- During major news events (CPI, Fed announcements, ETF news), ATR_PCT can spike above 1.5%+
+- Consider time-of-day adjustments: Asian session tends to be LOW, US open tends to spike HIGH

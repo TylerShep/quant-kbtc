@@ -1,0 +1,196 @@
+---
+name: low-latency-systems-engineer
+description: Role context for the Low-Latency Systems Engineer on the Kalshi BTC 15min trading bot. Use this skill when optimizing the signal-to-order round-trip time, profiling WebSocket message handling, reducing Python GIL overhead, tuning asyncio event loops, or benchmarking execution path latency.
+---
+
+# Low-Latency Systems Engineer
+
+## Role Purpose
+On Kalshi's 15-minute contracts, the window between a favorable order book shift and a filled position can be seconds. This role minimizes the "round-trip time" — from receiving a WebSocket book update to having an order confirmed on the exchange — so the bot captures the edge the QR found, rather than arriving late.
+
+## Latency Budget (Target)
+```
+WebSocket message received          →  0ms   (baseline)
+JSON parse + book reconstruction    →  < 2ms
+OBI calculation (top 10 levels)     →  < 3ms
+ATR regime check                    →  < 1ms
+Signal coordinator evaluation       →  < 5ms
+Order sizing calculation            →  < 1ms
+HTTP order submission               →  < 150ms  (network-bound)
+Order acknowledgment received       →  < 200ms
+─────────────────────────────────────────────
+Total round-trip target             →  < 350ms
+Hard ceiling                        →  < 500ms
+```
+
+## Critical Path Profiling
+```python
+import time
+import functools
+from collections import defaultdict
+
+# Decorator to measure any function in the critical path
+latency_log = defaultdict(list)
+
+def measure(name: str):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = time.perf_counter_ns()
+            result = fn(*args, **kwargs)
+            elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000
+            latency_log[name].append(elapsed_ms)
+            if elapsed_ms > LATENCY_BUDGET[name]:
+                logger.warning(f"LATENCY_BREACH: {name} took {elapsed_ms:.2f}ms")
+            return result
+        return wrapper
+    return decorator
+
+LATENCY_BUDGET = {
+    "parse_book":           2.0,
+    "calc_obi":             3.0,
+    "eval_signal":          5.0,
+    "submit_order":       150.0,
+}
+
+# Apply to critical path functions:
+@measure("calc_obi")
+def calculate_obi(bids, asks, depth=10): ...
+
+@measure("eval_signal")
+def evaluate_entry(candle, book, regime): ...
+```
+
+## Async Event Loop Optimization
+```python
+import asyncio
+import uvloop   # Drop-in asyncio replacement, ~2-4x faster for I/O
+
+# Always use uvloop in production
+uvloop.install()
+
+# Separate WebSocket handling from signal evaluation
+# — prevents OB processing latency from blocking order submission
+
+async def run_bot():
+    book_queue    = asyncio.Queue(maxsize=100)
+    candle_queue  = asyncio.Queue(maxsize=50)
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(book_stream_task(book_queue))     # Producer
+        tg.create_task(candle_feed_task(candle_queue))   # Producer
+        tg.create_task(signal_eval_task(book_queue, candle_queue))  # Consumer
+        tg.create_task(order_task())                     # Consumer
+
+async def book_stream_task(queue: asyncio.Queue):
+    """Read WebSocket frames, push to queue immediately — no computation here."""
+    async for msg in ws:
+        if not queue.full():
+            await queue.put(msg)
+        else:
+            logger.warning("Book queue full — dropping oldest frame")
+            queue.get_nowait()
+            await queue.put(msg)
+```
+
+## Order Book Reconstruction (Optimized)
+```python
+# Use sorted containers for O(log n) insert/delete vs O(n) sort
+from sortedcontainers import SortedDict
+
+class OrderBook:
+    """
+    Maintains a live L2 order book from incremental WebSocket deltas.
+    Uses SortedDict for fast top-N extraction.
+    """
+    def __init__(self):
+        self.bids = SortedDict(lambda x: -x)  # Descending (highest first)
+        self.asks = SortedDict()               # Ascending (lowest first)
+
+    def apply_delta(self, side: str, price: float, size: float):
+        book = self.bids if side == "yes" else self.asks
+        if size == 0:
+            book.pop(price, None)
+        else:
+            book[price] = size
+
+    def top_n(self, side: str, n: int = 10) -> list[dict]:
+        book = self.bids if side == "bids" else self.asks
+        return [{"price": p, "size": s} for p, s in list(book.items())[:n]]
+
+    def obi(self, depth: int = 10) -> float:
+        bid_vol = sum(s for _, s in list(self.bids.items())[:depth])
+        ask_vol = sum(s for _, s in list(self.asks.items())[:depth])
+        total   = bid_vol + ask_vol
+        return bid_vol / total if total > 0 else 0.5
+```
+
+## Memory Optimization
+```python
+# Use __slots__ on hot-path objects to avoid dict overhead
+class Candle:
+    __slots__ = ["timestamp", "open", "high", "low", "close", "volume"]
+    def __init__(self, ts, o, h, l, c, v):
+        self.timestamp = ts
+        self.open = o
+        self.high = h
+        self.low  = l
+        self.close = c
+        self.volume = v
+
+class Signal:
+    __slots__ = ["direction", "confidence", "obi_value", "roc_value", "regime"]
+
+# Use deque with maxlen instead of list for rolling windows — O(1) append
+from collections import deque
+obi_history = deque(maxlen=10)   # Rolling OBI readings, auto-evicts old values
+```
+
+## Connection Resilience
+```python
+# WebSocket reconnect with exponential backoff
+async def connect_with_retry(url: str, auth, on_message, max_retries: int = 10):
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            async with websockets.connect(url, extra_headers=auth.get_headers()) as ws:
+                logger.info("WebSocket connected")
+                attempt = 0   # Reset on successful connection
+                async for msg in ws:
+                    await on_message(msg)
+        except (websockets.ConnectionClosed, ConnectionError) as e:
+            attempt += 1
+            wait = min(2 ** attempt, 60)   # Cap at 60s
+            logger.warning(f"WS disconnected ({e}). Retry {attempt} in {wait}s")
+            await asyncio.sleep(wait)
+
+    logger.critical("Max WebSocket retries exceeded — bot halting")
+    await emergency_halt()
+```
+
+## Latency Monitoring Report
+```python
+def latency_report() -> dict:
+    """Generate p50/p95/p99 latency breakdown — run every hour."""
+    report = {}
+    for name, measurements in latency_log.items():
+        if measurements:
+            arr = sorted(measurements)
+            n   = len(arr)
+            report[name] = {
+                "p50":   arr[int(n * 0.50)],
+                "p95":   arr[int(n * 0.95)],
+                "p99":   arr[int(n * 0.99)],
+                "max":   arr[-1],
+                "count": n,
+                "budget_breaches": sum(1 for m in arr if m > LATENCY_BUDGET.get(name, 999)),
+            }
+    return report
+```
+
+## Guardrails
+- Never run CPU-intensive work (model inference, heavy logging) in the WebSocket callback
+- Always use asyncio.Queue between producers (WS/candle feed) and consumers (signal/order)
+- Profile before optimizing — measure actual bottleneck, don't assume
+- Test reconnect logic in staging — WS drops happen at the worst times
+- Always log latency breaches — silent slowdowns are invisible until they cost money

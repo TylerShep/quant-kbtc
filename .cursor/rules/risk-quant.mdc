@@ -1,0 +1,173 @@
+---
+name: risk-quant
+description: Role context for the Risk Quant/Analyst on the Kalshi BTC 15min trading bot. Use this skill when building or reviewing risk metrics, implementing circuit breakers, running stress tests, modeling potential drawdown scenarios, or setting risk limits across strategies.
+---
+
+# Risk Quant / Analyst (Risk Management)
+
+## Role Purpose
+The Risk Quant owns the risk framework — the rules that determine how much the bot can lose before it stops, how much it risks per trade, and what scenarios could wipe out the bankroll. This role acts as an independent check on the strategies and prevents catastrophic loss.
+
+## Primary Responsibilities
+- Design and maintain all risk limits (per-trade, daily, weekly, max drawdown)
+- Run stress tests simulating adverse BTC scenarios
+- Monitor live risk metrics and escalate when limits are approached
+- Ensure position sizing model is calibrated to actual live volatility
+- Review and approve changes to risk parameters
+- Model tail risk and extreme event impact on the portfolio
+
+## Risk Limit Framework
+```python
+# All limits stored in risk/config.py — single source of truth
+RISK_LIMITS = {
+    # Per-trade limits
+    "max_risk_per_trade_pct":   0.02,    # 2% of bankroll per trade baseline
+    "hard_ceiling_pct":         0.03,    # Never exceed 3% on a single trade
+    "stop_loss_pct":            0.02,    # Hard stop loss on every position
+
+    # Session limits
+    "daily_loss_limit_pct":     0.06,    # Halt trading if down 6% today
+    "weekly_loss_limit_pct":    0.15,    # Halt if down 15% this week
+
+    # Portfolio limits
+    "max_drawdown_pct":         0.20,    # Full bot pause if down 20% from peak
+    "max_concurrent_exposure":  0.10,    # Max 10% bankroll at risk simultaneously
+    "max_positions":            1,       # One position per market at a time
+
+    # Confidence-based sizing multipliers
+    "high_conviction_mult":     1.3,     # OBI + ROC both agree
+    "single_signal_mult":       0.7,     # Only one strategy firing
+    "drawdown_reduction_mult":  0.5,     # Reduce size when in drawdown > 10%
+}
+```
+
+## Circuit Breaker Logic
+```python
+class CircuitBreaker:
+    """
+    Independent module — runs on every candle close regardless of strategy state.
+    If any limit is breached, trading halts immediately.
+    """
+
+    def check_all(self, state: BotState) -> tuple[bool, str | None]:
+        """Returns (can_trade, halt_reason)."""
+        checks = [
+            self._check_daily_loss(state),
+            self._check_weekly_loss(state),
+            self._check_max_drawdown(state),
+            self._check_exposure(state),
+        ]
+        for can_trade, reason in checks:
+            if not can_trade:
+                self._trigger_halt(reason, state)
+                return False, reason
+        return True, None
+
+    def _check_daily_loss(self, state):
+        loss = (state.day_start_bankroll - state.current_bankroll) / state.day_start_bankroll
+        return loss < RISK_LIMITS["daily_loss_limit_pct"], f"DAILY_LOSS_LIMIT ({loss:.1%})"
+
+    def _check_weekly_loss(self, state):
+        loss = (state.week_start_bankroll - state.current_bankroll) / state.week_start_bankroll
+        return loss < RISK_LIMITS["weekly_loss_limit_pct"], f"WEEKLY_LOSS_LIMIT ({loss:.1%})"
+
+    def _check_max_drawdown(self, state):
+        dd = (state.peak_bankroll - state.current_bankroll) / state.peak_bankroll
+        return dd < RISK_LIMITS["max_drawdown_pct"], f"MAX_DRAWDOWN ({dd:.1%})"
+
+    def _check_exposure(self, state):
+        exposure = state.open_risk_amount / state.current_bankroll
+        return exposure < RISK_LIMITS["max_concurrent_exposure"], "MAX_EXPOSURE"
+
+    def _trigger_halt(self, reason, state):
+        state_store.set("circuit_breaker", {"triggered": True, "reason": reason})
+        alert_manager.send(f"CIRCUIT BREAKER TRIGGERED: {reason}", level="CRITICAL")
+```
+
+## Stress Testing Scenarios
+```python
+# Run monthly to validate risk limits are adequate
+STRESS_SCENARIOS = [
+    {
+        "name":        "Flash Crash",
+        "description": "BTC drops 15% in 30 minutes",
+        "btc_shock":   -0.15,
+        "kalshi_fill": 0.50,   # Assume 50% fill rate in chaos
+    },
+    {
+        "name":        "Prolonged Losing Streak",
+        "description": "10 consecutive losing trades at max stop loss",
+        "consecutive_losses": 10,
+        "loss_per_trade":     RISK_LIMITS["stop_loss_pct"],
+    },
+    {
+        "name":        "API Outage Mid-Position",
+        "description": "Bot cannot close position for 30 minutes during adverse move",
+        "adverse_move":       0.05,
+        "outage_duration_min": 30,
+    },
+    {
+        "name":        "Regime Misclassification",
+        "description": "ATR filter fails to detect HIGH volatility, OBI fires 5 bad trades",
+        "bad_trades":  5,
+        "loss_per_trade": RISK_LIMITS["hard_ceiling_pct"],
+    },
+]
+
+def run_stress_test(scenario: dict, current_bankroll: float) -> dict:
+    """Simulate worst-case outcome and report residual bankroll."""
+    # ... implementation
+    return {
+        "scenario":            scenario["name"],
+        "starting_bankroll":   current_bankroll,
+        "ending_bankroll":     ...,
+        "max_loss_pct":        ...,
+        "circuit_breaker_hit": ...,
+    }
+```
+
+## Risk Metrics Dashboard (Updated Daily)
+```python
+DAILY_RISK_REPORT = {
+    "date":                  ...,
+    "current_bankroll":      ...,
+    "peak_bankroll":         ...,
+    "current_drawdown_pct":  ...,
+    "daily_pnl_pct":         ...,
+    "weekly_pnl_pct":        ...,
+    "rolling_sharpe_30d":    ...,
+    "rolling_win_rate_30d":  ...,
+    "avg_risk_per_trade":    ...,   # Actual vs. configured limit
+    "circuit_breaker_hits":  ...,   # Count this week
+    "stress_test_results":   ...,   # Latest stress test output
+}
+```
+
+## Position Sizing Calibration (Quarterly Review)
+```python
+def recalibrate_stop_loss(live_trade_history: list[dict]) -> float:
+    """
+    Derive empirical stop loss from live trade ATR.
+    Stop loss should be ~1.5x the average adverse excursion.
+    """
+    adverse_excursions = [
+        t["max_adverse_move"] for t in live_trade_history
+        if t["exit_reason"] != "STOP_LOSS"   # Use trades that didn't hit stop
+    ]
+    avg_adverse = np.mean(adverse_excursions)
+    recommended_stop = avg_adverse * 1.5
+    return recommended_stop
+
+def recalibrate_profit_target(live_trade_history):
+    """Target should be ≥ 1.5x the stop loss for acceptable risk/reward."""
+    avg_win = np.mean([t["pnl_pct"] for t in live_trade_history if t["pnl_pct"] > 0])
+    avg_loss = abs(np.mean([t["pnl_pct"] for t in live_trade_history if t["pnl_pct"] < 0]))
+    return avg_win / avg_loss   # Target: > 1.5
+```
+
+## Guardrails — Absolute Rules
+- Circuit breakers are non-negotiable — QT cannot disable without written Risk Quant approval
+- Risk limits may only be loosened after a full stress test confirms safety
+- Any change to `RISK_LIMITS` must be version-controlled and reviewed
+- Maximum drawdown halt requires manual review before bot can resume — not an auto-reset
+- Stop loss on every open position — no exceptions, even "just for this one trade"

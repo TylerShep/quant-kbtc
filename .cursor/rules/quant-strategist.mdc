@@ -1,0 +1,184 @@
+---
+name: quant-strategist
+description: Role context for the Quant Strategist (Strats) on the Kalshi BTC 15min trading bot. Use this skill when building operational tooling for the bot, optimizing trading workflows, bridging signal research with execution logic, designing configuration management systems, or building internal dashboards and automation that connects strategy with infrastructure.
+---
+
+# Quant Strategist (Strats)
+
+## Role Purpose
+The Strats role bridges the gap between QR research, QD implementation, and live trading operations. The Strategist owns the operational layer — the tools, workflows, configs, and automation that keep the bot running smoothly and the team able to iterate quickly.
+
+## Primary Responsibilities
+- Build and maintain the configuration management system (all tunable parameters)
+- Design and own the signal coordination logic (how OBI and ROC interact)
+- Build internal tooling: dashboards, admin CLI, alert routing
+- Document and optimize the strategy deployment workflow
+- Own the parameter update process — ensuring changes are tested before going live
+- Bridge QR specs → QD implementation, catching gaps and ambiguities early
+
+## Configuration Management System
+```python
+# config/settings.py — single source of truth for all parameters
+# Loaded at startup from environment variables or config file
+# All strategy modules import from here — never hardcode
+
+from dataclasses import dataclass
+import os, json
+
+@dataclass
+class OBIConfig:
+    depth_levels:           int   = int(os.getenv("OBI_DEPTH_LEVELS",  "10"))
+    long_threshold:         float = float(os.getenv("OBI_LONG_THRESHOLD", "0.65"))
+    short_threshold:        float = float(os.getenv("OBI_SHORT_THRESHOLD", "0.35"))
+    consecutive_readings:   int   = int(os.getenv("OBI_CONSECUTIVE", "2"))
+    refresh_seconds:        int   = int(os.getenv("OBI_REFRESH_SECS", "30"))
+    min_book_volume:        int   = int(os.getenv("OBI_MIN_VOLUME", "1000"))
+
+@dataclass
+class ROCConfig:
+    lookback:               int   = int(os.getenv("ROC_LOOKBACK", "3"))
+    long_threshold:         float = float(os.getenv("ROC_LONG_THRESHOLD", "0.4"))
+    short_threshold:        float = float(os.getenv("ROC_SHORT_THRESHOLD", "-0.4"))
+    max_cap:                float = float(os.getenv("ROC_MAX_CAP", "2.5"))
+    candle_confirm_min:     int   = int(os.getenv("ROC_CANDLE_CONFIRM", "2"))
+
+@dataclass
+class ATRConfig:
+    period:                 int   = int(os.getenv("ATR_PERIOD", "14"))
+    low_threshold:          float = float(os.getenv("ATR_LOW_THRESHOLD", "0.15"))
+    high_threshold:         float = float(os.getenv("ATR_HIGH_THRESHOLD", "0.50"))
+
+@dataclass
+class RiskConfig:
+    risk_per_trade_pct:     float = float(os.getenv("RISK_PER_TRADE_PCT", "0.02"))
+    daily_loss_limit_pct:   float = float(os.getenv("DAILY_LOSS_LIMIT", "0.06"))
+    weekly_loss_limit_pct:  float = float(os.getenv("WEEKLY_LOSS_LIMIT", "0.15"))
+    max_drawdown_pct:       float = float(os.getenv("MAX_DRAWDOWN", "0.20"))
+
+@dataclass
+class BotConfig:
+    obi:    OBIConfig  = OBIConfig()
+    roc:    ROCConfig  = ROCConfig()
+    atr:    ATRConfig  = ATRConfig()
+    risk:   RiskConfig = RiskConfig()
+    market: str        = os.getenv("MARKET", "BTC")
+    env:    str        = os.getenv("BOT_ENV", "development")
+```
+
+## Parameter Update Workflow
+```
+Workflow for changing any live parameter:
+
+1. QR identifies need (e.g., "OBI threshold too sensitive in current regime")
+2. Strats opens a parameter change request (PCR) ticket with:
+   - Current value, proposed value, rationale
+   - Backtest showing impact of change
+   - Expected effect on win rate / trade frequency
+3. QD updates the config in a feature branch
+4. QA/Simulation Engineer runs paper trading for 48h minimum
+5. Strats reviews paper results vs expectation
+6. QT approves deployment to live
+7. Strats updates the config version log
+
+NEVER push parameter changes directly to production environment variables.
+```
+
+## Admin CLI (Operational Tooling)
+```python
+# tools/admin_cli.py
+# Simple command-line interface for QT and Strats to control the bot
+
+import argparse
+
+def main():
+    parser = argparse.ArgumentParser(description="Kalshi Bot Admin CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    # Bot control
+    sub.add_parser("status",   help="Show bot status, current regime, open position")
+    sub.add_parser("pause",    help="Pause new entries (let open positions close)")
+    sub.add_parser("halt",     help="Emergency halt — close all positions immediately")
+    sub.add_parser("resume",   help="Resume normal operation after manual pause")
+
+    # Performance
+    sub.add_parser("pnl",      help="Show today's P&L and trade count")
+    sub.add_parser("trades",   help="List recent trades with exit reasons")
+    sub.add_parser("metrics",  help="Show rolling win rate, Sharpe, drawdown")
+
+    # Risk
+    sub.add_parser("limits",   help="Show all active risk limits and current exposure")
+    sub.add_parser("stress",   help="Run latest stress test scenario")
+
+    # Config
+    p = sub.add_parser("config", help="Show current config values")
+    p.add_argument("--section", choices=["obi", "roc", "atr", "risk", "all"])
+
+    args = parser.parse_args()
+    dispatch(args)
+```
+
+## Signal Coordination Ownership
+```python
+# strategies/coordinator.py — Strats owns this file
+# This is the brain that decides when OBI and ROC agree/conflict
+
+class SignalCoordinator:
+    """
+    Strats role: maintain this coordination table.
+    QR defines signals individually; Strats defines how they interact.
+    """
+    # (obi_direction, roc_direction) → (trade_direction, confidence)
+    COORDINATION_TABLE = {
+        ("long",    "long"):    ("long",  "HIGH"),
+        ("long",    "neutral"): ("long",  "NORMAL"),
+        ("short",   "short"):   ("short", "HIGH"),
+        ("short",   "neutral"): ("short", "NORMAL"),
+        ("neutral", "long"):    ("long",  "LOW"),
+        ("neutral", "short"):   ("short", "LOW"),
+        ("long",    "short"):   (None, None),       # Conflict — skip
+        ("short",   "long"):    (None, None),       # Conflict — skip
+        ("neutral", "neutral"): (None, None),       # No signal
+    }
+```
+
+## Deployment Workflow Ownership
+```
+Strats maintains and documents:
+
+dev → paper → production pipeline:
+
+  1. git push feature branch
+  2. CI runs unit tests + backtest regression (QA owns the tests)
+  3. Paper trading deployment (auto-deploy to paper env on merge to staging)
+  4. Strats reviews paper results vs. expected performance
+  5. QT signs off on live deploy
+  6. Strats deploys to production (docker compose pull + restart)
+  7. Strats monitors first 24h post-deploy for anomalies
+```
+
+## Internal Dashboard (Key Metrics to Surface)
+```
+Real-time panel:
+  - Bot mode (ACTIVE / PAUSED / HALTED)
+  - ATR regime + current ATR_PCT value
+  - Open position (if any): direction, entry price, current PnL, candles held
+  - Today's trade count and win rate
+  - Daily PnL vs daily loss limit (progress bar)
+
+Daily summary panel:
+  - PnL chart (today, this week, this month)
+  - Trade breakdown by exit reason
+  - Regime distribution (% time in each regime)
+  - Signal conflict rate (% of eval cycles that were conflicts)
+
+Risk panel:
+  - Current drawdown from peak
+  - Weekly loss budget remaining
+  - Circuit breaker trigger history
+```
+
+## Guardrails
+- All parameter changes require a paper trading validation step — no exceptions
+- Coordination table changes require both QR approval (signal logic) and Risk Quant approval (risk impact)
+- Admin CLI actions that affect live positions must prompt for confirmation
+- Config version log must be updated on every parameter change

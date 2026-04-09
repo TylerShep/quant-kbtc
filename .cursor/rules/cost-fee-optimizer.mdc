@@ -1,0 +1,204 @@
+---
+name: cost-fee-optimizer
+description: Analysis and optimization of Kalshi fee structure, order pricing decisions, and their impact on net returns at scale. Use this skill when modeling the fee impact of a strategy, optimizing limit order pricing to improve fill rate without increasing slippage, calculating break-even trade frequency, or analyzing how fees change the viability of a signal.
+---
+
+# Cost & Fee Optimizer
+
+## Role Purpose
+Kalshi fees are a fixed drag on every trade. On a short-duration 15-minute strategy with tight margins, fees can consume 20–40% of gross profit if not managed carefully. This skill defines how to model fees accurately, price orders to minimize total cost, and set the minimum edge threshold a signal must clear to remain profitable after costs.
+
+## Kalshi Fee Structure
+```python
+# IMPORTANT: Verify against current Kalshi fee schedule — fees may change
+# https://kalshi.com/fees (check current docs)
+
+KALSHI_FEES = {
+    # Maker/taker model — limit orders that rest in book = maker, orders that cross = taker
+    "maker_fee_pct":    0.000,   # Maker orders: 0% (free — verify current policy)
+    "taker_fee_pct":    0.007,   # Taker orders: ~0.7% of notional (verify)
+
+    # Settlement fee on winning positions
+    "settlement_fee_pct": 0.010, # ~1% of winnings on settlement (verify)
+
+    # Minimum fee per trade
+    "min_fee_cents":      1,     # $0.01 minimum per order
+}
+
+def estimate_round_trip_fee(contracts: int, entry_price_cents: int,
+                             exit_price_cents: int, maker: bool = False) -> float:
+    """
+    Estimate total fees for one complete trade (entry + exit).
+    Returns fee in dollars.
+    """
+    fee_pct = KALSHI_FEES["maker_fee_pct"] if maker else KALSHI_FEES["taker_fee_pct"]
+
+    entry_notional = contracts * (entry_price_cents / 100)
+    exit_notional  = contracts * (exit_price_cents / 100)
+
+    entry_fee = max(entry_notional * fee_pct, KALSHI_FEES["min_fee_cents"] / 100)
+    exit_fee  = max(exit_notional  * fee_pct, KALSHI_FEES["min_fee_cents"] / 100)
+
+    return round(entry_fee + exit_fee, 4)
+```
+
+## Break-Even Analysis
+```python
+def calculate_breakeven_win_rate(avg_win_pct: float, avg_loss_pct: float,
+                                  fee_pct_of_notional: float) -> float:
+    """
+    Minimum win rate for the strategy to be profitable after fees.
+    Solve: win_rate * avg_win - (1 - win_rate) * avg_loss - fees = 0
+    """
+    # Adjust win and loss for fee drag
+    net_win  = avg_win_pct  - fee_pct_of_notional
+    net_loss = avg_loss_pct + fee_pct_of_notional
+
+    # Break-even: win_rate * net_win = (1 - win_rate) * net_loss
+    breakeven_wr = net_loss / (net_win + net_loss)
+    return round(breakeven_wr, 4)
+
+# Example: avg_win=2%, avg_loss=2%, fees=0.7% round-trip
+# net_win = 1.3%, net_loss = 2.7%
+# breakeven = 2.7 / (1.3 + 2.7) = 67.5%  ← much higher than the 50% raw breakeven
+# This is why fees matter enormously on tight-margin strategies
+
+def minimum_edge_after_fees(gross_edge_pct: float, fee_pct: float = 0.007) -> float:
+    """What edge remains after fees?"""
+    return gross_edge_pct - (fee_pct * 2)   # Entry + exit
+```
+
+## Order Pricing Strategy (Maker vs Taker)
+```python
+# Maker orders rest in the book and typically pay lower (or zero) fees
+# Taker orders cross the spread immediately — higher fees but guaranteed fill
+# On Kalshi, the fee difference can meaningfully affect profitability
+
+def price_limit_order(direction: str, book: dict, strategy: str = "maker_preferred") -> int:
+    """
+    Price a limit order to balance fill probability vs fee type.
+
+    strategy options:
+    - "maker_preferred": rest inside spread, aim for maker fill (lower fee)
+    - "taker_aggressive": cross spread for guaranteed fill (higher fee)
+    - "balanced": one cent inside best on our side (maker, high fill prob)
+    """
+    bids = book["bids"]
+    asks = book["asks"]
+
+    if strategy == "maker_preferred":
+        if direction == "long":
+            # Price just above best bid — stays in book, likely maker
+            return bids[0]["price"] + 1
+        else:
+            return asks[0]["price"] - 1
+
+    elif strategy == "taker_aggressive":
+        if direction == "long":
+            # Cross spread — fill immediately at best ask (taker)
+            return asks[0]["price"]
+        else:
+            return bids[0]["price"]
+
+    elif strategy == "balanced":
+        if direction == "long":
+            spread = asks[0]["price"] - bids[0]["price"]
+            # Enter at 1/3 into spread — good fill probability, likely maker
+            return bids[0]["price"] + max(1, spread // 3)
+        else:
+            spread = asks[0]["price"] - bids[0]["price"]
+            return asks[0]["price"] - max(1, spread // 3)
+
+# Rule: use "balanced" for entries, "taker_aggressive" only for emergency exits
+# (expiry risk, stop loss in fast market)
+```
+
+## Fee Impact by Trade Frequency
+```python
+def monthly_fee_projection(daily_trades: int, avg_notional_per_trade: float,
+                            fee_pct: float = 0.007) -> dict:
+    """
+    Project monthly fee burden at different trade frequencies.
+    Use to calibrate minimum signal quality threshold.
+    """
+    monthly_trades     = daily_trades * 30
+    fee_per_trade      = avg_notional_per_trade * fee_pct * 2   # Round-trip
+    total_monthly_fees = fee_per_trade * monthly_trades
+
+    # Required gross P&L to cover fees (at minimum 2x fees to be worth it)
+    required_gross = total_monthly_fees * 2
+
+    return {
+        "daily_trades":          daily_trades,
+        "monthly_trades":        monthly_trades,
+        "fee_per_trade_dollars": round(fee_per_trade, 3),
+        "total_monthly_fees":    round(total_monthly_fees, 2),
+        "required_gross_pnl":    round(required_gross, 2),
+        "fee_drag_on_10k_bankroll": f"{total_monthly_fees / 10000 * 100:.2f}%/month",
+    }
+
+# Example outputs at different trade frequencies (avg notional = $20/trade):
+# 5 trades/day:  $4.20/trade * 150 = $63/mo fees → need $126/mo gross to be worth it
+# 10 trades/day: $4.20 * 300 = $126/mo → need $252/mo gross
+# 20 trades/day: $4.20 * 600 = $252/mo → signals must be very strong
+```
+
+## Net P&L Waterfall
+```python
+def pnl_waterfall(trades: pd.DataFrame, bankroll: float) -> dict:
+    """
+    Full cost waterfall: gross → after fees → after slippage → after infra.
+    Gives the true net return picture.
+    """
+    gross_pnl         = trades["pnl_cents"].sum() / 100
+    total_fees        = trades["fees_cents"].sum() / 100
+    total_slippage    = trades.get("slippage_cents", pd.Series([0])).sum() / 100
+    monthly_infra     = 54.00   # From treasury-capital-manager
+
+    after_fees        = gross_pnl - total_fees
+    after_slippage    = after_fees - total_slippage
+    net_pnl           = after_slippage - monthly_infra
+
+    return {
+        "gross_pnl":           round(gross_pnl, 2),
+        "less_kalshi_fees":    round(-total_fees, 2),
+        "after_fees":          round(after_fees, 2),
+        "less_slippage":       round(-total_slippage, 2),
+        "after_slippage":      round(after_slippage, 2),
+        "less_infrastructure": round(-monthly_infra, 2),
+        "net_pnl":             round(net_pnl, 2),
+        "net_return_pct":      round(net_pnl / bankroll * 100, 2),
+        "fees_as_pct_gross":   round(total_fees / gross_pnl * 100, 1) if gross_pnl > 0 else "N/A",
+    }
+```
+
+## Cost Reduction Levers
+```python
+COST_REDUCTION_OPPORTUNITIES = {
+    "maker_order_preference": {
+        "description": "Price limit orders to rest in book (maker) vs. cross spread (taker)",
+        "estimated_savings": "0–0.7% per trade depending on Kalshi maker/taker differential",
+        "tradeoff": "Slightly lower fill rate — accept partial fills more often",
+        "implementation": "Use 'balanced' order pricing strategy in execution-algo-developer",
+    },
+    "reduce_trade_frequency": {
+        "description": "Tighten entry thresholds to trade less but with higher edge",
+        "estimated_savings": "Linear — fewer trades = fewer fees",
+        "tradeoff": "Lower total opportunity, must ensure remaining edge > fee drag",
+        "implementation": "QR raises OBI threshold from 0.65 → 0.68, re-validates IC",
+    },
+    "increase_position_size": {
+        "description": "Larger positions = same fee per trade, more P&L per trade",
+        "estimated_savings": "Fees as % of P&L fall as position size rises",
+        "tradeoff": "Higher risk per trade — must stay within risk limits",
+        "implementation": "Only viable once strategy proven — coordinate with risk-quant",
+    },
+}
+```
+
+## Guardrails
+- Always model fees in backtests — never report gross P&L as the headline number
+- Break-even win rate after fees is the minimum acceptable signal quality threshold
+- If fees consume > 30% of gross P&L, the strategy edge is too thin — escalate to QR for review
+- Verify Kalshi fee schedule quarterly — fees can change and invalidate existing models
+- Slippage is also a cost — track actual fill vs expected fill price on every trade

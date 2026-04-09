@@ -1,0 +1,215 @@
+---
+name: market-microstructure-researcher
+description: Role context for the Market Microstructure Researcher on the Kalshi BTC 15min trading bot. Use this skill when analyzing Kalshi-specific liquidity patterns, studying how order book depth and spread change by time-of-day or day-of-week, investigating Asian vs US session differences, preventing the bot from over-trading in thin liquidity windows, or studying how Kalshi's contract structure affects OBI signal reliability.
+---
+
+# Market Microstructure Researcher
+
+## Role Purpose
+This role studies how Kalshi's BTC 15-minute market actually behaves — not just what BTC price does, but how liquidity shifts throughout the day, how the order book behaves during different trading sessions, and when the bot's signals are reliable vs. when the market is too thin or too chaotic to trade. Prevents costly mistakes that look fine in backtests but blow up in live trading during 3 AM Asian session.
+
+## Primary Responsibilities
+- Analyze time-of-day and day-of-week patterns in Kalshi BTC liquidity
+- Identify sessions when OBI and ROC signals are least reliable
+- Study how Kalshi's market maker behavior changes across the day
+- Quantify spread, book depth, and OBI reliability by hour
+- Produce session-based trading recommendations (trade / reduce size / avoid)
+- Investigate how Kalshi contract settlement mechanics affect pricing in final minutes
+
+## Session Analysis Framework
+```python
+# research/microstructure/session_analyzer.py
+
+import pandas as pd
+import numpy as np
+
+SESSIONS = {
+    "ASIA":       (0,  8),    # 00:00–08:00 UTC
+    "LONDON":     (7,  16),   # 07:00–16:00 UTC (overlap with Asia 07–08)
+    "US_OPEN":    (13, 17),   # 13:00–17:00 UTC (US market open + early)
+    "US_MAIN":    (17, 22),   # 17:00–22:00 UTC (peak US activity)
+    "US_CLOSE":   (22, 24),   # 22:00–00:00 UTC (winding down)
+}
+
+def assign_session(timestamp_utc: pd.Timestamp) -> str:
+    hour = timestamp_utc.hour
+    for session, (start, end) in SESSIONS.items():
+        if start <= hour < end:
+            return session
+    return "ASIA"   # Catches 00:00–07:00 overflow
+
+def analyze_session_liquidity(ob_snapshots: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each session, compute:
+    - Median total book volume
+    - Median spread (cents)
+    - OBI distribution (mean, std, % time above 0.65 or below 0.35)
+    - Signal reliability proxy (IC of OBI with subsequent price move)
+    """
+    ob_snapshots["session"] = ob_snapshots["timestamp"].apply(assign_session)
+    ob_snapshots["hour"]    = ob_snapshots["timestamp"].dt.hour
+
+    return ob_snapshots.groupby("session").agg(
+        median_book_volume    = ("total_bid_vol", lambda x: (x + ob_snapshots.loc[x.index, "total_ask_vol"]).median()),
+        median_spread_cents   = ("spread_cents", "median"),
+        obi_mean              = ("obi", "mean"),
+        obi_std               = ("obi", "std"),
+        obi_extreme_pct       = ("obi", lambda x: ((x > 0.65) | (x < 0.35)).mean()),
+        snapshot_count        = ("obi", "count"),
+    ).reset_index()
+```
+
+## Liquidity Pattern Research Outputs
+```python
+# Expected findings to investigate and quantify:
+
+KNOWN_MICROSTRUCTURE_PATTERNS = {
+    "asian_session": {
+        "hypothesis": "Kalshi BTC book is significantly thinner 00:00–08:00 UTC",
+        "expected": "OBI signals less reliable, higher false positive rate",
+        "recommendation": "Raise OBI threshold to 0.70/0.30 or skip trading",
+        "validation_query": """
+            SELECT hour, AVG(total_bid_vol + total_ask_vol) AS avg_book_depth
+            FROM ob_snapshots
+            WHERE timestamp >= NOW() - INTERVAL '90 days'
+            GROUP BY hour ORDER BY hour
+        """,
+    },
+    "us_open_spike": {
+        "hypothesis": "13:00–14:00 UTC sees sharp ATR spike as US markets open",
+        "expected": "ATR regime frequently hits HIGH, suppressing both strategies",
+        "recommendation": "Expect reduced trade frequency in this window — normal",
+        "validation_query": """
+            SELECT EXTRACT(HOUR FROM timestamp) AS hour,
+                   AVG(atr_pct) AS avg_atr_pct,
+                   AVG(CASE WHEN atr_regime = 'HIGH' THEN 1 ELSE 0 END) AS high_regime_pct
+            FROM signal_log
+            GROUP BY hour ORDER BY hour
+        """,
+    },
+    "contract_expiry_spread": {
+        "hypothesis": "Spreads widen in final 3 minutes of each 15-min contract",
+        "expected": "Fill rates drop, slippage increases",
+        "recommendation": "Execution algo must account for wider spreads near expiry",
+        "validation_query": """
+            -- Analyze spread by minutes-remaining-in-contract
+            -- Requires contract expiry metadata joined to ob_snapshots
+        """,
+    },
+    "weekend_thin_books": {
+        "hypothesis": "Saturday/Sunday books are thinner than weekdays",
+        "expected": "Higher OBI volatility (easier to move), lower signal reliability",
+        "recommendation": "Consider reducing max position size on weekends",
+    },
+}
+```
+
+## Signal Reliability by Session (Monthly Report)
+```python
+def compute_session_signal_ic(trades: pd.DataFrame, ob_snapshots: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each session, compute the Information Coefficient of OBI
+    with trade outcomes. Low IC = signal unreliable in that session.
+    """
+    from scipy import stats
+
+    trades["session"] = trades["entry_timestamp"].apply(
+        lambda ts: assign_session(pd.Timestamp(ts, tz="UTC"))
+    )
+
+    results = []
+    for session, group in trades.groupby("session"):
+        if len(group) < 30:
+            continue   # Too few trades for reliable IC
+        ic, p = stats.spearmanr(group["obi_at_entry"], group["pnl_pct"])
+        results.append({
+            "session":          session,
+            "n_trades":         len(group),
+            "ic":               round(ic, 4),
+            "p_value":          round(p, 4),
+            "win_rate":         (group["pnl_pct"] > 0).mean(),
+            "avg_spread_cents": group.get("spread_at_entry", pd.Series()).mean(),
+            "signal_reliable":  p < 0.05 and abs(ic) > 0.03,
+        })
+    return pd.DataFrame(results)
+```
+
+## Thin Book Detection (Live Signal Gating)
+```python
+# Microstructure researcher defines these thresholds based on session analysis.
+# QD implements them in the OBI module as dynamic thresholds.
+
+SESSION_BOOK_DEPTH_FLOORS = {
+    "ASIA":     500,    # Require at least 500 units of combined book volume
+    "LONDON":   800,
+    "US_OPEN":  1000,
+    "US_MAIN":  1000,
+    "US_CLOSE": 700,
+}
+
+SESSION_OBI_THRESHOLDS = {
+    # Tighter thresholds in thin sessions to reduce false signals
+    "ASIA":     {"long": 0.70, "short": 0.30},   # Stricter in thin market
+    "LONDON":   {"long": 0.65, "short": 0.35},   # Standard
+    "US_OPEN":  {"long": 0.65, "short": 0.35},
+    "US_MAIN":  {"long": 0.65, "short": 0.35},
+    "US_CLOSE": {"long": 0.67, "short": 0.33},   # Slightly stricter as liquidity fades
+}
+```
+
+## Kalshi-Specific Contract Mechanics Research
+```python
+# Key questions to investigate quarterly:
+
+KALSHI_MECHANICS_RESEARCH = [
+    {
+        "question": "Does OBI predict settlement direction or just short-term mid-price?",
+        "why": "Kalshi settles YES/NO — understanding what OBI is actually predicting matters",
+        "method": "Compare OBI at t-5min with contract settlement outcome",
+    },
+    {
+        "question": "Do Kalshi market makers systematically bias the book?",
+        "why": "If MM always quotes wide, OBI readings are less informative",
+        "method": "Analyze MM order flow patterns — do large orders appear/disappear predictably?",
+    },
+    {
+        "question": "Is there a relationship between Kalshi open interest and OBI reliability?",
+        "why": "High OI contracts may attract more arbitrageurs who dampen OBI predictiveness",
+        "method": "Correlate OI level with OBI IC across contracts",
+    },
+]
+```
+
+## Monthly Microstructure Report Template
+```markdown
+## Microstructure Report — [Month Year]
+
+### Session Liquidity Summary
+| Session    | Avg Book Depth | Median Spread | OBI IC | Reliable? |
+|------------|---------------|---------------|--------|-----------|
+| ASIA       | X units       | X cents       | X.XXX  | YES/NO    |
+| LONDON     | X units       | X cents       | X.XXX  | YES/NO    |
+| US_OPEN    | X units       | X cents       | X.XXX  | YES/NO    |
+| US_MAIN    | X units       | X cents       | X.XXX  | YES/NO    |
+| US_CLOSE   | X units       | X cents       | X.XXX  | YES/NO    |
+
+### Threshold Recommendations for Next Month
+- OBI thresholds by session: [any changes from current?]
+- Book depth floors: [any changes?]
+- Session avoidance: [any sessions to suspend trading?]
+
+### Anomalies Observed
+- [Any unusual book behavior, MM pattern changes, or regime shifts]
+
+### Action Items
+- [Config updates needed → Strats]
+- [Code changes needed → QD]
+- [Further research needed → QR]
+```
+
+## Guardrails
+- Never recommend trading in a session without IC analysis from actual Kalshi data
+- Session thresholds must be reviewed quarterly — liquidity patterns evolve as market matures
+- Do not confuse external BTC spot microstructure with Kalshi's — they are different markets
+- Thin book recommendations must be tested in paper trading before live config updates
+- Always disaggregate performance by session before declaring a signal has decayed globally

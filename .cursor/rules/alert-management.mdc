@@ -1,0 +1,226 @@
+---
+name: alert-management
+description: Full alerting stack for the Kalshi BTC 15min trading bot — what conditions page, routing rules, escalation paths, and how to prevent alert fatigue. Use this skill when configuring alerts, adding new alert conditions, tuning thresholds to reduce noise, or building the alert routing and escalation system.
+---
+
+# Alert Management
+
+## Role Purpose
+The bot runs 24/7. Alerts are the only way to know something needs human attention at 3 AM. This skill defines what triggers an alert, how urgent each alert is, where it routes, and how to keep alert volume low enough that every alert still gets taken seriously.
+
+## Alert Taxonomy
+```
+CRITICAL  → Page immediately, any time of day or night
+            Human must respond within 5 minutes.
+            Reserve for: financial risk, security, bot is blind
+
+WARNING   → Notify promptly, human should check within 30 minutes
+            Does not require waking anyone up.
+            Reserve for: degraded performance, approaching limits
+
+INFO      → Daily digest only, no immediate action required
+            Reserve for: operational summaries, health stats
+
+RESOLVED  → Automatic clear when condition resolves
+            Always send a RESOLVED when a CRITICAL or WARNING clears
+```
+
+## Alert Catalog
+
+### CRITICAL Alerts
+```python
+CRITICAL_ALERTS = {
+    "POSITION_CANNOT_CLOSE": {
+        "trigger":     "Exit order rejected 3+ times in a row",
+        "message":     "CRITICAL: Cannot close position on {ticker}. {n} rejections. Reason: {reason}",
+        "route":       ["pager", "sms", "slack_critical"],
+        "auto_action": "cancel_all_orders(), escalate_to_human()",
+    },
+    "CIRCUIT_BREAKER_MAX_DRAWDOWN": {
+        "trigger":     "Drawdown exceeds MAX_DRAWDOWN_PCT (20%)",
+        "message":     "CRITICAL: Max drawdown hit. Bankroll: ${bankroll}. Peak: ${peak}. DD: {pct}%",
+        "route":       ["pager", "sms", "slack_critical"],
+        "auto_action": "halt_all_trading()",
+    },
+    "API_AUTH_FAILURE": {
+        "trigger":     "Kalshi API returns 401 on any request",
+        "message":     "CRITICAL: Kalshi auth failing. Possible key expiry or compromise.",
+        "route":       ["pager", "sms", "slack_critical"],
+        "auto_action": "halt_all_trading(), pause_new_orders()",
+    },
+    "BOT_UNRESPONSIVE": {
+        "trigger":     "Heartbeat stale > 5 minutes AND watchdog failed to recover",
+        "message":     "CRITICAL: Bot heartbeat stale {age_min}min. Watchdog not recovering.",
+        "route":       ["pager", "sms", "slack_critical"],
+        "auto_action": "watchdog escalation — manual intervention required",
+    },
+    "DATABASE_DOWN_WITH_POSITION": {
+        "trigger":     "DB unreachable AND open position exists",
+        "message":     "CRITICAL: DB down with open position on {ticker}. Cannot log or update state.",
+        "route":       ["pager", "sms", "slack_critical"],
+        "auto_action": "bot continues running to close position using cached state",
+    },
+}
+```
+
+### WARNING Alerts
+```python
+WARNING_ALERTS = {
+    "DAILY_LOSS_LIMIT_TRIGGERED": {
+        "trigger":     "Daily loss reaches DAILY_LOSS_LIMIT_PCT",
+        "message":     "WARNING: Daily loss limit hit. Today: {daily_pnl_pct}%. Trading halted until midnight UTC.",
+        "route":       ["slack_trading", "email"],
+    },
+    "WEEKLY_LOSS_LIMIT_TRIGGERED": {
+        "trigger":     "Weekly loss reaches WEEKLY_LOSS_LIMIT_PCT",
+        "message":     "WARNING: Weekly loss limit hit. This week: {weekly_pnl_pct}%. Trading halted until Monday.",
+        "route":       ["slack_trading", "email", "sms"],
+    },
+    "HEARTBEAT_STALE": {
+        "trigger":     "Heartbeat stale > 3 minutes (watchdog catching up)",
+        "message":     "WARNING: Heartbeat stale {age_min}min. Watchdog attempting recovery.",
+        "route":       ["slack_infra"],
+        "auto_resolve": True,
+    },
+    "HIGH_LATENCY": {
+        "trigger":     "Order submission P99 > 500ms for 10+ consecutive trades",
+        "message":     "WARNING: High execution latency. P99: {p99_ms}ms. Budget: 500ms.",
+        "route":       ["slack_infra"],
+    },
+    "PIPELINE_STALE": {
+        "trigger":     "External data feed (Binance/Coinbase) stale > 2 minutes",
+        "message":     "WARNING: {source} data stale {lag_sec}s. OBI may be using stale book data.",
+        "route":       ["slack_infra"],
+        "auto_resolve": True,
+    },
+    "DISK_HIGH": {
+        "trigger":     "Disk usage > 85%",
+        "message":     "WARNING: Disk at {pct}%. Run log rotation or archive old OB snapshots.",
+        "route":       ["slack_infra"],
+    },
+    "FILL_RATE_LOW": {
+        "trigger":     "Fill rate < 70% over last 20 trades",
+        "message":     "WARNING: Fill rate {rate}% over last 20 trades. Order pricing may need tuning.",
+        "route":       ["slack_trading"],
+    },
+    "HIGH_CONFLICT_RATE": {
+        "trigger":     "Signal conflict rate > 25% in last 2 hours",
+        "message":     "WARNING: OBI/ROC conflict rate {rate}% in last 2hrs. Signals may be miscalibrated.",
+        "route":       ["slack_trading"],
+    },
+}
+```
+
+### INFO Alerts (Daily Digest Only)
+```python
+INFO_DIGEST = {
+    "daily_pnl_summary":        "Today's PnL, trade count, win rate",
+    "regime_distribution":      "% time in each ATR regime today",
+    "latency_report":           "P50/P95/P99 latency by component",
+    "backup_status":            "Daily backup completion + size",
+    "circuit_breaker_summary":  "Any circuit breaker events today",
+}
+```
+
+## Alert Routing Implementation
+```python
+# alerts/manager.py
+
+import os
+import requests
+import json
+
+class AlertManager:
+
+    def __init__(self):
+        self.slack_critical   = os.getenv("SLACK_CRITICAL_WEBHOOK")
+        self.slack_trading    = os.getenv("SLACK_TRADING_WEBHOOK")
+        self.slack_infra      = os.getenv("SLACK_INFRA_WEBHOOK")
+        self.sms_webhook      = os.getenv("SMS_ALERT_WEBHOOK")   # e.g., PagerDuty/Twilio
+        self.email_webhook    = os.getenv("EMAIL_ALERT_WEBHOOK")
+        self.active_alerts    = {}   # Track active alerts to prevent repeat firing
+
+    def send(self, alert_key: str, level: str, message: str, **context):
+        """Route and send an alert. Deduplicates within 15-minute windows."""
+
+        # Deduplication: don't re-alert on the same condition every minute
+        dedup_key = f"{alert_key}:{level}"
+        if dedup_key in self.active_alerts:
+            return   # Already alerting on this — skip
+
+        self.active_alerts[dedup_key] = True
+
+        # Format message with context
+        formatted = message.format(**context)
+
+        # Route by level
+        if level == "CRITICAL":
+            self._send_slack(self.slack_critical, formatted, level, alert_key)
+            self._send_sms(formatted)
+        elif level == "WARNING":
+            channel = CRITICAL_ALERTS.get(alert_key, {}).get("route", ["slack_trading"])
+            if "slack_infra"    in channel: self._send_slack(self.slack_infra, formatted, level, alert_key)
+            if "slack_trading"  in channel: self._send_slack(self.slack_trading, formatted, level, alert_key)
+            if "sms"            in channel: self._send_sms(formatted)
+            if "email"          in channel: self._send_email(formatted)
+
+        # Log all alerts
+        logger.info("ALERT_SENT", alert_key=alert_key, level=level, message=formatted)
+
+    def resolve(self, alert_key: str):
+        """Send RESOLVED notification when a condition clears."""
+        dedup_key_critical = f"{alert_key}:CRITICAL"
+        dedup_key_warning  = f"{alert_key}:WARNING"
+        was_active = dedup_key_critical in self.active_alerts or dedup_key_warning in self.active_alerts
+
+        self.active_alerts.pop(dedup_key_critical, None)
+        self.active_alerts.pop(dedup_key_warning, None)
+
+        if was_active:
+            self._send_slack(self.slack_trading, f"✅ RESOLVED: {alert_key}", "RESOLVED", alert_key)
+
+    def _send_slack(self, webhook: str, message: str, level: str, key: str):
+        emoji = {"CRITICAL": "🚨", "WARNING": "⚠️", "RESOLVED": "✅", "INFO": "ℹ️"}.get(level, "")
+        try:
+            requests.post(webhook, json={"text": f"{emoji} *{level}* | {key}\n{message}"}, timeout=5)
+        except Exception as e:
+            logger.error("ALERT_SEND_FAILED", channel="slack", error=str(e))
+
+    def _send_sms(self, message: str):
+        # Implement with PagerDuty, Twilio, or similar
+        try:
+            requests.post(self.sms_webhook, json={"message": message[:160]}, timeout=5)
+        except Exception as e:
+            logger.error("ALERT_SEND_FAILED", channel="sms", error=str(e))
+```
+
+## Alert Fatigue Prevention
+```python
+ANTI_FATIGUE_RULES = {
+    "deduplication_window_min":    15,    # Same alert doesn't fire more than once per 15 min
+    "warning_cooldown_min":        60,    # Same WARNING doesn't repeat within 1 hour
+    "max_alerts_per_hour":         10,    # If > 10 alerts/hour, suppress non-criticals
+    "digest_hour_utc":             8,     # INFO digest sent once daily at 8 AM UTC
+    "auto_resolve_required":       True,  # All WARNING alerts must have auto-resolve path
+}
+
+def check_alert_volume(alert_log: list) -> bool:
+    """Return True if alert volume is too high — suppress non-criticals."""
+    recent = [a for a in alert_log if a["age_min"] < 60]
+    return len(recent) > ANTI_FATIGUE_RULES["max_alerts_per_hour"]
+```
+
+## Slack Channel Structure
+```
+#kalshi-critical   → CRITICAL only. Every message here requires a human response.
+#kalshi-trading    → Trade decisions, circuit breakers, fill rates, PnL alerts
+#kalshi-infra      → Latency, disk, pipeline, WS reconnects
+#kalshi-daily      → Daily digest (automated, no one needs to read immediately)
+```
+
+## Guardrails
+- CRITICAL alerts must always get through — never suppress based on volume or deduplication
+- Every CRITICAL must have a RESOLVED when the condition clears — no open alerts left dangling
+- Never add a new alert without defining its deduplication window and auto-resolve condition
+- Review alert volume monthly — if any WARNING fires > 5x/week, tune the threshold or fix the root cause
+- Test alert routing quarterly: intentionally trigger each CRITICAL to confirm it actually pages

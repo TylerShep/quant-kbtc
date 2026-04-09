@@ -1,0 +1,265 @@
+---
+name: strategy-onboarding
+description: End-to-end checklist and workflow for taking a new trading signal from QR research spec all the way to live production deployment. Use this skill when onboarding a new strategy, as a master checklist before any new signal goes live, or to audit whether an existing strategy was properly validated before deployment.
+---
+
+# Strategy Onboarding
+
+## Role Purpose
+This is the master workflow that ties every other skill together. A new signal idea is worthless — and potentially dangerous — without passing through each gate systematically. This skill defines the complete onboarding process, who owns each step, and the hard criteria that must be met before a strategy touches real capital.
+
+## Onboarding Phases Overview
+```
+Phase 1: Research & Specification     (QR owns)
+Phase 2: Data Validation              (DS/DE owns)
+Phase 3: Backtesting                  (QR + QA own)
+Phase 4: Walk-Forward Validation      (QR + Walk-Forward Optimizer)
+Phase 5: Implementation               (QD owns)
+Phase 6: Unit & Integration Testing   (QA owns)
+Phase 7: Paper Trading                (QA + QT own)
+Phase 8: Micro Live Deployment        (QT + Risk Quant own)
+Phase 9: Scale-Up                     (PM + Treasury own)
+```
+
+---
+
+## Phase 1: Research & Specification
+**Owner: Quantitative Researcher**
+**Exit Criteria: Completed signal spec document**
+
+```
+[ ] Hypothesis written in plain English (one sentence)
+[ ] Market inefficiency clearly identified
+[ ] Expected win rate and hold duration estimated
+[ ] Data requirements fully listed (exact field names, frequency, source)
+[ ] Signal formula defined with all parameters named and typed
+[ ] Entry conditions written as unambiguous boolean logic
+[ ] Exit conditions defined in priority order
+[ ] ATR regime fit specified (LOW / MEDIUM / HIGH)
+[ ] Conflict behavior defined (what blocks this signal)
+[ ] Edge cases documented (thin book, news spike, post-halt, etc.)
+[ ] Signal spec document delivered to QD and DS/DE
+```
+
+---
+
+## Phase 2: Data Validation
+**Owner: Data Scientist / Engineer**
+**Exit Criteria: Clean dataset with validation report**
+
+```
+[ ] All required data fields confirmed available
+[ ] Data completeness checked: % of expected timestamps present
+[ ] Gaps identified and documented
+[ ] Data validated against schema (no negative prices, no zero volumes, etc.)
+[ ] Cross-source validation complete (Binance vs Coinbase prices aligned)
+[ ] Timestamp normalization confirmed (all UTC, all to 15-min boundaries)
+[ ] Survivorship bias assessed (are we missing delisted contracts?)
+[ ] Minimum dataset size confirmed: >= 2000 labeled examples
+[ ] Validation report delivered to QR
+```
+
+---
+
+## Phase 3: Backtesting
+**Owner: Quantitative Researcher + QA/Simulation Engineer**
+**Exit Criteria: Backtest clears all minimum thresholds**
+
+```
+[ ] Backtest implemented with NO look-ahead bias (verified manually)
+[ ] Realistic fill assumptions applied (slippage, partial fills, fees)
+[ ] Kalshi fee structure modeled correctly (see cost-fee-optimizer)
+[ ] Backtest run on full dataset with 70/30 train/test split
+[ ] Test set not touched during any optimization
+
+Minimum thresholds (ALL must be met on test set):
+[ ] Win rate > 52%
+[ ] Sharpe ratio > 1.0
+[ ] Max drawdown < 20%
+[ ] Total trades > 200
+[ ] Profit factor > 1.2
+[ ] Fee-adjusted net Sharpe > 0.8
+
+Red flags that kill the backtest (ANY fails it):
+[ ] Sharpe > 3.0 (likely overfitting)
+[ ] Win rate > 70% (too good to be true)
+[ ] < 200 trades (insufficient sample)
+[ ] Performance concentrated in < 3 months of data
+[ ] Backtest report delivered
+```
+
+---
+
+## Phase 4: Walk-Forward Validation
+**Owner: Quantitative Researcher**
+**Exit Criteria: Edge confirmed across multiple independent windows**
+
+```
+[ ] Walk-forward windows configured (see walk-forward-optimizer)
+[ ] Parameters optimized on rolling train windows only
+[ ] Each test window is genuinely unseen data
+[ ] Results analyzed across all windows
+
+Minimum acceptance:
+[ ] > 60% of test windows show positive Sharpe (> 0.5)
+[ ] Average test Sharpe > 0.8 across all windows
+[ ] Overfitting gap (train - test Sharpe) < 1.0 on average
+[ ] Final parameters selected by majority vote, NOT by best single window
+[ ] Walk-forward report delivered to QD and Strats
+```
+
+---
+
+## Phase 5: Implementation
+**Owner: Quant Developer**
+**Exit Criteria: Code matches signal spec exactly, all tests written**
+
+```
+[ ] Signal implemented exactly as specified — no undocumented deviations
+[ ] All parameters loaded from config (not hardcoded)
+[ ] Type hints on all public functions
+[ ] Exception handling on all API calls and signal evaluations
+[ ] Logging before and after every trade action (see logging-observability)
+[ ] Heartbeat written on each loop iteration
+[ ] Signal passed through SignalConflictResolver (never submitted directly)
+[ ] Contract selection logic integrated (see contract-selection)
+[ ] Rate limiter wrapped around all order calls (see risk-manager-compliance-officer)
+[ ] Unit tests written for:
+    [ ] Signal calculation with known inputs → expected outputs
+    [ ] Edge cases (thin book, zero volume, extreme values)
+    [ ] Entry blocked in wrong ATR regime
+    [ ] Exit conditions trigger correctly
+[ ] Code review complete
+[ ] QD signs off: "Implementation matches spec"
+```
+
+---
+
+## Phase 6: Integration Testing
+**Owner: QA / Simulation Engineer**
+**Exit Criteria: All regression tests pass, fill model calibrated**
+
+```
+[ ] Full regression test suite passes (100% — no skips)
+[ ] Integration test: signal → coordinator → order manager → fill (end-to-end)
+[ ] Mock Kalshi API used for all order submission tests
+[ ] Paper fill model validated against recent real Kalshi fill data
+[ ] Latency measured: signal evaluation < 50ms, order submission P99 < 500ms
+[ ] No memory leaks confirmed (run for 24h on dev, monitor RSS)
+[ ] Bot gracefully handles:
+    [ ] WebSocket disconnect mid-evaluation
+    [ ] DB connection failure
+    [ ] Order rejection (all codes)
+    [ ] Contract expiry with open position
+    [ ] SIGTERM with open position (close before shutdown)
+[ ] QA sign-off: "Code is testable and tested"
+```
+
+---
+
+## Phase 7: Paper Trading
+**Owner: QA/Simulation Engineer + Quantitative Trader**
+**Exit Criteria: Paper results within acceptable range of backtest**
+
+```
+Minimum paper trading duration: 4 weeks OR 100 trades (whichever is later)
+
+[ ] Paper bot deployed to paper environment (separate from production)
+[ ] Live Kalshi data used (not historical replay)
+[ ] Realistic fill model active
+[ ] All alerts configured in slack_only mode
+[ ] QT reviewing paper results weekly
+
+Acceptance criteria:
+[ ] Paper win rate within ±5pp of backtest
+[ ] Paper Sharpe > 0.8
+[ ] Paper fill rate > 75%
+[ ] No critical bugs observed
+[ ] Backtest-vs-live gap analysis complete (see qa-simulation-engineer)
+[ ] QT sign-off: "Paper results acceptable for live deployment"
+[ ] Risk Quant sign-off: "Risk parameters confirmed"
+```
+
+---
+
+## Phase 8: Micro Live Deployment
+**Owner: Quantitative Trader + Risk Quant**
+**Exit Criteria: Live performance confirms edge at minimum size**
+
+```
+Deployment configuration:
+  - Position sizing: 10% of normal (minimum viable)
+  - Duration: 4 weeks minimum OR 100 live trades
+  - Circuit breakers: fully active
+  - Alerts: fully active (including SMS/pager)
+
+[ ] Deploy during low-volatility window (avoid US open, major news)
+[ ] QT monitoring first 48 hours closely
+[ ] Performance tracked weekly against paper and backtest baselines
+
+Graduation criteria (to scale up):
+[ ] Live win rate > 50% (allows for small live vs paper degradation)
+[ ] Live Sharpe > 0.8 (3-week rolling)
+[ ] No unexpected behavior or anomalous trades
+[ ] Fill rate > 70%
+[ ] Risk Quant confirms: drawdown and exposure within limits
+[ ] PM + QT sign-off to scale up
+```
+
+---
+
+## Phase 9: Scale-Up
+**Owner: Portfolio Manager + Treasury**
+**Exit Criteria: Strategy fully integrated into portfolio**
+
+```
+[ ] Scale from micro (10%) → small (25%) → standard (50%) per deployment-stages
+[ ] Each stage requires minimum 4 weeks at current stage before scaling
+[ ] Performance attribution run monthly
+[ ] Signal health monitored (IC, win rate decay checks)
+[ ] Strategy added to portfolio-manager-quant monthly review
+[ ] Treasury confirms capital allocation is within structure limits
+[ ] If ETH market expansion being considered, see multi-market-expansion
+```
+
+---
+
+## Onboarding Timeline Estimate
+```
+Phase 1: Research & Spec        1–2 weeks
+Phase 2: Data Validation        3–5 days
+Phase 3: Backtesting            1–2 weeks
+Phase 4: Walk-Forward           3–5 days
+Phase 5: Implementation         1–2 weeks
+Phase 6: Integration Testing    3–5 days
+Phase 7: Paper Trading          4–8 weeks
+Phase 8: Micro Live             4–6 weeks
+Phase 9: Scale-Up               8–12 weeks
+───────────────────────────────────────────
+Total to full deployment:       ~5–6 months
+```
+
+## Gate Failure Protocol
+```
+If any phase gate fails:
+
+Minor failure (one metric slightly below threshold):
+  → Document the gap
+  → QR + QD review and address root cause
+  → Re-run the failing phase (don't advance)
+
+Major failure (multiple metrics failing, or overfitting detected):
+  → Return to Phase 1 — hypothesis may be flawed
+  → Do not patch around a fundamentally weak signal
+
+No exceptions for advancing without sign-offs:
+  → Phase 7 → 8 requires: QT + Risk Quant
+  → Phase 8 → 9 requires: PM + QT + Treasury
+```
+
+## Guardrails
+- Phases cannot be skipped — every phase catches a different class of failure
+- Time minimums are floors, not targets — more time in paper is always better
+- Sign-offs must be explicit (written) — verbal approvals are not sufficient for compliance records
+- A strategy that fails Phase 3 or 4 must not advance regardless of how promising the hypothesis seems
+- The onboarding record (completed checklist) is a compliance document — retain indefinitely

@@ -1,0 +1,260 @@
+---
+name: walk-forward-optimizer
+description: Parameter search, optimization, and overfitting prevention for Kalshi BTC 15min trading strategies. Use this skill when running grid or randomized parameter searches, implementing walk-forward windows, validating that optimized parameters generalize out-of-sample, or diagnosing overfitting in backtest results.
+---
+
+# Walk-Forward Optimizer
+
+## Role Purpose
+Finds the best strategy parameters through systematic search while preventing overfitting to historical data. The walk-forward approach ensures parameters are always tested on data they were never optimized against — the only honest way to know if a parameter set will work live.
+
+## The Overfitting Problem
+```
+The danger: optimize OBI_LONG_THRESHOLD on 12 months of data
+→ find 0.683 outperforms 0.65 on that specific dataset
+→ deploy live
+→ performance reverts to mean or worse
+
+Why it fails: 0.683 captured noise specific to those 12 months.
+The walk-forward optimizer catches this by requiring the parameter
+to generalize across multiple independent test windows.
+```
+
+## Parameter Search Space
+```python
+# Define the search space for each tunable parameter
+# Keep it bounded and meaningful — don't search values that make no conceptual sense
+
+PARAMETER_SPACE = {
+    # OBI parameters
+    "OBI_LONG_THRESHOLD":       [0.60, 0.63, 0.65, 0.67, 0.70, 0.72],
+    "OBI_SHORT_THRESHOLD":      [0.28, 0.30, 0.33, 0.35, 0.37, 0.40],
+    "OBI_CONSECUTIVE_READINGS": [1, 2, 3],
+    "OBI_DEPTH_LEVELS":         [5, 10, 15],
+
+    # ROC parameters
+    "ROC_LOOKBACK":             [2, 3, 4, 5],
+    "ROC_LONG_THRESHOLD":       [0.25, 0.30, 0.35, 0.40, 0.50],
+    "ROC_SHORT_THRESHOLD":      [-0.25, -0.30, -0.35, -0.40, -0.50],
+    "ROC_MAX_CAP":              [1.5, 2.0, 2.5, 3.0],
+    "ROC_CANDLE_CONFIRM_MIN":   [1, 2, 3],
+
+    # ATR parameters
+    "ATR_LOW_THRESHOLD":        [0.10, 0.12, 0.15, 0.18, 0.20],
+    "ATR_HIGH_THRESHOLD":       [0.40, 0.45, 0.50, 0.55, 0.60],
+    "ATR_PERIOD":               [10, 14, 20],
+
+    # Risk parameters (optimize separately — don't mix with signal params)
+    "STOP_LOSS_PCT":            [0.015, 0.020, 0.025, 0.030],
+    "PROFIT_TARGET_MULT":       [1.2, 1.5, 1.8, 2.0],
+}
+```
+
+## Walk-Forward Window Configuration
+```python
+WALK_FORWARD_CONFIG = {
+    "total_candles":        17520,   # 6 months of 15min candles
+    "train_window":         3500,    # ~36 days of training data
+    "test_window":          500,     # ~5 days of out-of-sample test
+    "step_size":            500,     # Roll forward 5 days per window
+    "min_trades_per_window": 30,     # Skip window if too few trades (not statistically valid)
+    "train_test_ratio":     0.70,    # Final holdout: 70/30 train/test
+}
+
+# With these settings, approximate number of windows:
+# (17520 - 3500) / 500 = ~28 walk-forward windows
+# Each window is independently optimized then tested on unseen data
+```
+
+## Walk-Forward Engine
+```python
+import itertools
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class WindowResult:
+    window_id:      int
+    train_range:    tuple[int, int]
+    test_range:     tuple[int, int]
+    best_params:    dict
+    train_sharpe:   float
+    test_sharpe:    float
+    test_win_rate:  float
+    test_trades:    int
+    overfitting_gap: float   # train_sharpe - test_sharpe
+
+class WalkForwardOptimizer:
+
+    def __init__(self, candles, ob_history, backtester_class):
+        self.candles      = candles
+        self.ob_history   = ob_history
+        self.Backtester   = backtester_class
+
+    def run(self, param_space: dict, objective: str = "sharpe") -> list[WindowResult]:
+        """Run full walk-forward optimization across all windows."""
+        windows = self._generate_windows()
+        results = []
+
+        for i, (train_range, test_range) in enumerate(windows):
+            print(f"Window {i+1}/{len(windows)}: training {train_range}, testing {test_range}")
+
+            # Optimize on train window only
+            best_params, train_sharpe = self._optimize_on_window(
+                train_range, param_space, objective
+            )
+
+            # Test on unseen data — no parameter changes allowed here
+            test_result = self.Backtester(
+                self.candles[test_range[0]:test_range[1]],
+                self.ob_history,
+                best_params,
+            ).run()
+
+            if test_result["total_trades"] < WALK_FORWARD_CONFIG["min_trades_per_window"]:
+                print(f"  Skipping window {i+1} — too few trades ({test_result['total_trades']})")
+                continue
+
+            results.append(WindowResult(
+                window_id        = i,
+                train_range      = train_range,
+                test_range       = test_range,
+                best_params      = best_params,
+                train_sharpe     = train_sharpe,
+                test_sharpe      = test_result["sharpe_ratio"],
+                test_win_rate    = test_result["win_rate"],
+                test_trades      = test_result["total_trades"],
+                overfitting_gap  = train_sharpe - test_result["sharpe_ratio"],
+            ))
+
+        return results
+
+    def _optimize_on_window(self, train_range, param_space, objective):
+        """Grid search over parameter space on train window."""
+        keys   = list(param_space.keys())
+        values = list(param_space.values())
+        best_score  = -np.inf
+        best_params = {}
+
+        for combo in itertools.product(*values):
+            params = dict(zip(keys, combo))
+            result = self.Backtester(
+                self.candles[train_range[0]:train_range[1]],
+                self.ob_history,
+                params,
+            ).run()
+
+            if result["total_trades"] < 30:
+                continue   # Skip combos that produce too few trades
+
+            score = result.get(objective, result["sharpe_ratio"])
+            if score > best_score:
+                best_score  = score
+                best_params = params
+
+        return best_params, best_score
+
+    def _generate_windows(self):
+        cfg     = WALK_FORWARD_CONFIG
+        windows = []
+        start   = 0
+        while start + cfg["train_window"] + cfg["test_window"] <= len(self.candles):
+            train_end  = start + cfg["train_window"]
+            test_end   = train_end + cfg["test_window"]
+            windows.append(((start, train_end), (train_end, test_end)))
+            start     += cfg["step_size"]
+        return windows
+```
+
+## Randomized Search (For Large Parameter Spaces)
+```python
+import random
+
+def randomized_search(candles, ob_history, param_space, n_trials=200, objective="sharpe"):
+    """
+    When grid search is too slow (> 10,000 combinations),
+    use randomized search with n_trials random samples.
+    Typically finds near-optimal solution in 10-20% of grid search time.
+    """
+    results = []
+    for _ in range(n_trials):
+        params = {k: random.choice(v) for k, v in param_space.items()}
+        result = run_backtest(candles, ob_history, params)
+        if result["total_trades"] >= 50:
+            results.append((result[objective], params))
+
+    results.sort(reverse=True)
+    return results[:10]   # Return top 10 for inspection
+```
+
+## Overfitting Detection
+```python
+def diagnose_overfitting(window_results: list[WindowResult]) -> dict:
+    """
+    Analyze walk-forward results for signs of overfitting.
+    """
+    train_sharpes = [w.train_sharpe for w in window_results]
+    test_sharpes  = [w.test_sharpe  for w in window_results]
+    gaps          = [w.overfitting_gap for w in window_results]
+
+    return {
+        # Core metrics
+        "avg_train_sharpe":    np.mean(train_sharpes),
+        "avg_test_sharpe":     np.mean(test_sharpes),
+        "avg_overfitting_gap": np.mean(gaps),
+
+        # Consistency: what % of windows show positive test Sharpe?
+        "pct_windows_profitable": sum(1 for s in test_sharpes if s > 0) / len(test_sharpes),
+
+        # Flags
+        "high_overfitting":    np.mean(gaps) > 1.0,           # Train >> test
+        "inconsistent_edge":   sum(1 for s in test_sharpes if s > 0.5) / len(test_sharpes) < 0.6,
+        "edge_confirmed":      np.mean(test_sharpes) > 1.0 and np.mean(gaps) < 1.0,
+
+        # Recommendation
+        "recommendation": _overfitting_recommendation(np.mean(gaps), np.mean(test_sharpes)),
+    }
+
+def _overfitting_recommendation(avg_gap, avg_test_sharpe):
+    if avg_test_sharpe < 0:
+        return "ABANDON — signal has no OOS edge"
+    if avg_gap > 2.0:
+        return "HIGH OVERFITTING — reduce parameter space, use simpler model"
+    if avg_gap > 1.0:
+        return "MODERATE OVERFITTING — widen test windows, reduce combos"
+    if avg_test_sharpe > 1.0 and avg_gap < 1.0:
+        return "DEPLOY CANDIDATE — edge appears robust"
+    return "MARGINAL — gather more data before deploying"
+```
+
+## Final Parameter Selection
+```python
+def select_final_params(window_results: list[WindowResult]) -> dict:
+    """
+    Select the parameter set to deploy live.
+    Strategy: use the most frequently winning params across windows,
+    not the params from the single best window.
+    """
+    from collections import Counter
+
+    # Count how often each parameter value appears in winning windows
+    winning_windows = [w for w in window_results if w.test_sharpe > 0.5]
+    if not winning_windows:
+        raise ValueError("No windows with acceptable test Sharpe — do not deploy")
+
+    param_votes = {}
+    for window in winning_windows:
+        for key, val in window.best_params.items():
+            param_votes.setdefault(key, Counter())[val] += 1
+
+    # Select most common value for each parameter (majority vote)
+    return {key: counter.most_common(1)[0][0] for key, counter in param_votes.items()}
+```
+
+## Guardrails
+- Never optimize on the final holdout test set — it exists to validate once, at the very end
+- Never select parameters from a single best window — use majority vote across all profitable windows
+- If grid search yields > 10,000 combinations, switch to randomized search — grid overfitting is real
+- An overfitting gap > 1.0 Sharpe is a hard stop — do not deploy regardless of train performance
+- Parameter changes from optimization must go through paper trading before live deployment
+- Re-run walk-forward quarterly — market regimes shift, optimal parameters drift

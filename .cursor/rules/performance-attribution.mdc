@@ -1,0 +1,225 @@
+---
+name: performance-attribution
+description: Decompose and explain bot P&L — identifying whether returns came from OBI, ROC, regime selection, sizing, or execution quality. Use this skill when analyzing why the bot made or lost money, running monthly attribution reports, diagnosing underperformance, or quantifying the contribution of each strategy component.
+---
+
+# Performance Attribution
+
+## Role Purpose
+"The bot made $X this month" is not enough information. Performance attribution decomposes P&L into its sources — which signal drove it, which regime it happened in, how much slippage cost, how much sizing decisions added or subtracted. Without attribution, you can't improve what's working or fix what isn't.
+
+## Attribution Framework
+```
+Total P&L
+  ├── Signal Attribution
+  │     ├── OBI-only trades (ROC neutral)
+  │     ├── ROC-only trades (OBI neutral)
+  │     └── Combined HIGH conviction trades (both agree)
+  ├── Regime Attribution
+  │     ├── LOW ATR regime performance
+  │     ├── MEDIUM ATR regime performance
+  │     └── HIGH ATR regime performance (should be zero — bot halts)
+  ├── Session Attribution
+  │     ├── Asian session
+  │     ├── London session
+  │     └── US session
+  ├── Sizing Attribution
+  │     ├── HIGH conviction multiplier impact
+  │     ├── Drawdown reduction multiplier impact
+  │     └── Base sizing impact
+  └── Execution Attribution
+        ├── Slippage cost (expected vs actual fill price)
+        ├── Partial fill impact
+        └── Fee drag
+```
+
+## Core Attribution Engine
+```python
+import pandas as pd
+import numpy as np
+
+def run_attribution(trades: pd.DataFrame) -> dict:
+    """
+    Full P&L attribution from trade log.
+    trades must include: pnl_pct, pnl_cents, conviction, obi_dir, roc_dir,
+                         atr_regime, session, entry_price, fill_price,
+                         contracts, fees_cents, candles_held
+    """
+    total_pnl = trades["pnl_cents"].sum() / 100   # Convert to dollars
+
+    return {
+        "total_pnl_dollars":    round(total_pnl, 2),
+        "signal_attribution":   _signal_attribution(trades),
+        "regime_attribution":   _regime_attribution(trades),
+        "session_attribution":  _session_attribution(trades),
+        "sizing_attribution":   _sizing_attribution(trades),
+        "execution_attribution":_execution_attribution(trades),
+        "exit_reason_breakdown":_exit_reason_attribution(trades),
+    }
+```
+
+## Signal Attribution
+```python
+def _signal_attribution(trades: pd.DataFrame) -> dict:
+    results = {}
+
+    # Segment by conviction level (proxy for which signals fired)
+    for conviction in ["HIGH", "NORMAL", "LOW"]:
+        subset = trades[trades["conviction"] == conviction]
+        if len(subset) == 0:
+            continue
+        results[conviction] = {
+            "trades":        len(subset),
+            "pnl_dollars":   round(subset["pnl_cents"].sum() / 100, 2),
+            "avg_pnl_pct":   round(subset["pnl_pct"].mean() * 100, 3),
+            "win_rate":      round((subset["pnl_pct"] > 0).mean(), 3),
+            "pnl_share_pct": round(subset["pnl_cents"].sum() / trades["pnl_cents"].sum() * 100, 1)
+                             if trades["pnl_cents"].sum() != 0 else 0,
+        }
+
+    # OBI direction at entry — which direction was more profitable?
+    for direction in ["long", "short"]:
+        subset = trades[trades["direction"] == direction]
+        results[f"direction_{direction}"] = {
+            "trades":      len(subset),
+            "pnl_dollars": round(subset["pnl_cents"].sum() / 100, 2),
+            "win_rate":    round((subset["pnl_pct"] > 0).mean(), 3),
+        }
+
+    return results
+```
+
+## Regime Attribution
+```python
+def _regime_attribution(trades: pd.DataFrame) -> dict:
+    results = {}
+    for regime in ["LOW", "MEDIUM", "HIGH"]:
+        subset = trades[trades["atr_regime_entry"] == regime]
+        results[regime] = {
+            "trades":      len(subset),
+            "pnl_dollars": round(subset["pnl_cents"].sum() / 100, 2),
+            "win_rate":    round((subset["pnl_pct"] > 0).mean(), 3) if len(subset) > 0 else None,
+            "avg_hold_candles": round(subset["candles_held"].mean(), 1) if len(subset) > 0 else None,
+        }
+
+    # Key insight: if LOW regime is significantly better than MEDIUM,
+    # consider tightening ATR_HIGH_THRESHOLD to get more LOW regime trades
+    results["best_regime"] = max(
+        [r for r in ["LOW","MEDIUM"] if results[r]["trades"] > 10],
+        key=lambda r: results[r].get("win_rate", 0),
+        default=None,
+    )
+    return results
+```
+
+## Session Attribution
+```python
+SESSIONS = ["ASIA", "LONDON", "US_OPEN", "US_MAIN", "US_CLOSE"]
+
+def _session_attribution(trades: pd.DataFrame) -> dict:
+    trades = trades.copy()
+    trades["session"] = trades["entry_timestamp"].apply(assign_session)
+    results = {}
+    for session in SESSIONS:
+        subset = trades[trades["session"] == session]
+        results[session] = {
+            "trades":        len(subset),
+            "pnl_dollars":   round(subset["pnl_cents"].sum() / 100, 2),
+            "win_rate":      round((subset["pnl_pct"] > 0).mean(), 3) if len(subset) > 0 else None,
+            "avg_pnl_pct":   round(subset["pnl_pct"].mean() * 100, 3) if len(subset) > 0 else None,
+        }
+    return results
+```
+
+## Execution Attribution (Slippage & Fees)
+```python
+def _execution_attribution(trades: pd.DataFrame) -> dict:
+    # Slippage: difference between signal price (mid at entry) and actual fill
+    if "expected_fill_price" in trades.columns:
+        slippage_cents = (trades["fill_price_cents"] - trades["expected_fill_price_cents"]).abs()
+        total_slippage = slippage_cents.sum() * trades["contracts"].mean() / 100
+    else:
+        total_slippage = None
+
+    total_fees = trades["fees_cents"].sum() / 100
+
+    # Theoretical P&L if zero slippage and zero fees
+    theoretical_pnl = trades["pnl_cents"].sum() / 100 + total_fees + (total_slippage or 0)
+
+    return {
+        "total_fees_dollars":      round(total_fees, 2),
+        "total_slippage_dollars":  round(total_slippage, 2) if total_slippage else "N/A",
+        "theoretical_pnl":         round(theoretical_pnl, 2),
+        "actual_pnl":              round(trades["pnl_cents"].sum() / 100, 2),
+        "execution_drag":          round(total_fees + (total_slippage or 0), 2),
+        "fees_as_pct_of_gross":    round(total_fees / theoretical_pnl * 100, 1) if theoretical_pnl > 0 else "N/A",
+    }
+```
+
+## Exit Reason Attribution
+```python
+def _exit_reason_attribution(trades: pd.DataFrame) -> dict:
+    results = {}
+    for reason, group in trades.groupby("exit_reason"):
+        results[reason] = {
+            "count":        len(group),
+            "pct_of_all":   round(len(group) / len(trades) * 100, 1),
+            "avg_pnl_pct":  round(group["pnl_pct"].mean() * 100, 3),
+            "pnl_dollars":  round(group["pnl_cents"].sum() / 100, 2),
+        }
+    # Key: STOP_LOSS should be < 20% of exits. HIGH = position sizing or entry quality issue
+    # TAKE_PROFIT should be > 30%. LOW = profit target too ambitious or signal decaying too fast
+    return results
+```
+
+## Monthly Attribution Report Template
+```markdown
+## Performance Attribution — [Month Year]
+
+### Summary
+- Total P&L: $X (X% of bankroll)
+- Total Trades: N | Win Rate: X% | Sharpe: X.X
+
+### Signal Attribution
+| Conviction | Trades | P&L    | Win Rate | P&L Share |
+|------------|--------|--------|----------|-----------|
+| HIGH       | N      | $X     | X%       | X%        |
+| NORMAL     | N      | $X     | X%       | X%        |
+| LOW        | N      | $X     | X%       | X%        |
+
+### Regime Attribution
+| Regime | Trades | P&L | Win Rate | Avg Hold |
+|--------|--------|-----|----------|----------|
+| LOW    | N      | $X  | X%       | X candles|
+| MEDIUM | N      | $X  | X%       | X candles|
+
+### Session Attribution
+| Session  | Trades | P&L | Win Rate |
+|----------|--------|-----|----------|
+| ASIA     | N      | $X  | X%       |
+| US_MAIN  | N      | $X  | X%       |
+
+### Execution Drag
+- Total fees: $X
+- Total slippage: $X
+- Combined drag: X% of gross P&L
+
+### Exit Reason Breakdown
+| Reason        | Count | % of Exits | Avg P&L |
+|---------------|-------|------------|---------|
+| TAKE_PROFIT   | N     | X%         | +X%     |
+| STOP_LOSS     | N     | X%         | -X%     |
+| SIGNAL_DECAY  | N     | X%         | X%      |
+| TIME_EXIT     | N     | X%         | X%      |
+
+### Key Findings & Action Items
+- [What drove returns this month]
+- [What hurt returns]
+- [Recommended adjustments — escalate to QR/Strats]
+```
+
+## Guardrails
+- Run attribution monthly minimum — quarterly is too infrequent to catch signal decay early
+- Minimum 50 trades per segment before drawing conclusions from segment-level data
+- Never act on a single month of attribution data — look for 3-month trends
+- Attribution findings that suggest parameter changes must go to QR, not be implemented directly

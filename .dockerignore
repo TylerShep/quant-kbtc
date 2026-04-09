@@ -1,0 +1,17 @@
+.git
+.env
+*.pyc
+__pycache__
+.pytest_cache
+*.egg-info
+dist/
+build/
+.venv
+venv/
+*.log
+backtest_reports/
+*.pem
+*.key
+.secrets/
+.cursor/
+node_modules/

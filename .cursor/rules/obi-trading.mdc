@@ -1,0 +1,136 @@
+---
+name: obi-trading
+description: Implement Order Book Imbalance (OBI) trading strategy for Kalshi 15-minute BTC/ETH prediction markets. Use this skill when building, modifying, or debugging OBI signal generation, entry/exit logic, or order book data processing.
+---
+
+# Order Book Imbalance (OBI) Trading Strategy
+
+## What This Skill Covers
+Building and maintaining the OBI strategy module for Kalshi 15min BTC/ETH markets. OBI measures buy vs sell pressure in the live order book before price moves, giving a leading signal for short-term direction.
+
+## Core Formula
+```python
+OBI = total_bid_volume / (total_bid_volume + total_ask_volume)
+# > 0.65 = strong buy pressure
+# < 0.35 = strong sell pressure
+# 0.45–0.55 = neutral, no trade
+```
+
+## Parameters (Tunable)
+```python
+OBI_DEPTH_LEVELS     = 10        # How many price levels deep to read
+OBI_LONG_THRESHOLD   = 0.65      # Minimum OBI to enter long
+OBI_SHORT_THRESHOLD  = 0.35      # Maximum OBI to enter short
+OBI_CONSECUTIVE_READINGS = 2     # Readings above/below threshold before entry
+OBI_REFRESH_SECONDS  = 30        # How often to recalculate
+MIN_BOOK_VOLUME      = 1000      # Ignore signal if book is too thin
+NEUTRAL_EXIT_LONG    = 0.55      # Exit long early if OBI drops below this
+NEUTRAL_EXIT_SHORT   = 0.45      # Exit short early if OBI rises above this
+STOP_LOSS_PCT        = 0.02      # 2% hard stop loss
+PROFIT_TARGET_MULT   = 1.5       # Target = 1.5x average loss
+MAX_CANDLES_IN_TRADE = 3         # Time-based exit after N 15min candles
+```
+
+## Data Requirements
+- Real-time L2 order book (bid/ask ladder) from Kalshi API
+- Top N price levels with size at each level
+- Timestamp for each snapshot to detect staleness
+- ATR regime signal from `atr-regime-filter` module (required gating)
+
+## Entry Logic
+```python
+def should_enter_long(obi_history, atr_regime, current_position):
+    if current_position is not None:
+        return False
+    if atr_regime == "HIGH":
+        return False
+    if total_book_volume() < MIN_BOOK_VOLUME:
+        return False
+    # Require N consecutive readings above threshold
+    recent = obi_history[-OBI_CONSECUTIVE_READINGS:]
+    return all(r >= OBI_LONG_THRESHOLD for r in recent)
+
+def should_enter_short(obi_history, atr_regime, current_position):
+    if current_position is not None:
+        return False
+    if atr_regime == "HIGH":
+        return False
+    if total_book_volume() < MIN_BOOK_VOLUME:
+        return False
+    recent = obi_history[-OBI_CONSECUTIVE_READINGS:]
+    return all(r <= OBI_SHORT_THRESHOLD for r in recent)
+```
+
+## Exit Logic — Check In Priority Order
+```python
+def should_exit(position, current_obi, current_price, entry_price, candles_held):
+    direction = position["direction"]  # "long" or "short"
+
+    # 1. Hard stop loss (always first)
+    pnl_pct = (current_price - entry_price) / entry_price
+    if direction == "short":
+        pnl_pct = -pnl_pct
+    if pnl_pct <= -STOP_LOSS_PCT:
+        return True, "STOP_LOSS"
+
+    # 2. Profit target hit
+    if pnl_pct >= STOP_LOSS_PCT * PROFIT_TARGET_MULT:
+        return True, "TAKE_PROFIT"
+
+    # 3. OBI signal decay (early exit)
+    if direction == "long" and current_obi < NEUTRAL_EXIT_LONG:
+        return True, "SIGNAL_DECAY"
+    if direction == "short" and current_obi > NEUTRAL_EXIT_SHORT:
+        return True, "SIGNAL_DECAY"
+
+    # 4. ATR volatility spike
+    if atr_regime() == "HIGH":
+        return True, "VOLATILITY_SPIKE"
+
+    # 5. Time-based exit
+    if candles_held >= MAX_CANDLES_IN_TRADE:
+        return True, "TIME_EXIT"
+
+    return False, None
+```
+
+## Implementation Structure
+```
+strategies/
+  obi/
+    __init__.py
+    signal.py        # OBI calculation + history tracking
+    entry.py         # Entry condition checks
+    exit.py          # All exit condition checks
+    book_parser.py   # Parse raw Kalshi order book response
+    config.py        # All parameters in one place
+```
+
+## Common Pitfalls to Avoid
+- **Single reading entries**: Always require `OBI_CONSECUTIVE_READINGS` before entering — single spikes are noise
+- **Thin book entries**: Always check `MIN_BOOK_VOLUME` — low liquidity makes OBI unreliable and easily manipulated
+- **Chasing**: If OBI spiked and is already reverting when you check, skip the trade entirely
+- **Stale data**: If the book snapshot is older than `OBI_REFRESH_SECONDS * 2`, treat signal as invalid
+- **Conflicting ROC signal**: If ROC module signals the opposite direction, do NOT enter — log as "CONFLICT_SKIP"
+
+## Logging Requirements
+Every signal evaluation must log:
+```python
+{
+  "timestamp": ...,
+  "obi_value": ...,
+  "obi_history": [...],       # last N readings
+  "book_volume": ...,
+  "atr_regime": ...,
+  "action": "ENTER_LONG | ENTER_SHORT | SKIP | EXIT",
+  "skip_reason": "...",       # if skipped
+  "exit_reason": "...",       # if exited
+  "pnl_pct": ...,             # if exited
+}
+```
+
+## Integration Points
+- Receives: ATR regime from `atr-regime-filter`
+- Receives: Conflict flag from `roc-trading` module
+- Sends: Position state to `risk-position-sizing` module
+- Sends: Trade logs to backtesting framework

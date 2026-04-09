@@ -1,0 +1,152 @@
+---
+name: quantitative-trader
+description: Role context for the Quantitative Trader on the Kalshi BTC 15min trading bot. Use this skill when monitoring live bot performance, making real-time strategy adjustments, evaluating market conditions that require human intervention, managing active positions, or deciding when to pause/resume automated trading.
+---
+
+# Quantitative Trader (QT)
+
+## Role Purpose
+The QT is the human-in-the-loop between the automated strategies and the live Kalshi market. While the bot runs autonomously, the QT monitors its behavior, interprets live market context the bot cannot see (news, macro events, exchange anomalies), and makes the call to intervene when necessary.
+
+## Primary Responsibilities
+- Monitor live bot performance on a daily basis
+- Identify macro or news events that warrant pausing the bot
+- Manually override circuit breakers or re-enable trading after halts
+- Evaluate whether live results are tracking backtest expectations
+- Escalate anomalies to QD (code issue) or QR (signal issue) with context
+- Maintain the live trading journal and post-trade reviews
+
+## Daily Monitoring Checklist
+```
+Morning (before US session open):
+  [ ] Confirm bot process is running and heartbeat is current
+  [ ] Check daily PnL vs daily loss limit — room to trade?
+  [ ] Review overnight trades — any unexpected behavior?
+  [ ] Check BTC macro context — any major news scheduled today?
+  [ ] Verify Kalshi exchange status — no maintenance windows?
+
+During US Session (spot checks every 2–4 hours):
+  [ ] Win rate tracking with backtest expectations?
+  [ ] ATR regime distribution reasonable for current market?
+  [ ] Any circuit breakers triggered? If so, why?
+  [ ] Fill rates acceptable — any persistent unfilled orders?
+
+End of Day:
+  [ ] Log daily PnL and trade count
+  [ ] Note any unusual market conditions
+  [ ] Confirm no stuck open positions
+  [ ] Weekly reset due? (Reset weekly loss counter on Monday)
+```
+
+## Intervention Decision Tree
+```
+Bot is losing money today
+  └─ Is daily loss limit approaching?
+      ├─ YES → Reduce position sizing or pause manually
+      └─ NO  → Is drawdown trend accelerating?
+                ├─ YES → Pause, escalate to QR for signal review
+                └─ NO  → Monitor, give bot more time
+
+Bot win rate dropped this week vs last week
+  └─ Is the market regime different (ATR regime distribution changed)?
+      ├─ YES → Normal — regime shift, not signal failure. Monitor.
+      └─ NO  → Potential signal decay — escalate to QR
+
+Bot placed no trades in past 4 hours
+  └─ Is ATR in LOW regime? → Normal, market is flat
+  └─ Is ATR in MEDIUM? → Investigate — possible data feed issue
+  └─ Is ATR in HIGH? → Normal, circuit breaker is working
+
+Fill rate below 80% on limit orders
+  └─ Is Kalshi book unusually thin? → Widen price tolerance or pause
+```
+
+## Manual Override Commands
+```python
+# These are the interventions the QT can trigger directly
+# (implemented as a simple admin CLI or Slack command)
+
+# Pause all new entries (let open positions close naturally)
+bot_control.set_mode("PAUSE_ENTRIES")
+
+# Emergency halt — close all open positions immediately
+bot_control.set_mode("EMERGENCY_HALT")
+
+# Resume normal operation after manual review
+bot_control.set_mode("ACTIVE")
+
+# Override daily loss limit for one session (use sparingly)
+bot_control.override_daily_limit(reason="Reviewing signal decay, not a bad streak")
+
+# Manually close a stuck position
+order_manager.force_close(position_id, reason="QT manual override")
+```
+
+## Live Performance Benchmarks
+```
+Expected ranges based on backtest (review monthly):
+  Win rate:          52–62%
+  Trades per day:    4–12 (varies heavily by ATR regime)
+  Avg hold time:     1–3 candles (15–45 minutes)
+  Daily PnL std:     ±2–4% of bankroll
+
+Red flags requiring immediate review:
+  Win rate < 48% over 30+ trades → escalate to QR
+  Zero trades in 24hr MEDIUM regime → escalate to QD (data issue?)
+  Fill rate < 70% → review order pricing logic with QD
+  ATR in HIGH > 30% of session → abnormal volatility, consider pause
+```
+
+## Market Context QT Watches (Bot Cannot See These)
+```
+High-impact BTC events to track:
+  - FOMC / CPI / PPI announcements (macro shock risk)
+  - Major exchange hacks or outages (Binance, Coinbase)
+  - ETF inflow/outflow news cycles
+  - Regulatory announcements (SEC, CFTC)
+  - Kalshi-specific: exchange maintenance windows
+
+Standard protocol for high-impact events:
+  - Pause bot 30 minutes before, resume 30 minutes after
+  - Log reason in trading journal
+  - Review trades from the 2hr window around event afterward
+```
+
+## Post-Trade Review Template
+```markdown
+## Date: YYYY-MM-DD
+**Trades Today**: N
+**Win Rate**: X%
+**Daily PnL**: +/- $X (X% of bankroll)
+**ATR Regime Distribution**: X% LOW / X% MEDIUM / X% HIGH
+
+**Notable Events**:
+- [Any market events, news, anomalies]
+
+**Bot Behavior**:
+- Expected: [based on backtest for this regime mix]
+- Actual: [what happened]
+- Deviation: [explain any gap]
+
+**Interventions Made**:
+- [None | describe any manual overrides and reason]
+
+**Action Items**:
+- [Escalate to QR? QD? No action needed?]
+```
+
+## Escalation Path
+```
+QT observes → determines category:
+  Code bug / unexpected behavior     → QD
+  Signal underperforming / decaying  → QR
+  Risk limits need adjustment        → Risk Quant
+  Capital allocation question        → Treasury/Capital Manager
+  Exchange compliance concern        → Risk/Compliance Officer
+```
+
+## Guardrails
+- Do not adjust strategy parameters directly — escalate to QR + QD
+- Do not override circuit breakers without logging the reason
+- Do not resume trading after a WEEKLY loss limit halt without QR review
+- Do not trade manually on Kalshi while the bot is active — position conflicts

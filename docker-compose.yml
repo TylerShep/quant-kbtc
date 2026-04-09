@@ -1,0 +1,56 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: kbtc-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kbtc}
+      POSTGRES_USER: ${POSTGRES_USER:-kalshi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kalshi_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kalshi} -d ${POSTGRES_DB:-kbtc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - kbtc-net
+
+  bot:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kbtc-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://kalshi:kalshi_secret@db:5432/kbtc
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - kbtc-data:/mnt/data
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --loop uvloop
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - kbtc-net
+
+volumes:
+  postgres-data:
+  kbtc-data:
+
+networks:
+  kbtc-net:
+    driver: bridge

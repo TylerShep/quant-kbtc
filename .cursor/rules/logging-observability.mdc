@@ -1,0 +1,282 @@
+---
+name: logging-observability
+description: Structured logging schema, log levels, observability patterns, and query guides for the Kalshi BTC 15min trading bot. Use this skill when setting up logging infrastructure, defining what gets logged and where, building log-based dashboards, debugging bot behavior from logs, or ensuring every system component is observable.
+---
+
+# Logging & Observability
+
+## Role Purpose
+If the bot does something unexpected — a missed trade, a bad fill, an unexplained loss — logs are the only way to reconstruct what happened. This skill defines what every component logs, in what format, at what level, and how to query it effectively. Observability is not an afterthought; it is built in from day one.
+
+## Logging Philosophy
+```
+1. Structured JSON always — never free-form strings in production
+2. Every trade action logged before AND after it happens
+3. Every skipped signal logged with a reason — silence is not observability
+4. Log levels are enforced — don't DEBUG in production, don't ERROR everything
+5. Logs must answer: what happened, when, why, and what was the context
+```
+
+## Log Levels
+```python
+# Use these levels consistently across ALL modules
+
+# DEBUG   — detailed internal state, only enable during development
+#           Examples: individual OB levels, raw WebSocket frames, every ATR calc
+
+# INFO    — normal operational events worth recording
+#           Examples: bot started, signal fired, order submitted, position closed
+
+# WARNING — unexpected but recoverable events
+#           Examples: latency breach, partial fill, thin book skipped, WS reconnect
+
+# ERROR   — failures that need attention but bot continues running
+#           Examples: order rejection, DB write failure, API timeout
+
+# CRITICAL — failures requiring immediate human intervention
+#           Examples: auth failure, circuit breaker, bot cannot close a position
+
+import logging
+import json
+from datetime import datetime, timezone
+
+class StructuredLogger:
+    def __init__(self, component: str):
+        self.component = component
+        self.logger    = logging.getLogger(component)
+
+    def _emit(self, level: str, event: str, **kwargs):
+        record = {
+            "timestamp":  datetime.now(timezone.utc).isoformat(),
+            "level":      level,
+            "component":  self.component,
+            "event":      event,
+            **kwargs,
+        }
+        getattr(self.logger, level.lower())(json.dumps(record))
+
+    def info(self,     event, **kw): self._emit("INFO",     event, **kw)
+    def warning(self,  event, **kw): self._emit("WARNING",  event, **kw)
+    def error(self,    event, **kw): self._emit("ERROR",    event, **kw)
+    def critical(self, event, **kw): self._emit("CRITICAL", event, **kw)
+    def debug(self,    event, **kw): self._emit("DEBUG",    event, **kw)
+```
+
+## Required Log Events Per Component
+
+### Bot Main Loop
+```python
+logger = StructuredLogger("bot.main")
+
+# On startup
+logger.info("BOT_STARTED", version=BOT_VERSION, market=MARKET, env=BOT_ENV,
+            bankroll=bankroll, regime_at_start=regime)
+
+# On each candle close
+logger.debug("CANDLE_CLOSE", timestamp=candle.ts, open=candle.open,
+             high=candle.high, low=candle.low, close=candle.close, volume=candle.volume)
+
+# On clean shutdown
+logger.info("BOT_STOPPED", reason="SIGTERM", open_positions=n_open, final_bankroll=bankroll)
+```
+
+### Signal Evaluation
+```python
+logger = StructuredLogger("strategy.coordinator")
+
+# Every signal evaluation — even skips
+logger.info("SIGNAL_EVALUATED",
+    obi_direction = obi_dir,
+    roc_direction = roc_dir,
+    atr_regime    = regime,
+    decision      = decision.direction,
+    conviction    = decision.conviction,
+    skip_reason   = decision.skip_reason,
+    obi_value     = obi_value,
+    roc_value     = roc_value,
+    book_volume   = total_book_volume,
+)
+```
+
+### Order Manager
+```python
+logger = StructuredLogger("execution.orders")
+
+# Before submitting
+logger.info("ORDER_SUBMITTING",
+    ticker      = ticker,
+    side        = side,
+    contracts   = contracts,
+    price_cents = price,
+    size_dollars= size,
+    conviction  = conviction,
+    strategy    = "OBI+ROC",
+)
+
+# After fill confirmed
+logger.info("ORDER_FILLED",
+    order_id         = order_id,
+    fill_price_cents = fill_price,
+    fill_contracts   = fill_contracts,
+    fill_pct         = fill_contracts / requested_contracts,
+    latency_ms       = latency_ms,
+)
+
+# On rejection
+logger.error("ORDER_REJECTED",
+    order_id        = order_id,
+    rejection_code  = code,
+    requested_price = price,
+    requested_qty   = contracts,
+)
+```
+
+### Position Manager
+```python
+logger = StructuredLogger("positions")
+
+logger.info("POSITION_OPENED",
+    ticker         = ticker,
+    direction      = direction,
+    entry_price    = price,
+    contracts      = contracts,
+    risk_dollars   = risk,
+    conviction     = conviction,
+    obi_at_entry   = obi,
+    roc_at_entry   = roc,
+    regime         = regime,
+)
+
+logger.info("POSITION_CLOSED",
+    ticker         = ticker,
+    exit_reason    = reason,
+    entry_price    = entry_price,
+    exit_price     = exit_price,
+    candles_held   = n,
+    pnl_pct        = pnl_pct,
+    pnl_dollars    = pnl_dollars,
+    fees_dollars   = fees,
+)
+```
+
+### Risk Manager
+```python
+logger = StructuredLogger("risk")
+
+logger.warning("CIRCUIT_BREAKER_TRIGGERED",
+    trigger     = "DAILY_LOSS_LIMIT",
+    current_pct = daily_loss_pct,
+    limit_pct   = DAILY_LOSS_LIMIT_PCT,
+    bankroll    = current_bankroll,
+)
+
+logger.info("HEARTBEAT",
+    bankroll         = current_bankroll,
+    daily_pnl_pct    = daily_pnl,
+    open_positions   = n_open,
+    regime           = regime,
+    trades_today     = trades_today,
+)
+```
+
+## Log Storage & Rotation
+```python
+# logging_config.py
+
+import logging.handlers
+
+def configure_logging(env: str):
+    handlers = []
+
+    # Rotating file handler — 50MB per file, keep 10 files
+    file_handler = logging.handlers.RotatingFileHandler(
+        "/mnt/kalshi-data/logs/bot.jsonl",
+        maxBytes    = 50 * 1024 * 1024,   # 50MB
+        backupCount = 10,
+    )
+    handlers.append(file_handler)
+
+    # Console handler (Docker captures stdout → JSON logging driver)
+    handlers.append(logging.StreamHandler())
+
+    # In production: only INFO and above
+    level = logging.DEBUG if env == "development" else logging.INFO
+
+    logging.basicConfig(level=level, handlers=handlers, format="%(message)s")
+```
+
+## Log Query Patterns (For Debugging)
+```bash
+# --- Find all trades in the last 24 hours ---
+cat /mnt/kalshi-data/logs/bot.jsonl | \
+    python3 -c "
+import sys, json
+from datetime import datetime, timezone, timedelta
+cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+        if r.get('event') in ('POSITION_OPENED', 'POSITION_CLOSED') and \
+           datetime.fromisoformat(r['timestamp']) > cutoff:
+            print(json.dumps(r, indent=2))
+    except: pass
+"
+
+# --- Find all signal conflicts today ---
+grep 'SIGNAL_CONFLICT' /mnt/kalshi-data/logs/bot.jsonl | tail -50 | python3 -m json.tool
+
+# --- Find all circuit breaker events ---
+grep 'CIRCUIT_BREAKER' /mnt/kalshi-data/logs/bot.jsonl
+
+# --- Check latency by component (last hour) ---
+cat /mnt/kalshi-data/logs/bot.jsonl | python3 -c "
+import sys, json
+from collections import defaultdict
+latencies = defaultdict(list)
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+        if 'latency_ms' in r:
+            latencies[r.get('component','unknown')].append(r['latency_ms'])
+    except: pass
+for comp, vals in latencies.items():
+    vals.sort()
+    n = len(vals)
+    print(f'{comp}: p50={vals[n//2]:.1f}ms p95={vals[int(n*0.95)]:.1f}ms max={vals[-1]:.1f}ms')
+"
+
+# --- Find all errors in last hour ---
+grep '"level":"ERROR"\|"level":"CRITICAL"' /mnt/kalshi-data/logs/bot.jsonl | \
+    python3 -c "
+import sys, json
+from datetime import datetime, timezone, timedelta
+cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+for line in sys.stdin:
+    r = json.loads(line.strip())
+    if datetime.fromisoformat(r['timestamp']) > cutoff:
+        print(r['event'], '|', r.get('rejection_code',''), r.get('error',''))
+"
+```
+
+## Key Metrics to Surface From Logs (Daily)
+```python
+DAILY_OBSERVABILITY_REPORT = {
+    "bot_uptime_pct":           "% of candle closes with heartbeat",
+    "signal_evaluation_count":  "Total evaluations",
+    "entry_rate_pct":           "% evaluations that led to entry",
+    "conflict_rate_pct":        "% evaluations that were OBI/ROC conflicts",
+    "fill_rate_pct":            "% orders fully filled (vs partial/rejected)",
+    "avg_fill_latency_ms":      "Mean order → fill latency",
+    "p99_fill_latency_ms":      "P99 order → fill latency",
+    "error_count":              "Total ERROR + CRITICAL log lines",
+    "ws_reconnect_count":       "WebSocket reconnections",
+    "circuit_breaker_events":   "Circuit breaker triggers",
+}
+```
+
+## Guardrails
+- Every trade action must have a log entry before and after — no silent actions
+- Every skip decision must log the reason — "no signal" is a valid reason, silence is not
+- Never log PII or sensitive data (API keys, private key material) — even in DEBUG
+- Log files must be rotated — unbounded logs fill disk and kill the bot
+- CRITICAL level must always trigger an alert — don't use it for anything non-critical

@@ -1,0 +1,291 @@
+---
+name: kalshi-api-integration
+description: Implement Kalshi API integration for trading bot including authentication, market data fetching, order placement, position management, and WebSocket order book streaming. Use this skill for any code that touches the Kalshi API directly.
+---
+
+# Kalshi API Integration
+
+## What This Skill Covers
+All direct interaction with the Kalshi Exchange API: authentication, fetching market data, streaming order books, placing/canceling orders, managing positions, and handling API errors gracefully.
+
+## Authentication
+```python
+import requests
+import jwt
+import time
+from cryptography.hazmat.primitives import serialization
+
+# Kalshi uses RSA key-based auth for their trading API
+class KalshiAuth:
+    def __init__(self, api_key_id, private_key_path):
+        self.api_key_id = api_key_id
+        with open(private_key_path, "rb") as f:
+            self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    def get_headers(self, method, path, body=""):
+        timestamp = str(int(time.time() * 1000))
+        msg = timestamp + method.upper() + path + body
+
+        signature = self.private_key.sign(
+            msg.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        sig_b64 = base64.b64encode(signature).decode("utf-8")
+
+        return {
+            "KALSHI-ACCESS-KEY":       self.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "Content-Type":            "application/json",
+        }
+```
+
+## Base Client
+```python
+BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+
+class KalshiClient:
+    def __init__(self, auth: KalshiAuth):
+        self.auth = auth
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+    def _request(self, method, path, body=None):
+        url = BASE_URL + path
+        body_str = json.dumps(body) if body else ""
+        headers = self.auth.get_headers(method, path, body_str)
+
+        for attempt in range(3):
+            try:
+                resp = self.session.request(
+                    method, url,
+                    headers=headers,
+                    json=body,
+                    timeout=10
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                if resp.status_code == 429:     # Rate limited
+                    time.sleep(2 ** attempt)    # Exponential backoff
+                    continue
+                if resp.status_code == 401:
+                    raise AuthError("Invalid credentials") from e
+                raise
+            except requests.exceptions.Timeout:
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+```
+
+## Market Data
+```python
+class MarketData:
+    def __init__(self, client: KalshiClient):
+        self.client = client
+
+    def get_btc_markets(self):
+        """Fetch active BTC 15min prediction markets."""
+        return self.client._request("GET", "/markets?status=open&tag=BTC")
+
+    def get_market(self, ticker):
+        return self.client._request("GET", f"/markets/{ticker}")
+
+    def get_orderbook(self, ticker, depth=10):
+        """Fetch current L2 order book for a market."""
+        return self.client._request("GET", f"/markets/{ticker}/orderbook?depth={depth}")
+
+    def get_trades(self, ticker, limit=100):
+        """Fetch recent trades for price/volume context."""
+        return self.client._request("GET", f"/markets/{ticker}/trades?limit={limit}")
+
+    def parse_orderbook(self, raw_ob):
+        """Normalize Kalshi order book response to standard format."""
+        return {
+            "timestamp": raw_ob["timestamp"],
+            "bids": [{"price": b[0], "size": b[1]} for b in raw_ob["orderbook"]["yes"]],
+            "asks": [{"price": a[0], "size": a[1]} for a in raw_ob["orderbook"]["no"]],
+        }
+```
+
+## Order Management
+```python
+class OrderManager:
+    def __init__(self, client: KalshiClient):
+        self.client = client
+        self.open_orders = {}
+
+    def place_order(self, ticker, side, contracts, price, order_type="limit"):
+        """
+        side: "yes" or "no"
+        price: cents (1–99)
+        contracts: number of contracts
+        """
+        body = {
+            "ticker":      ticker,
+            "action":      "buy",
+            "side":        side,
+            "count":       contracts,
+            "type":        order_type,
+            "yes_price":   price if side == "yes" else (100 - price),
+            "no_price":    price if side == "no"  else (100 - price),
+        }
+        resp = self.client._request("POST", "/portfolio/orders", body)
+        order_id = resp["order"]["order_id"]
+        self.open_orders[order_id] = resp["order"]
+        return order_id
+
+    def cancel_order(self, order_id):
+        resp = self.client._request("DELETE", f"/portfolio/orders/{order_id}")
+        self.open_orders.pop(order_id, None)
+        return resp
+
+    def get_order_status(self, order_id):
+        return self.client._request("GET", f"/portfolio/orders/{order_id}")
+
+    def cancel_all_open(self):
+        """Emergency: cancel everything."""
+        for order_id in list(self.open_orders.keys()):
+            try:
+                self.cancel_order(order_id)
+            except Exception as e:
+                log.error(f"Failed to cancel {order_id}: {e}")
+
+    def get_positions(self):
+        return self.client._request("GET", "/portfolio/positions")
+
+    def get_balance(self):
+        resp = self.client._request("GET", "/portfolio/balance")
+        return resp["balance"] / 100  # Kalshi returns cents
+```
+
+## WebSocket — Real-Time Order Book Streaming
+```python
+import websockets
+import asyncio
+
+KALSHI_WS_URL = "wss://trading-api.kalshi.com/trade-api/ws/v2"
+
+class OrderBookStream:
+    def __init__(self, auth: KalshiAuth, ticker, on_update_callback):
+        self.auth = auth
+        self.ticker = ticker
+        self.callback = on_update_callback
+        self.book = {"bids": {}, "asks": {}}  # price → size
+
+    async def connect(self):
+        headers = self.auth.get_headers("GET", "/trade-api/ws/v2")
+        async with websockets.connect(KALSHI_WS_URL, extra_headers=headers) as ws:
+            # Subscribe to orderbook channel
+            await ws.send(json.dumps({
+                "id": 1,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_tickers": [self.ticker]
+                }
+            }))
+
+            async for msg in ws:
+                data = json.loads(msg)
+                self._apply_delta(data)
+                self.callback(self._snapshot())
+
+    def _apply_delta(self, msg):
+        """Apply incremental order book updates."""
+        if msg.get("type") == "orderbook_snapshot":
+            self.book = {"bids": {}, "asks": {}}
+            for bid in msg["msg"].get("yes", []):
+                self.book["bids"][bid[0]] = bid[1]
+            for ask in msg["msg"].get("no", []):
+                self.book["asks"][ask[0]] = ask[1]
+        elif msg.get("type") == "orderbook_delta":
+            for bid in msg["msg"].get("yes", []):
+                price, size = bid[0], bid[1]
+                if size == 0:
+                    self.book["bids"].pop(price, None)
+                else:
+                    self.book["bids"][price] = size
+            for ask in msg["msg"].get("no", []):
+                price, size = ask[0], ask[1]
+                if size == 0:
+                    self.book["asks"].pop(price, None)
+                else:
+                    self.book["asks"][price] = size
+
+    def _snapshot(self):
+        bids = sorted(self.book["bids"].items(), reverse=True)[:10]
+        asks = sorted(self.book["asks"].items())[:10]
+        return {
+            "timestamp": time.time(),
+            "bids": [{"price": p, "size": s} for p, s in bids],
+            "asks": [{"price": p, "size": s} for p, s in asks],
+        }
+```
+
+## Rate Limits & Throttling
+```python
+# Kalshi API rate limits (verify against current docs)
+RATE_LIMITS = {
+    "orders":    10,    # requests per second
+    "market_data": 20, # requests per second
+    "websocket": 1,    # connection per account
+}
+
+# Use a token bucket or simple sleep to stay under limits
+import time
+from collections import deque
+
+class RateLimiter:
+    def __init__(self, max_calls, period=1.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = deque()
+
+    def wait_if_needed(self):
+        now = time.time()
+        while self.calls and now - self.calls[0] > self.period:
+            self.calls.popleft()
+        if len(self.calls) >= self.max_calls:
+            sleep_time = self.period - (now - self.calls[0])
+            time.sleep(max(0, sleep_time))
+        self.calls.append(time.time())
+```
+
+## Implementation Structure
+```
+kalshi/
+  __init__.py
+  auth.py             # RSA authentication
+  client.py           # Base HTTP client with retry logic
+  market_data.py      # REST market data endpoints
+  order_manager.py    # Order placement and management
+  websocket.py        # Real-time order book streaming
+  rate_limiter.py     # API rate limit management
+  exceptions.py       # Custom exception classes
+  config.py           # API URLs, rate limits, timeouts
+```
+
+## Error Handling
+```python
+# Always handle these Kalshi-specific scenarios:
+# 401 Unauthorized     → Auth failure, check key/signature
+# 403 Forbidden        → Market closed or action not permitted
+# 404 Not Found        → Market ticker invalid or expired
+# 429 Too Many Requests → Rate limited, back off exponentially
+# 503 Service Unavailable → Kalshi maintenance, pause bot
+
+class KalshiError(Exception): pass
+class AuthError(KalshiError): pass
+class RateLimitError(KalshiError): pass
+class MarketClosedError(KalshiError): pass
+class InsufficientFundsError(KalshiError): pass
+```
+
+## Important Notes
+- Kalshi markets expire — always verify market is still active before placing orders
+- "Yes" and "No" sides are inverse — yes_price + no_price = 100 cents always
+- Contracts are binary — max payout is $1.00 per contract
+- Always verify API credentials work in sandbox environment before live trading
+- Check Kalshi docs for current fee schedule before modeling PnL

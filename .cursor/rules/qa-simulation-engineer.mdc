@@ -1,0 +1,243 @@
+---
+name: qa-simulation-engineer
+description: Role context for the QA/Simulation Engineer on the Kalshi BTC 15min trading bot. Use this skill when building the paper trading environment, simulating realistic fill latencies, writing integration tests against a mock Kalshi API, validating backtest vs live performance gaps, or building the regression test suite that runs before every production deploy.
+---
+
+# QA / Simulation Engineer
+
+## Role Purpose
+The QA/Simulation Engineer ensures the strategy works in the real world, not just on paper. Builds the paper trading environment that simulates realistic market conditions — including fill delays, partial fills, and data latency — so gaps between backtest and live performance are caught before real money is at risk.
+
+## Primary Responsibilities
+- Build and maintain the paper trading simulation environment
+- Model realistic Kalshi fill mechanics (latency, partial fills, thin books)
+- Write and maintain the regression test suite run before every deployment
+- Validate that backtest results match live performance within acceptable tolerance
+- Build a mock Kalshi API for unit and integration testing
+- Flag unrealistic backtest assumptions and quantify their impact
+
+## Paper Trading Environment
+```python
+# simulation/paper_trader.py
+# Simulates live trading without real money, using live Kalshi data
+
+class PaperTrader:
+    """
+    Subscribes to live Kalshi WebSocket and runs strategy exactly as production.
+    Orders are simulated using realistic fill model instead of hitting the real API.
+    """
+
+    def __init__(self, strategy, fill_model: FillModel, initial_bankroll: float = 10000):
+        self.strategy      = strategy
+        self.fill_model    = fill_model
+        self.bankroll      = initial_bankroll
+        self.position      = None
+        self.trade_log     = []
+
+    async def on_candle_close(self, candle, book):
+        """Same logic as production bot — only order execution is simulated."""
+        regime = self.atr_filter.update(candle.high, candle.low, candle.close)
+
+        if self.position:
+            exit_signal = self.strategy.check_exit(self.position, candle, regime)
+            if exit_signal:
+                fill = await self.fill_model.simulate_exit(self.position, book)
+                pnl  = self._calc_pnl(self.position, fill.price)
+                self._record_trade(exit_signal.reason, pnl)
+                self.bankroll += pnl
+                self.position = None
+
+        if not self.position:
+            signal = self.strategy.evaluate_entry(candle, book, regime)
+            if signal and self.risk_manager.can_trade():
+                size = self.risk_manager.calculate_size(signal.confidence)
+                fill = await self.fill_model.simulate_entry(signal, book, size)
+                if fill.filled:
+                    self.position = Position(
+                        direction=signal.direction,
+                        entry_price=fill.price,
+                        contracts=fill.contracts,
+                    )
+```
+
+## Fill Model (Realistic Simulation)
+```python
+import asyncio
+import random
+
+class RealisticFillModel:
+    """
+    Simulates Kalshi fill mechanics:
+    - Latency: 50–250ms round-trip (varies by server load)
+    - Partial fills: 15% of orders partially fill on thin books
+    - Slippage: 1–2 cent slippage from quoted price
+    - Rejection rate: ~2% of orders rejected (rate limits, out-of-range price)
+    """
+
+    FILL_LATENCY_MS   = (50, 250)     # min, max
+    PARTIAL_FILL_RATE = 0.15          # 15% of limit orders partially fill
+    SLIPPAGE_CENTS    = (0, 2)        # 0–2 cent slippage from mid
+    REJECTION_RATE    = 0.02          # 2% rejection probability
+
+    async def simulate_entry(self, signal: Signal, book: dict, size_dollars: float) -> FillResult:
+        # Simulate network latency
+        latency_ms = random.uniform(*self.FILL_LATENCY_MS)
+        await asyncio.sleep(latency_ms / 1000)
+
+        # Simulate rejection
+        if random.random() < self.REJECTION_RATE:
+            return FillResult(filled=False, reason="SIMULATED_REJECTION")
+
+        # Calculate fill price with slippage
+        if signal.direction == "long":
+            best_ask    = book["asks"][0]["price"]
+            fill_price  = best_ask + random.randint(*self.SLIPPAGE_CENTS)
+        else:
+            best_bid    = book["bids"][0]["price"]
+            fill_price  = best_bid - random.randint(*self.SLIPPAGE_CENTS)
+
+        # Simulate partial fill on thin books
+        contracts   = int(size_dollars / (fill_price / 100))
+        if random.random() < self.PARTIAL_FILL_RATE:
+            fill_ratio  = random.uniform(0.4, 0.9)
+            contracts   = max(1, int(contracts * fill_ratio))
+
+        return FillResult(
+            filled=True,
+            price=fill_price,
+            contracts=contracts,
+            latency_ms=latency_ms,
+        )
+```
+
+## Mock Kalshi API (for Unit/Integration Tests)
+```python
+# tests/mocks/mock_kalshi.py
+from unittest.mock import AsyncMock
+import json
+
+class MockKalshiClient:
+    """
+    Drop-in replacement for KalshiClient in tests.
+    Returns configurable canned responses.
+    """
+    def __init__(self):
+        self.orders = {}
+        self.order_counter = 0
+        self._order_book = self._default_book()
+
+    async def place_order(self, ticker, side, contracts, price, order_type="limit"):
+        self.order_counter += 1
+        order_id = f"mock-order-{self.order_counter}"
+        order = {
+            "order_id": order_id,
+            "status":   "filled",         # Default to immediate fill in tests
+            "fill_price": price,
+            "contracts": contracts,
+        }
+        self.orders[order_id] = order
+        return MockOrder(**order)
+
+    async def get_orderbook(self, ticker, depth=10):
+        return self._order_book
+
+    def set_order_book(self, bids, asks):
+        """Test helper: inject a specific order book scenario."""
+        self._order_book = {"bids": bids, "asks": asks}
+
+    def simulate_thin_book(self):
+        """Test helper: inject a thin book that should suppress OBI signals."""
+        self.set_order_book(
+            bids=[{"price": 50, "size": 10}],
+            asks=[{"price": 52, "size": 10}],
+        )
+
+    def _default_book(self):
+        return {
+            "bids": [{"price": 50 - i, "size": 100 + i*10} for i in range(10)],
+            "asks": [{"price": 51 + i, "size": 100 + i*10} for i in range(10)],
+        }
+```
+
+## Regression Test Suite
+```python
+# tests/regression/test_strategy_regression.py
+# Run before EVERY deployment to production
+
+class StrategyRegressionTests:
+
+    def test_obi_long_signal_fires_correctly(self, mock_kalshi):
+        """Given a book with OBI=0.72, bot should enter long."""
+        mock_kalshi.set_order_book(
+            bids=[{"price": 60, "size": 720}],
+            asks=[{"price": 61, "size": 280}],
+        )
+        signal = obi_strategy.evaluate(mock_kalshi.get_orderbook(), regime="MEDIUM")
+        assert signal.direction == "long"
+        assert signal.confidence in ("HIGH", "NORMAL")
+
+    def test_obi_no_signal_in_high_regime(self, mock_kalshi):
+        """OBI should not fire in HIGH ATR regime."""
+        mock_kalshi.set_order_book(strong_long_book)
+        signal = obi_strategy.evaluate(mock_kalshi.get_orderbook(), regime="HIGH")
+        assert signal is None
+
+    def test_roc_does_not_fire_in_low_regime(self):
+        """ROC momentum should be suppressed in LOW volatility."""
+        candles = build_trending_candles(roc=0.8)
+        signal  = roc_strategy.evaluate(candles, regime="LOW")
+        assert signal is None
+
+    def test_conflicting_signals_produce_no_trade(self):
+        """OBI long + ROC short should never result in a trade."""
+        signal = coordinator.evaluate(obi_direction="long", roc_direction="short")
+        assert signal is None
+
+    def test_stop_loss_triggers_correctly(self, paper_trader):
+        """Position must close when price moves against entry by stop_loss_pct."""
+        paper_trader.enter_long_at(price=51)
+        adverse_candle = Candle(close=49.0)   # ~4% adverse move
+        paper_trader.on_candle_close(adverse_candle)
+        assert paper_trader.position is None
+        assert paper_trader.last_exit_reason == "STOP_LOSS"
+
+    def test_expiry_risk_exits_in_final_3_minutes(self, paper_trader):
+        """Position must close automatically when contract expiry < 3 min."""
+        paper_trader.enter_long_at(price=51)
+        paper_trader.set_time_until_expiry(minutes=2.5)
+        paper_trader.on_candle_close(neutral_candle)
+        assert paper_trader.position is None
+        assert paper_trader.last_exit_reason == "CONTRACT_EXPIRY_RISK"
+```
+
+## Backtest vs Live Gap Analysis
+```python
+# Run monthly to check if live results match backtest predictions
+ACCEPTABLE_GAP = {
+    "win_rate":   0.05,   # Live win rate within ±5pp of backtest
+    "sharpe":     0.30,   # Live Sharpe within 30% of backtest
+    "trade_freq": 0.30,   # Live trade frequency within 30% of backtest
+}
+
+def analyze_backtest_live_gap(backtest_stats: dict, live_stats: dict) -> dict:
+    gaps = {}
+    for metric, threshold in ACCEPTABLE_GAP.items():
+        bt_val   = backtest_stats[metric]
+        live_val = live_stats[metric]
+        gap      = abs(bt_val - live_val) / bt_val
+        gaps[metric] = {
+            "backtest":    bt_val,
+            "live":        live_val,
+            "gap_pct":     gap,
+            "within_tolerance": gap <= threshold,
+            "status": "OK" if gap <= threshold else "INVESTIGATE",
+        }
+    return gaps
+```
+
+## Guardrails
+- Paper trading must run for minimum 4 weeks before any live deployment
+- Regression suite must pass 100% before any deployment — no skipping failing tests
+- Fill model must be calibrated against real Kalshi fill data quarterly
+- Any backtest-vs-live gap > acceptable thresholds triggers a mandatory QR + QD review
+- Never adjust the fill model to make paper results look better — it must reflect reality

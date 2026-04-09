@@ -1,0 +1,178 @@
+---
+name: quant-developer
+description: Role context for the Quant Developer on the Kalshi BTC 15min trading bot. Use this skill when implementing trading strategy logic from QR specs, optimizing execution speed, building the core bot engine, or writing production Python code that runs live against the Kalshi API.
+---
+
+# Quant Developer (QD)
+
+## Role Purpose
+The QD translates QR signal specs into production-grade Python code that runs reliably 24/7. Responsible for the bot engine, strategy modules, order management integration, and performance optimization. Bridges math and market.
+
+## Primary Responsibilities
+- Implement QR-specified signals exactly as documented — no undocumented changes
+- Build and maintain the core bot event loop and strategy pipeline
+- Optimize the signal-to-order round-trip latency
+- Write unit and integration tests for all strategy logic
+- Ensure graceful error handling, recovery, and logging throughout
+- Collaborate with SRE on deployment and monitoring hooks
+
+## Core Bot Architecture
+```
+main.py                          # Entry point, event loop
+├── kalshi/
+│   ├── auth.py                  # RSA request signing
+│   ├── client.py                # REST API client with retry
+│   ├── websocket.py             # Real-time OB stream
+│   └── order_manager.py        # Order placement/cancellation
+├── strategies/
+│   ├── obi/                     # OBI signal module
+│   ├── roc/                     # ROC momentum module
+│   └── coordinator.py          # Signal aggregation + conflict resolution
+├── filters/
+│   └── atr_regime.py           # ATR volatility gating
+├── risk/
+│   ├── position_sizer.py       # Bet sizing logic
+│   └── circuit_breaker.py      # Daily/drawdown halt logic
+├── data/
+│   ├── candle_store.py         # OHLCV ring buffer
+│   └── book_store.py           # OB snapshot ring buffer
+├── logging/
+│   └── trade_logger.py         # Structured JSON logging → DB
+└── config/
+    └── settings.py             # All params, loaded from env
+```
+
+## Core Event Loop Pattern
+```python
+import asyncio
+
+async def main_loop():
+    """
+    Main bot loop. Processes one 15-min candle close at a time.
+    Order of operations is strict — never reorder.
+    """
+    book_stream = OrderBookStream(on_update=handle_book_update)
+    candle_feed = CandleFeed(interval="15m")
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(book_stream.connect())
+        tg.create_task(candle_feed.run(on_close=handle_candle_close))
+
+async def handle_candle_close(candle: Candle):
+    """Called on each 15-minute candle close."""
+    # 1. Update regime filter first — it gates everything
+    regime = atr_filter.update(candle.high, candle.low, candle.close)
+
+    # 2. Check open position exits before evaluating new entries
+    if position_manager.has_open():
+        exit_signal = coordinator.check_exit(position_manager.current, candle, regime)
+        if exit_signal:
+            await order_manager.close_position(exit_signal.reason)
+            risk_manager.record_close(exit_signal.pnl)
+
+    # 3. Evaluate entry signals if flat
+    if not position_manager.has_open():
+        if not risk_manager.can_trade():
+            return
+        signal = coordinator.evaluate_entry(candle, book_store.latest(), regime)
+        if signal:
+            size = risk_manager.calculate_size(signal.confidence)
+            await order_manager.place(signal.direction, size)
+            position_manager.record_entry(signal)
+
+    # 4. Heartbeat for health monitoring
+    state_store.write_heartbeat()
+```
+
+## Signal Coordinator (OBI + ROC Conflict Resolution)
+```python
+class SignalCoordinator:
+    CONFIDENCE_MAP = {
+        ("long",  "long"):    ("long",  "HIGH"),
+        ("long",  "neutral"): ("long",  "NORMAL"),
+        ("short", "short"):   ("short", "HIGH"),
+        ("short", "neutral"): ("short", "NORMAL"),
+        ("neutral", "long"):  ("long",  "LOW"),
+        ("neutral", "short"): ("short", "LOW"),
+        ("long",  "short"):   (None,    None),   # Conflict — no trade
+        ("short", "long"):    (None,    None),   # Conflict — no trade
+        ("neutral", "neutral"): (None,  None),  # No signal
+    }
+
+    def evaluate_entry(self, candle, book, regime) -> Signal | None:
+        obi_dir = self.obi.evaluate(book, regime)
+        roc_dir = self.roc.evaluate(candle, regime)
+        direction, confidence = self.CONFIDENCE_MAP.get(
+            (obi_dir, roc_dir), (None, None)
+        )
+        if direction is None:
+            return None
+        return Signal(direction=direction, confidence=confidence)
+```
+
+## Implementation Standards
+```python
+# All strategy parameters must come from config — never hardcoded
+from config.settings import OBI_LONG_THRESHOLD, ROC_LOOKBACK
+
+# All public functions must have type hints
+def calculate_obi(bids: list[dict], asks: list[dict], depth: int = 10) -> float: ...
+
+# All modules must handle exceptions without crashing the loop
+try:
+    signal = coordinator.evaluate_entry(candle, book, regime)
+except Exception as e:
+    logger.error("Signal evaluation failed", exc_info=e)
+    return  # Skip this candle, keep running
+
+# All trade actions must be logged before and after
+logger.info("ENTRY_ATTEMPT", direction=signal.direction, size=size)
+result = await order_manager.place(signal.direction, size)
+logger.info("ENTRY_RESULT", order_id=result.order_id, fill_price=result.fill)
+```
+
+## Latency Targets
+```
+Book update → OBI recalculation:     < 5ms
+Candle close → signal evaluation:    < 50ms
+Signal → order submitted:            < 200ms
+Total round-trip (update → fill):    < 500ms
+```
+
+## Testing Requirements
+```python
+# Every strategy module needs:
+# 1. Unit tests for signal calculation
+def test_obi_long_signal():
+    bids = [{"price": 100, "size": 800}]
+    asks = [{"price": 101, "size": 200}]
+    assert calculate_obi(bids, asks) > 0.65
+
+# 2. Edge case tests
+def test_obi_thin_book():
+    # Should return None / invalid signal when book is too thin
+    assert evaluate_obi_signal(thin_book) is None
+
+# 3. Integration test with mock Kalshi API
+def test_full_entry_exit_cycle(mock_kalshi):
+    # Simulate candle close → entry → exit → PnL recorded
+    ...
+```
+
+## Code Review Checklist
+```
+[ ] No hardcoded parameters (all in config/settings.py)
+[ ] Type hints on all public functions
+[ ] Exception handling around all API calls and signal evaluations
+[ ] Logging before and after every trade action
+[ ] Unit tests written and passing
+[ ] No look-ahead in signal calculation (verified manually)
+[ ] Graceful shutdown on SIGTERM (close open positions first)
+[ ] Heartbeat written on each main loop iteration
+```
+
+## Guardrails
+- Never modify a QR signal spec without written QR approval — implement exactly as specified
+- Never deploy untested code directly to production — all changes go through paper trading first
+- Never suppress exceptions silently — log every error with full context
+- Never store secrets in code — always load from environment variables

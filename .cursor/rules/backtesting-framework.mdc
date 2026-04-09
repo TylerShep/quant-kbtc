@@ -1,0 +1,221 @@
+---
+name: backtesting-framework
+description: Implement the backtesting and walk-forward validation framework for Kalshi trading strategies. Use this skill when building simulation infrastructure, running parameter optimization, validating out-of-sample performance, or generating backtest reports. Always run backtests before deploying any strategy change live.
+---
+
+# Backtesting & Walk-Forward Validation Framework
+
+## What This Skill Covers
+The full pipeline from raw historical data → strategy simulation → performance metrics → walk-forward validation → go/no-go decision. This framework is the ground truth for whether a strategy has edge before it touches real money.
+
+## Data Requirements
+```python
+# Minimum data needed before backtesting
+MIN_CANDLES          = 2000       # ~20 days of 15min BTC candles
+RECOMMENDED_CANDLES  = 17520      # 6 months of 15min data
+IDEAL_CANDLES        = 35040      # 12 months = sees multiple regimes
+
+# Required fields per candle
+candle = {
+    "timestamp": ...,   # Unix ms
+    "open": ...,
+    "high": ...,
+    "low": ...,
+    "close": ...,
+    "volume": ...,
+}
+
+# Required for OBI backtesting (harder to get historically)
+order_book_snapshot = {
+    "timestamp": ...,
+    "bids": [{"price": ..., "size": ...}, ...],  # Top 10 levels
+    "asks": [{"price": ..., "size": ...}, ...],
+}
+```
+
+## Walk-Forward Split
+```python
+# NEVER optimize on full dataset — always split
+TRAIN_PCT     = 0.70    # 70% for parameter optimization
+TEST_PCT      = 0.30    # 30% held out — touch only once, at the end
+
+# Walk-forward windows (rolling)
+WINDOW_SIZE   = 1000    # Candles per training window
+STEP_SIZE     = 200     # Roll forward by this many candles
+
+# Example with 5000 candles:
+# Window 1: train 0–700,   test 700–1000
+# Window 2: train 200–900, test 900–1200
+# Window 3: train 400–1100, test 1100–1400
+# ... continue until end of data
+```
+
+## Core Backtester
+```python
+class Backtester:
+    def __init__(self, candles, order_book_history, strategy_config):
+        self.candles = candles
+        self.ob_history = order_book_history
+        self.config = strategy_config
+        self.trades = []
+        self.equity_curve = []
+
+    def run(self, start_idx, end_idx, bankroll=10000):
+        """Simulate strategy over candle range."""
+        position = None
+        current_bankroll = bankroll
+
+        for i in range(start_idx, end_idx):
+            candle = self.candles[i]
+            ob = self.ob_history.get(candle["timestamp"])
+
+            # Update regime filter
+            regime = self.regime_filter.update(candle["high"], candle["low"], candle["close"])
+
+            # Check exit first if in position
+            if position:
+                exit, reason = self.check_exit(position, candle, regime)
+                if exit:
+                    pnl = self.calculate_pnl(position, candle["close"])
+                    pnl_after_fees = pnl - self.estimate_fees(position)
+                    current_bankroll += pnl_after_fees
+                    self.record_trade(position, candle, reason, pnl_after_fees)
+                    position = None
+
+            # Check entry if no position
+            if position is None and ob:
+                signal = self.evaluate_signals(candle, ob, regime, i)
+                if signal:
+                    risk = current_bankroll * self.config["RISK_PER_TRADE_PCT"]
+                    position = self.open_position(signal, candle, risk, i)
+
+            self.equity_curve.append(current_bankroll)
+
+        return self.generate_report(bankroll, current_bankroll)
+
+    def estimate_fees(self, position):
+        """Model Kalshi fee structure."""
+        # Update with actual Kalshi fee schedule
+        return position["notional"] * 0.007   # ~0.7% round-trip estimate
+
+    def calculate_pnl(self, position, exit_price):
+        direction = 1 if position["direction"] == "long" else -1
+        return direction * (exit_price - position["entry_price"]) / position["entry_price"] * position["notional"]
+```
+
+## Performance Metrics
+```python
+def generate_report(initial_bankroll, trades, equity_curve):
+    returns = [t["pnl_pct"] for t in trades]
+    winners = [r for r in returns if r > 0]
+    losers  = [r for r in returns if r <= 0]
+
+    metrics = {
+        # Volume
+        "total_trades":         len(trades),
+        "trades_per_day":       len(trades) / trading_days(trades),
+
+        # Profitability
+        "win_rate":             len(winners) / len(trades),
+        "avg_win_pct":          mean(winners) if winners else 0,
+        "avg_loss_pct":         mean(losers) if losers else 0,
+        "profit_factor":        sum(winners) / abs(sum(losers)) if losers else float("inf"),
+        "total_return_pct":     (equity_curve[-1] - initial_bankroll) / initial_bankroll * 100,
+
+        # Risk-adjusted
+        "sharpe_ratio":         mean(returns) / std(returns) * sqrt(252) if std(returns) > 0 else 0,
+        "sortino_ratio":        mean(returns) / std(losers) * sqrt(252) if losers else 0,
+
+        # Drawdown
+        "max_drawdown_pct":     max_drawdown(equity_curve),
+        "avg_drawdown_pct":     avg_drawdown(equity_curve),
+        "recovery_factor":      total_return / max_drawdown,
+
+        # Exit breakdown
+        "exit_reasons":         Counter(t["exit_reason"] for t in trades),
+        "avg_candles_held":     mean(t["candles_held"] for t in trades),
+
+        # Regime breakdown
+        "trades_by_regime":     Counter(t["regime_at_entry"] for t in trades),
+        "winrate_by_regime":    {regime: winrate(trades, regime) for regime in ["LOW","MEDIUM","HIGH"]},
+    }
+    return metrics
+```
+
+## Minimum Bar to Proceed
+```python
+# Strategy must clear ALL of these on out-of-sample test data
+MINIMUM_THRESHOLDS = {
+    "total_trades":    200,        # Enough trades for statistical significance
+    "win_rate":        0.52,       # Better than coin flip
+    "sharpe_ratio":    1.0,        # Risk-adjusted return acceptable
+    "max_drawdown":    0.20,       # No more than 20% drawdown
+    "profit_factor":   1.2,        # Gross wins > gross losses by 20%+
+}
+
+# Red flags that suggest overfitting
+OVERFITTING_RED_FLAGS = {
+    "sharpe_ratio":    3.0,        # Too good = curve-fitted
+    "win_rate":        0.70,       # Unrealistically high
+    "total_trades":    50,         # Too few = not statistically significant
+}
+```
+
+## Walk-Forward Validation
+```python
+def walk_forward_validation(candles, ob_history, param_grid):
+    """
+    Optimize params on rolling train windows, test on subsequent window.
+    Report consistency of edge across all test windows.
+    """
+    results = []
+    windows = generate_windows(candles, WINDOW_SIZE, STEP_SIZE)
+
+    for train_range, test_range in windows:
+        # Optimize on train
+        best_params = optimize(candles[train_range], ob_history, param_grid)
+
+        # Test on unseen data — no touching
+        test_result = Backtester(candles[test_range], ob_history, best_params).run()
+        results.append(test_result)
+
+    # Edge is real if it appears in majority of test windows
+    consistency = sum(1 for r in results if r["sharpe_ratio"] > 1.0) / len(results)
+    print(f"Edge consistency across windows: {consistency:.0%}")
+    # Target: > 60% of windows show positive edge
+    return results, consistency
+```
+
+## Implementation Structure
+```
+backtesting/
+  __init__.py
+  backtester.py         # Core simulation engine
+  walk_forward.py       # Rolling window validation
+  metrics.py            # All performance metric calculations
+  optimizer.py          # Grid/random search over param space
+  data_loader.py        # Load and validate historical data
+  report_generator.py   # HTML/CSV report output
+  config.py             # Backtest configuration
+```
+
+## Common Pitfalls to Avoid
+- **Look-ahead bias**: Signal at candle N can ONLY use data from candles 0 to N-1. Check every calculation.
+- **Survivorship bias**: Include periods when your strategy would have been halted by circuit breakers
+- **Ignoring fees**: Always model Kalshi fees — they significantly impact short-term strategies
+- **Peeking at test set**: Once you've looked at test data to "just check something," it's no longer out-of-sample
+- **Too few trades**: < 200 trades means results are noise — get more data or loosen entry criteria slightly
+- **Unrealistic fills**: Assume you get fills at slight slippage from mid — not always at best price
+
+## Logging & Report Output
+Every backtest run must output:
+```
+reports/
+  {strategy}_{date}_{param_hash}/
+    summary.json          # All metrics
+    trades.csv            # Every trade with full context
+    equity_curve.csv      # Bankroll over time
+    regime_breakdown.csv  # Performance by ATR regime
+    exit_reason_dist.csv  # What triggered exits
+    params.json           # Exact params used
+```

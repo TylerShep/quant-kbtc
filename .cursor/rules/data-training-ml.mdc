@@ -1,0 +1,235 @@
+---
+name: data-training-ml
+description: Implement data collection, feature engineering, model training, and ML pipeline for Kalshi BTC/ETH trading strategies. Use this skill when building training datasets, engineering features from order book or candle data, training classifiers, evaluating model performance, or setting up retraining pipelines.
+---
+
+# Data Training & Machine Learning Pipeline
+
+## What This Skill Covers
+The full ML pipeline: raw data collection → feature engineering → labeling → model training → evaluation → deployment → retraining. Focuses on practical approaches for 15min BTC/ETH Kalshi markets with limited labeled data.
+
+## Recommended Approach By Data Volume
+```
+< 200 labeled examples   → RAG / few-shot retrieval only (no model training yet)
+200–500 examples         → Fine-tune small classifier (sklearn, XGBoost)
+500–2000 examples        → Gradient boosted trees (XGBoost / LightGBM)
+2000+ examples           → Neural approaches viable (LSTM, Transformer)
+```
+
+Start with RAG + rule-based signals. Accumulate labels. Train only when you have enough.
+
+## Feature Engineering
+
+### Order Book Features (OBI-derived)
+```python
+def extract_ob_features(order_book, depth_levels=10):
+    bids = order_book["bids"][:depth_levels]
+    asks = order_book["asks"][:depth_levels]
+
+    total_bid_vol = sum(b["size"] for b in bids)
+    total_ask_vol = sum(a["size"] for a in asks)
+
+    return {
+        "obi":                   total_bid_vol / (total_bid_vol + total_ask_vol),
+        "bid_ask_spread":        asks[0]["price"] - bids[0]["price"],
+        "bid_depth_top3":        sum(b["size"] for b in bids[:3]),
+        "ask_depth_top3":        sum(a["size"] for a in asks[:3]),
+        "bid_concentration":     bids[0]["size"] / total_bid_vol,   # Is top level dominant?
+        "ask_concentration":     asks[0]["size"] / total_ask_vol,
+        "weighted_mid_price":    weighted_mid(bids, asks),
+        "order_book_slope_bid":  book_slope(bids),   # How fast volume drops off
+        "order_book_slope_ask":  book_slope(asks),
+    }
+```
+
+### Candle / Price Features (ROC-derived)
+```python
+def extract_candle_features(candles, current_idx):
+    c = candles
+    i = current_idx
+
+    closes = [c[j]["close"] for j in range(max(0, i-20), i+1)]
+    highs  = [c[j]["high"]  for j in range(max(0, i-20), i+1)]
+    lows   = [c[j]["low"]   for j in range(max(0, i-20), i+1)]
+
+    return {
+        "roc_3":          roc(closes, 3),
+        "roc_5":          roc(closes, 5),
+        "roc_10":         roc(closes, 10),
+        "atr_14":         atr(highs, lows, closes, 14),
+        "atr_pct":        atr(highs, lows, closes, 14) / closes[-1] * 100,
+        "candle_body":    abs(c[i]["close"] - c[i]["open"]) / c[i]["open"],
+        "upper_wick":     (c[i]["high"] - max(c[i]["open"], c[i]["close"])) / c[i]["open"],
+        "lower_wick":     (min(c[i]["open"], c[i]["close"]) - c[i]["low"]) / c[i]["open"],
+        "green_candles_3": sum(1 for j in range(i-2, i+1) if c[j]["close"] > c[j]["open"]),
+        "volume_ratio":   c[i]["volume"] / mean(c[j]["volume"] for j in range(i-10, i)),
+        "price_vs_sma10": (closes[-1] - mean(closes[-10:])) / mean(closes[-10:]),
+    }
+```
+
+### Label Generation
+```python
+def generate_label(candles, current_idx, forward_candles=2, threshold=0.003):
+    """
+    Label each candle with what price did in the next N candles.
+    Used for supervised learning.
+    """
+    entry_price = candles[current_idx]["close"]
+    future_prices = [candles[current_idx + j]["close"] for j in range(1, forward_candles + 1)]
+    max_future = max(future_prices)
+    min_future = min(future_prices)
+
+    if (max_future - entry_price) / entry_price >= threshold:
+        return 1    # UP — long signal
+    elif (entry_price - min_future) / entry_price >= threshold:
+        return -1   # DOWN — short signal
+    else:
+        return 0    # FLAT — no trade
+```
+
+## Model Training (XGBoost Recommended Start)
+```python
+import xgboost as xgb
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import classification_report
+
+def train_direction_classifier(features_df, labels):
+    """
+    Predict -1 (short), 0 (flat), 1 (long).
+    CRITICAL: Use TimeSeriesSplit — never random split on time-series data.
+    """
+    tscv = TimeSeriesSplit(n_splits=5)
+    models = []
+
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(features_df)):
+        X_train = features_df.iloc[train_idx]
+        y_train = labels.iloc[train_idx]
+        X_val   = features_df.iloc[val_idx]
+        y_val   = labels.iloc[val_idx]
+
+        model = xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=4,            # Keep shallow to reduce overfitting
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            use_label_encoder=False,
+            eval_metric="mlogloss",
+            early_stopping_rounds=20,
+        )
+        model.fit(X_train, y_train,
+                  eval_set=[(X_val, y_val)],
+                  verbose=False)
+
+        preds = model.predict(X_val)
+        print(f"Fold {fold}: \n{classification_report(y_val, preds)}")
+        models.append(model)
+
+    return models  # Ensemble of fold models
+
+def predict_ensemble(models, features):
+    """Average probabilities across fold models."""
+    proba_list = [m.predict_proba(features) for m in models]
+    avg_proba = sum(proba_list) / len(proba_list)
+    return avg_proba  # Shape: [n_samples, 3] for [-1, 0, 1]
+```
+
+## RAG / Few-Shot Retrieval (Use Before Model Training)
+```python
+# Store past trade contexts + outcomes in a vector DB
+# At prediction time, find similar past situations and use their outcomes
+
+import chromadb
+
+def build_trade_memory(past_trades):
+    """Index historical trades by their feature vectors."""
+    client = chromadb.Client()
+    collection = client.create_collection("trade_memory")
+
+    for trade in past_trades:
+        features = trade["features"]
+        outcome  = trade["label"]  # 1, 0, -1
+        collection.add(
+            embeddings=[features],
+            metadatas=[{"outcome": outcome, "pnl": trade["pnl"]}],
+            ids=[trade["id"]]
+        )
+    return collection
+
+def retrieve_similar_trades(collection, current_features, n=10):
+    """Find N most similar past situations."""
+    results = collection.query(
+        query_embeddings=[current_features],
+        n_results=n,
+    )
+    outcomes = [r["outcome"] for r in results["metadatas"][0]]
+    # Majority vote = signal direction
+    return max(set(outcomes), key=outcomes.count)
+```
+
+## Retraining Pipeline
+```python
+# Retrain schedule
+RETRAIN_FREQUENCY    = "weekly"       # Retrain every Sunday night
+MIN_NEW_SAMPLES      = 100            # Only retrain if N new labeled samples available
+PERFORMANCE_DECAY_THRESHOLD = 0.05   # Retrain if win rate drops 5% below baseline
+
+def should_retrain(recent_performance, baseline_performance, new_sample_count):
+    performance_decayed = (baseline_performance - recent_performance) > PERFORMANCE_DECAY_THRESHOLD
+    enough_new_data = new_sample_count >= MIN_NEW_SAMPLES
+    return performance_decayed or enough_new_data
+
+# Always validate new model against holdout before deploying
+def deploy_new_model(new_model, holdout_data):
+    new_perf  = evaluate(new_model, holdout_data)
+    old_perf  = evaluate(current_model, holdout_data)
+    if new_perf["sharpe"] > old_perf["sharpe"]:
+        swap_model(new_model)
+        log("Model updated — new Sharpe: {}", new_perf["sharpe"])
+    else:
+        log("Model NOT updated — old model still better")
+```
+
+## Implementation Structure
+```
+ml/
+  __init__.py
+  features/
+    ob_features.py      # Order book feature extraction
+    candle_features.py  # Price/candle feature extraction
+    labeler.py          # Label generation from future price
+    pipeline.py         # Full feature + label pipeline
+  training/
+    trainer.py          # XGBoost training with TimeSeriesSplit
+    evaluator.py        # Metrics, classification report
+    optimizer.py        # Hyperparameter search
+  retrieval/
+    rag.py              # ChromaDB RAG few-shot retrieval
+    embedder.py         # Feature vector → embedding
+  serving/
+    predictor.py        # Load model, make predictions
+    model_store.py      # Versioned model storage
+  retraining/
+    scheduler.py        # Cron-based retrain trigger
+    validator.py        # A/B validation before deploy
+  data/
+    collector.py        # Ongoing data collection
+    storage.py          # Persist candles + OB snapshots
+```
+
+## Common Pitfalls to Avoid
+- **Random train/test split on time-series**: Always use TimeSeriesSplit — random split leaks future data into training
+- **Training on labeled flat candles**: Class imbalance (lots of FLAT labels) will bias the model — undersample FLAT or use class weights
+- **Feature look-ahead**: Every feature must only use data available at prediction time — check each one carefully
+- **Deploying without validation**: Never swap to a new model without comparing against holdout performance
+- **Over-engineering early**: Start with RAG + XGBoost. Add complexity only when simpler approach fails.
+
+## Minimum Model Performance Before Live Use
+```python
+MINIMUM_ML_THRESHOLDS = {
+    "precision_long":   0.54,   # When model says long, right 54%+ of time
+    "precision_short":  0.54,
+    "f1_macro":         0.50,
+    "out_of_sample_sharpe": 1.0,
+}
+```

@@ -1,0 +1,189 @@
+---
+name: roc-trading
+description: Implement Rate of Change (ROC) momentum trading strategy for Kalshi 15-minute BTC/ETH prediction markets. Use this skill when building, modifying, or debugging momentum signal generation, candle confirmation logic, or entry/exit rules.
+---
+
+# Rate of Change (ROC) Momentum Trading Strategy
+
+## What This Skill Covers
+Building and maintaining the ROC momentum strategy module. ROC measures how fast price is moving over recent candles and bets that short-term momentum continues for at least one more candle. Works best in medium-to-high volatility regimes.
+
+## Core Formula
+```python
+ROC = ((current_close - close_n_candles_ago) / close_n_candles_ago) * 100
+# Positive = upward momentum
+# Negative = downward momentum
+# Units = percentage change
+```
+
+## Parameters (Tunable)
+```python
+ROC_LOOKBACK         = 3         # How many candles back to compare price
+ROC_LONG_THRESHOLD   = 0.4       # % ROC to trigger long (e.g. +0.4%)
+ROC_SHORT_THRESHOLD  = -0.4      # % ROC to trigger short (e.g. -0.4%)
+ROC_MAX_CAP          = 2.5       # Skip if ROC > this (blow-off, likely to revert)
+ROC_MIN_CAP          = -2.5      # Skip if ROC < this (oversold spike)
+CANDLE_CONFIRM_MIN   = 2         # Min candles out of last 3 that must agree on direction
+MOMENTUM_STALL_RATIO = 0.5       # Exit early if ROC drops to 50% of entry ROC
+BLOWOFF_SINGLE_CANDLE = 1.5      # Take profit if single candle moves this % in your favor
+STOP_LOSS_PCT        = 0.02      # 2% hard stop
+PROFIT_TARGET_MULT   = 1.5       # Target = 1.5x average loss
+MAX_CANDLES_IN_TRADE = 2         # ROC trades are shorter-lived than OBI
+```
+
+## Data Requirements
+- OHLCV candle data at 15min resolution
+- Minimum of `ROC_LOOKBACK + 3` candles of history before first signal
+- ATR regime signal from `atr-regime-filter` module (required gating)
+- Current OBI direction from `obi-trading` module (for conflict detection)
+
+## Entry Logic
+```python
+def calculate_roc(closes, lookback):
+    return ((closes[-1] - closes[-lookback - 1]) / closes[-lookback - 1]) * 100
+
+def candle_direction_count(candles, direction):
+    """Count how many of last 3 candles closed in given direction."""
+    recent = candles[-3:]
+    if direction == "up":
+        return sum(1 for c in recent if c["close"] > c["open"])
+    return sum(1 for c in recent if c["close"] < c["open"])
+
+def should_enter_long(closes, candles, atr_regime, obi_direction, current_position):
+    if current_position is not None:
+        return False
+    if atr_regime == "LOW":          # ROC unreliable in dead markets
+        return False
+    roc = calculate_roc(closes, ROC_LOOKBACK)
+    if roc < ROC_LONG_THRESHOLD:
+        return False
+    if roc > ROC_MAX_CAP:            # Blow-off — likely to revert
+        return False
+    if candle_direction_count(candles, "up") < CANDLE_CONFIRM_MIN:
+        return False
+    if obi_direction == "short":     # Conflict with OBI — skip
+        return False
+    return True
+
+def should_enter_short(closes, candles, atr_regime, obi_direction, current_position):
+    if current_position is not None:
+        return False
+    if atr_regime == "LOW":
+        return False
+    roc = calculate_roc(closes, ROC_LOOKBACK)
+    if roc > ROC_SHORT_THRESHOLD:
+        return False
+    if roc < ROC_MIN_CAP:
+        return False
+    if candle_direction_count(candles, "down") < CANDLE_CONFIRM_MIN:
+        return False
+    if obi_direction == "long":
+        return False
+    return True
+```
+
+## Exit Logic — Check In Priority Order
+```python
+def should_exit(position, current_price, entry_price, entry_roc,
+                current_roc, latest_candle, prev_candles, candles_held):
+    direction = position["direction"]
+
+    # 1. Hard stop loss
+    pnl_pct = (current_price - entry_price) / entry_price
+    if direction == "short":
+        pnl_pct = -pnl_pct
+    if pnl_pct <= -STOP_LOSS_PCT:
+        return True, "STOP_LOSS"
+
+    # 2. Profit target
+    if pnl_pct >= STOP_LOSS_PCT * PROFIT_TARGET_MULT:
+        return True, "TAKE_PROFIT"
+
+    # 3. Blow-off spike in your favor — lock in gain
+    candle_move = abs(latest_candle["close"] - latest_candle["open"]) / latest_candle["open"] * 100
+    if candle_move >= BLOWOFF_SINGLE_CANDLE and pnl_pct > 0:
+        return True, "BLOWOFF_TAKE_PROFIT"
+
+    # 4. Reversal candle — opposite direction, large body
+    avg_body = average_candle_body_size(prev_candles[-5:])
+    current_body = abs(latest_candle["close"] - latest_candle["open"])
+    candle_reversed = (
+        (direction == "long" and latest_candle["close"] < latest_candle["open"]) or
+        (direction == "short" and latest_candle["close"] > latest_candle["open"])
+    )
+    if candle_reversed and current_body > avg_body * 1.5:
+        return True, "REVERSAL_CANDLE"
+
+    # 5. Momentum stall — ROC fading fast
+    if abs(current_roc) < abs(entry_roc) * MOMENTUM_STALL_RATIO:
+        return True, "MOMENTUM_STALL"
+
+    # 6. First candle closes against position (standard exit)
+    if direction == "long" and latest_candle["close"] < latest_candle["open"]:
+        return True, "CANDLE_REVERSAL"
+    if direction == "short" and latest_candle["close"] > latest_candle["open"]:
+        return True, "CANDLE_REVERSAL"
+
+    # 7. Time-based exit
+    if candles_held >= MAX_CANDLES_IN_TRADE:
+        return True, "TIME_EXIT"
+
+    return False, None
+```
+
+## Implementation Structure
+```
+strategies/
+  roc/
+    __init__.py
+    signal.py        # ROC calculation + candle direction counting
+    entry.py         # Entry condition checks
+    exit.py          # All exit condition checks
+    candle_utils.py  # Body size, direction helpers
+    config.py        # All parameters in one place
+```
+
+## Common Pitfalls to Avoid
+- **Chasing blow-offs**: The `ROC_MAX_CAP` check is critical — entering after a 3%+ move means you're last in, first hurt on the reversion
+- **Low volatility entries**: ROC signals in flat markets are noise — always gate on ATR regime
+- **Holding through reversals**: ROC trades are short — the exit discipline is stricter than OBI
+- **Ignoring candle confirmation**: One strong candle is not enough — require `CANDLE_CONFIRM_MIN` agreement
+- **Conflicting OBI**: If OBI says opposite direction, skip regardless of how strong ROC looks
+
+## Signal Interaction With OBI
+```python
+# Highest conviction — both agree
+if roc_long and obi_long:
+    position_size = full_size
+    
+# ROC only — OBI neutral
+elif roc_long and obi_neutral:
+    position_size = reduced_size  # 60-70% of full
+
+# Conflict — never trade
+elif roc_long and obi_short:
+    skip()
+```
+
+## Logging Requirements
+```python
+{
+  "timestamp": ...,
+  "roc_value": ...,
+  "entry_roc": ...,            # saved at entry for stall detection
+  "candle_direction_count": ...,
+  "atr_regime": ...,
+  "obi_direction": ...,
+  "action": "ENTER_LONG | ENTER_SHORT | SKIP | EXIT",
+  "skip_reason": "...",
+  "exit_reason": "...",
+  "candles_held": ...,
+  "pnl_pct": ...,
+}
+```
+
+## Integration Points
+- Receives: ATR regime from `atr-regime-filter`
+- Receives: OBI direction from `obi-trading` module
+- Sends: Position state to `risk-position-sizing` module
+- Sends: Trade logs to backtesting framework

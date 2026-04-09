@@ -1,0 +1,303 @@
+---
+name: incident-response-runbook
+description: Step-by-step playbooks for the most likely failure scenarios on the Kalshi BTC 15min trading bot. Use this skill when responding to an active incident, building incident response automation, or preparing runbooks for new failure modes. Covers WebSocket disconnect, stuck positions, bad fills, database outages, circuit breaker triggers, and API auth failures.
+---
+
+# Incident Response Runbook
+
+## Incident Severity Levels
+```
+SEV-1 (Immediate — wake up for this):
+  - Open position cannot be closed (order rejections looping)
+  - Bot placed unauthorized or unexpected trades
+  - API key compromised or auth failing
+  - Database down with open position
+
+SEV-2 (Urgent — respond within 15 min):
+  - Circuit breaker triggered (daily/weekly/drawdown)
+  - WebSocket disconnected and not auto-recovering
+  - Bot process crashed and watchdog failing to restart
+  - Data pipeline stale > 10 minutes with open position
+
+SEV-3 (Same day — respond within 4 hours):
+  - Win rate significantly below expected for 24h+
+  - Latency P99 consistently above budget
+  - Disk usage > 85%
+  - Backup failures
+
+SEV-4 (Monitor — no immediate action):
+  - Single trade behaved unexpectedly
+  - Occasional latency spikes
+  - Non-critical alert noise
+```
+
+---
+
+## Runbook 1: WebSocket Disconnect / Stale Order Book
+
+**Symptoms**: Bot not receiving book updates, OBI readings unchanged for > 60s, WS error in logs
+
+```bash
+# Step 1: Check WS connection status in logs
+docker logs kalshi-bot --tail=100 | grep -E "websocket|WS|disconnect|reconnect"
+
+# Step 2: Check if auto-reconnect is running
+docker logs kalshi-bot --tail=50 | grep -E "Retry|reconnect attempt"
+
+# If auto-reconnect appears stuck (same error > 5 minutes):
+# Step 3: Restart just the bot container (preserves DB state)
+docker restart kalshi-bot
+sleep 30
+docker logs kalshi-bot --tail=30 | grep "WebSocket connected"
+
+# Step 4: If still failing, check Kalshi exchange status
+curl -s "https://trading-api.kalshi.com/trade-api/v2/exchange/status" | python3 -m json.tool
+
+# Step 5: If exchange is down, set bot to PAUSE_ENTRIES mode
+docker exec kalshi-bot python -c "
+from tools.admin_cli import bot_control
+bot_control.set_mode('PAUSE_ENTRIES')
+print('Bot paused — will resume when WS reconnects')
+"
+
+# Step 6: Log the incident
+echo "[$(date -u)] SEV-2: WS disconnect. Auto-reconnect failed. Manual restart at $(date -u). Exchange status: [OK/DOWN]" >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Runbook 2: Stuck Open Position (Cannot Close)
+
+**Symptoms**: Exit order submitted but not filling, position open past expected hold time, fill errors in logs
+
+```bash
+# Step 1: Identify the stuck position
+docker exec kalshi-bot python -c "
+from kalshi.client import KalshiClient
+from kalshi.auth import KalshiAuth
+import os
+client = KalshiClient(KalshiAuth(os.getenv('KALSHI_API_KEY_ID'), os.getenv('KALSHI_PRIVATE_KEY_PATH')))
+positions = client.get_positions()
+print(positions)
+"
+
+# Step 2: Cancel any pending exit orders
+docker exec kalshi-bot python -c "
+from tools.admin_cli import order_manager
+order_manager.cancel_all_open()
+print('All pending orders canceled')
+"
+
+# Step 3: Check contract expiry — if < 5 min, do nothing and let it settle
+# Kalshi will settle the contract and PnL will resolve automatically
+
+# Step 4: If contract has time remaining, force close with aggressive (taker) pricing
+docker exec kalshi-bot python -c "
+from tools.admin_cli import position_manager
+position_manager.force_close(reason='INCIDENT_MANUAL_CLOSE', aggressive=True)
+"
+
+# Step 5: If API rejects all close attempts, check for:
+#   - INSUFFICIENT_FUNDS (can't buy back at current price)
+#   - MARKET_CLOSED (contract expired — settlement will handle it)
+#   - RATE_LIMITED (wait 30s, retry)
+docker logs kalshi-bot --tail=50 | grep -E "rejection|REJECTED|error"
+
+# Step 6: Record outcome
+echo "[$(date -u)] SEV-1: Stuck position on [TICKER]. Closed via [method] at [price]. PnL: [amount]" >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Runbook 3: Circuit Breaker Triggered
+
+**Symptoms**: Alert fires "CIRCUIT BREAKER TRIGGERED", bot stops entering trades
+
+```bash
+# Step 1: Identify which circuit breaker fired
+docker exec kalshi-bot python -c "
+import json, psycopg2, os
+conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+cur = conn.cursor()
+cur.execute(\"SELECT value FROM bot_state WHERE key = 'circuit_breaker'\")
+row = cur.fetchone()
+print(json.dumps(json.loads(row[0]), indent=2))
+"
+
+# Step 2: Review today's trades to understand why
+docker exec kalshi-bot python -c "
+import psycopg2, os
+conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+cur = conn.cursor()
+cur.execute('''
+    SELECT exit_reason, COUNT(*), SUM(pnl_cents)/100.0 as pnl
+    FROM trades
+    WHERE entry_timestamp >= NOW() - INTERVAL '24 hours'
+    GROUP BY exit_reason
+    ORDER BY pnl
+''')
+for row in cur.fetchall():
+    print(row)
+"
+
+# Step 3: Decision tree
+# DAILY_LOSS_LIMIT → Wait until next calendar day. Review trades, no override today.
+# WEEKLY_LOSS_LIMIT → Wait until Monday. Requires QR + PM review before resuming.
+# MAX_DRAWDOWN → Full review required. Do NOT resume without team sign-off.
+
+# Step 4: If DAILY_LOSS and reason is clearly explainable (e.g., one bad fill, news event):
+# QT can override with documented reason
+docker exec kalshi-bot python -c "
+from tools.admin_cli import bot_control
+bot_control.override_circuit_breaker(
+    reason='DAILY_LOSS: Major news event caused 3 consecutive stop-outs. Anomalous — not signal failure.',
+    approved_by='QT'
+)
+"
+
+# Step 5: Log everything
+echo "[$(date -u)] Circuit breaker: [TYPE]. Trades reviewed: [N]. Decision: [WAIT/OVERRIDE]. Reason: [...]" >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Runbook 4: Bot Process Crashed / Won't Restart
+
+**Symptoms**: Watchdog alert fires, container not running, heartbeat stale
+
+```bash
+# Step 1: Check container status and exit code
+docker ps -a | grep kalshi-bot
+docker inspect kalshi-bot --format='{{.State.ExitCode}} {{.State.Error}}'
+
+# Step 2: Check for OOM kill (out of memory)
+docker inspect kalshi-bot --format='{{.State.OOMKilled}}'
+# If true → memory issue. Check usage before restart:
+free -h && docker stats --no-stream
+
+# Step 3: Check last logs before crash
+docker logs kalshi-bot --tail=100 2>&1 | tail -50
+
+# Step 4: Restart the container
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d bot
+sleep 30
+
+# Step 5: Verify health
+docker inspect --format='{{.State.Health.Status}}' kalshi-bot
+docker logs kalshi-bot --tail=30
+
+# Step 6: If crash is repeating (3+ times in 30 min):
+# STOP and investigate before restarting again
+# Pull most recent logs to local for analysis
+docker logs kalshi-bot > /tmp/crash_$(date +%Y%m%d_%H%M%S).log 2>&1
+# DO NOT keep force-restarting a repeatedly crashing bot — it may be in a bad state
+
+echo "[$(date -u)] Bot crash. Exit code: [N]. OOM: [Y/N]. Restarted at: [time]. Status: [OK/INVESTIGATING]" >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Runbook 5: Database Outage With Open Position
+
+**Symptoms**: DB connection errors in logs, bot cannot write trades or read state
+
+```bash
+# Step 1: Check if it's the managed DB or PgBouncer
+psql $DATABASE_URL -c "SELECT 1" 2>&1
+
+# Step 2: Check DO Managed DB status
+# → DigitalOcean console → Databases → check status
+
+# Step 3: If DB is down with an open position:
+# The bot will attempt to close the position using cached state
+# DO NOT kill the bot — it needs to run to close the position
+# Monitor: docker logs kalshi-bot -f | grep -E "position|close|exit"
+
+# Step 4: Once position is closed (or contract expires), restart DB connection
+docker restart kalshi-bot   # Will reconnect to DB on startup
+
+# Step 5: Validate data integrity after recovery
+docker exec kalshi-bot python -c "
+import psycopg2, os
+conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+cur = conn.cursor()
+# Check for any trades that may have been lost during outage
+cur.execute('''
+    SELECT COUNT(*) FROM trades
+    WHERE entry_timestamp >= NOW() - INTERVAL '2 hours'
+''')
+print('Recent trades in DB:', cur.fetchone()[0])
+"
+
+echo "[$(date -u)] DB outage. Duration: [N min]. Open position during outage: [Y/N]. Data loss: [Y/N]." >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Runbook 6: API Auth Failure
+
+**Symptoms**: All API calls returning 401, "Invalid credentials" in logs
+
+```bash
+# Step 1: Verify key file exists and permissions
+ls -la /run/secrets/kalshi_key.pem
+# Should be: -rw------- 1 botuser botuser
+
+# Step 2: Test auth manually
+docker exec kalshi-bot python -c "
+from kalshi.auth import KalshiAuth
+from kalshi.client import KalshiClient
+import os
+try:
+    c = KalshiClient(KalshiAuth(os.getenv('KALSHI_API_KEY_ID'), '/run/secrets/kalshi_key.pem'))
+    print('Balance:', c.get_balance())
+except Exception as e:
+    print('Auth failed:', e)
+"
+
+# Step 3: If auth is failing — IMMEDIATE: check for key compromise
+# Review Kalshi dashboard for unauthorized activity
+# If compromise suspected → follow devops-security-specialist incident response
+
+# Step 4: If key simply needs rotation (expired per Kalshi policy)
+# Run key rotation script
+/opt/kalshi/scripts/rotate_api_key.sh
+
+echo "[$(date -u)] Auth failure. Cause: [expired/compromised/config]. Resolved: [Y/N]. Key rotated: [Y/N]." >> /var/log/kalshi/incidents.log
+```
+
+---
+
+## Post-Incident Template
+```markdown
+## Incident Report — [Date]
+
+**Severity**: SEV-[1/2/3/4]
+**Duration**: [start] → [resolved] (X minutes)
+**Detected By**: [watchdog alert / QT observation / user report]
+
+**What Happened**:
+[Plain English description]
+
+**Impact**:
+- Open positions affected: [Y/N]
+- Estimated P&L impact: $X
+- Trading halted for: N minutes
+
+**Root Cause**:
+[Technical root cause]
+
+**Resolution**:
+[Steps taken to resolve]
+
+**Prevention**:
+[ ] Action item 1 — assigned to [role]
+[ ] Action item 2 — assigned to [role]
+```
+
+## Guardrails
+- Never restart a crashing bot more than 3 times in 30 minutes without investigating root cause first
+- Never override a circuit breaker without logging the reason and approver
+- Always check for open positions before taking any remediation action — position safety first
+- Every SEV-1 and SEV-2 requires a post-incident report, no exceptions
+- Incident logs are compliance records — never delete them

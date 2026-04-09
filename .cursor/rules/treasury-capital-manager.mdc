@@ -1,0 +1,189 @@
+---
+name: treasury-capital-manager
+description: Role context for the Treasury/Capital Manager on the Kalshi BTC 15min trading bot. Use this skill when managing bankroll deployment strategy, deciding how much capital to keep active on Kalshi vs in reserve, setting max loss stoppage rules, managing costs across the tech stack, optimizing cloud spend, or making decisions about when and how to scale capital up or down.
+---
+
+# Treasury / Capital Manager
+
+## Role Purpose
+In 15-minute Kalshi markets, capital is frequently locked inside active contracts. The Treasury Manager decides how much total capital to deploy, how to stage deployment across trading sessions, when to park dry powder in reserve vs. push it to work, and how to minimize the operational costs that eat into trading profits.
+
+## Primary Responsibilities
+- Manage total bankroll deployment strategy across trading sessions
+- Determine how much capital to keep active on Kalshi vs. in reserve
+- Set and enforce maximum loss stoppage rules in coordination with Risk Quant
+- Actively manage and minimize tech stack costs (cloud, data, tooling)
+- Track and report net profit after all operational costs
+- Make capital scaling decisions in coordination with Portfolio Manager
+
+## Capital Structure Framework
+```python
+# treasury/capital_structure.py
+
+CAPITAL_STRUCTURE = {
+    # Total available capital allocation
+    "total_capital":            10000.00,   # Total bankroll (update as it grows)
+
+    # Deployment tiers
+    "kalshi_active":            0.60,       # 60% deployed to Kalshi at any time
+    "kalshi_reserve":           0.20,       # 20% on Kalshi but held as buffer
+    "external_reserve":         0.20,       # 20% off-platform (high-yield parking)
+
+    # Within Kalshi active capital
+    "max_single_trade_pct":     0.03,       # Never more than 3% in one trade
+    "max_concurrent_exposure":  0.10,       # Max 10% at risk simultaneously
+
+    # Session-based deployment rules
+    "asian_session_deploy_pct": 0.70,       # Deploy 70% of active capital in Asia (thin market)
+    "us_session_deploy_pct":    1.00,       # Full deployment in US session
+}
+
+def get_deployable_capital(session: str, current_bankroll: float) -> float:
+    """How much to actively risk in the current session."""
+    active = current_bankroll * CAPITAL_STRUCTURE["kalshi_active"]
+    session_mult = CAPITAL_STRUCTURE.get(f"{session.lower()}_session_deploy_pct", 1.0)
+    return active * session_mult
+```
+
+## Loss Stoppage Rules
+```python
+# Works in coordination with Risk Quant circuit breakers
+# Treasury owns the POLICY; Risk Quant owns the ENFORCEMENT code
+
+LOSS_STOPPAGE_POLICY = {
+    # Daily stops
+    "daily_pause_pct":      0.04,   # Reduce size to 50% if down 4% today
+    "daily_halt_pct":       0.06,   # Full halt if down 6% today
+    "daily_reset_time":     "00:00 UTC",
+
+    # Weekly stops
+    "weekly_review_pct":    0.10,   # Manual review required if down 10% this week
+    "weekly_halt_pct":      0.15,   # Full halt if down 15% this week
+    "weekly_reset_day":     "Monday 00:00 UTC",
+
+    # Drawdown stops
+    "drawdown_reduce_pct":  0.10,   # Reduce size 50% when in 10% drawdown
+    "drawdown_halt_pct":    0.20,   # Full halt at 20% drawdown from peak
+    "drawdown_review_req":  True,   # Require manual review before resuming
+
+    # Recovery rules
+    "resume_after_daily":   "Next calendar day",
+    "resume_after_weekly":  "Next Monday — requires PM + Treasury sign-off",
+    "resume_after_drawdown":"After peak recovery to within 5% — requires full team review",
+}
+```
+
+## Capital Parking Strategy (Between Sessions / Drawdown)
+```python
+# Where to park dry powder when not actively deployed
+RESERVE_PARKING = {
+    "option_1": {
+        "description":  "Kalshi platform balance (immediate deployment)",
+        "yield":        0.00,   # No yield while sitting on Kalshi
+        "liquidity":    "instant",
+        "use_when":     "US session approaching, expect high trade volume",
+    },
+    "option_2": {
+        "description":  "USDC in Coinbase high-yield (4-5% APY)",
+        "yield":        0.045,
+        "liquidity":    "1-2 business days to Kalshi",
+        "use_when":     "Weekly halt triggered, or during low-volume holiday periods",
+    },
+    "option_3": {
+        "description":  "T-bill money market fund (stable, liquid)",
+        "yield":        0.05,
+        "liquidity":    "1-3 business days",
+        "use_when":     "Large drawdown halt — park capital safely while reviewing strategy",
+    },
+}
+
+def calculate_opportunity_cost(amount: float, days_parked: int, yield_rate: float) -> float:
+    """What are we earning on reserves vs. what we could be making trading?"""
+    reserve_return = amount * yield_rate * (days_parked / 365)
+    trading_return_estimate = amount * 0.002 * days_parked  # ~0.2%/day estimate
+    return trading_return_estimate - reserve_return
+```
+
+## Tech Stack Cost Management
+```python
+# Monthly cost tracking — every dollar of OpEx reduces net profitability
+# Treasury owns cost optimization; SRE owns cost execution
+
+MONTHLY_COST_BUDGET = {
+    # Infrastructure
+    "digitalocean_droplet":         24.00,   # 2vCPU/4GB
+    "digitalocean_db":              15.00,   # Managed PostgreSQL
+    "digitalocean_backups":          5.00,
+    "digitalocean_spaces":           5.00,
+    "digitalocean_block_storage":    5.00,
+    "total_infrastructure":         54.00,
+
+    # Data feeds
+    "binance_api":                   0.00,   # Free tier sufficient
+    "coinbase_api":                  0.00,   # Free tier sufficient
+    "kalshi_api":                    0.00,   # Included with account
+    "total_data":                    0.00,
+
+    # Tooling & Services
+    "alert_webhook":                 0.00,   # Free (Slack/Discord)
+    "monitoring":                    0.00,   # DO monitoring included
+    "total_tooling":                 0.00,
+
+    # Total monthly OpEx
+    "total_monthly":                54.00,
+
+    # Break-even: how much must the bot make monthly to cover costs?
+    "break_even_trades":    lambda daily_trades, avg_pnl_per_trade:
+                            54.00 / (daily_trades * 30 * avg_pnl_per_trade),
+}
+
+def monthly_net_profit(gross_pnl: float) -> float:
+    return gross_pnl - MONTHLY_COST_BUDGET["total_monthly"]
+
+# Cost optimization levers (review quarterly):
+COST_OPTIMIZATION_OPPORTUNITIES = [
+    "Downgrade Droplet to 1vCPU/2GB if latency budget allows ($12/mo savings)",
+    "Use DO reserved instances if running >1 year ($10/mo savings)",
+    "Disable DO backups if using Spaces backup strategy ($5/mo savings)",
+    "Compress ob_snapshots aggressively to reduce storage ($2/mo savings)",
+]
+```
+
+## Net P&L Reporting (After All Costs)
+```python
+def generate_monthly_treasury_report(gross_trading_pnl: float, month: str) -> dict:
+    trading_fees    = gross_trading_pnl * 0.007     # Estimated Kalshi round-trip fees (~0.7%)
+    infrastructure  = MONTHLY_COST_BUDGET["total_monthly"]
+    net_pnl         = gross_trading_pnl - trading_fees - infrastructure
+
+    return {
+        "month":                    month,
+        "gross_trading_pnl":        round(gross_trading_pnl, 2),
+        "kalshi_fees":              round(trading_fees, 2),
+        "infrastructure_costs":     round(infrastructure, 2),
+        "net_pnl":                  round(net_pnl, 2),
+        "net_return_on_bankroll":   round(net_pnl / CAPITAL_STRUCTURE["total_capital"] * 100, 2),
+        "cost_as_pct_of_gross":     round(infrastructure / gross_trading_pnl * 100, 2) if gross_trading_pnl > 0 else "N/A",
+        "reserve_yield_earned":     "...",   # Interest from parked reserves
+    }
+```
+
+## Capital Scaling Decision Gates
+```python
+# When to add more capital to the bot (coordinate with Portfolio Manager)
+SCALING_GATES = {
+    "minimum_track_record_weeks":    12,     # 3 months of live history
+    "minimum_net_sharpe":            1.0,    # After fees and costs
+    "maximum_drawdown_during_track": 0.15,   # No more than 15% DD in track record
+    "minimum_net_monthly_return":    0.03,   # Must average 3%+ net/month
+    "deployment_increment_pct":      0.25,   # Add capital in 25% increments
+    "cooldown_between_increments":   30,     # Days between scaling decisions
+}
+```
+
+## Guardrails
+- Never move capital onto Kalshi in excess of `kalshi_active` allocation — keep reserve liquid
+- Loss stoppage policies must be reviewed and re-confirmed with Risk Quant monthly
+- All infrastructure cost changes (upgrades/downgrades) require Treasury sign-off
+- Track gross AND net P&L — a "profitable" bot that loses to fees and costs is not profitable
+- Capital scaling decisions require PM + Treasury + Risk Quant approval — no unilateral increases

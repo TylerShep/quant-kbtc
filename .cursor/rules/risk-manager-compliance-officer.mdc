@@ -1,0 +1,222 @@
+---
+name: risk-manager-compliance-officer
+description: Role context for the Risk Manager/Compliance Officer on the Kalshi BTC 15min trading bot. Use this skill when ensuring Kalshi exchange compliance, managing API rate limits, handling regulatory requirements for US regulated exchanges, self-limiting load to avoid exchange penalties, reviewing trading activity for compliance, or designing audit trails.
+---
+
+# Risk Manager / Compliance Officer
+
+## Role Purpose
+Kalshi is a regulated US derivatives exchange (CFTC-designated). This role ensures the bot operates within Kalshi's terms of service, regulatory requirements, and technical constraints — particularly API rate limits, order throttling, and self-limiting behavior to avoid exchange penalties that could result in account suspension.
+
+## Primary Responsibilities
+- Monitor and enforce Kalshi API rate limits at all times
+- Ensure bot behavior complies with Kalshi's rules for automated trading
+- Maintain a complete audit trail of all orders and decisions
+- Design and enforce self-limiting mechanisms to avoid exchange penalties
+- Review trading activity patterns that could trigger exchange scrutiny
+- Manage regulatory record-keeping requirements
+
+## Kalshi API Rate Limit Enforcement
+```python
+# compliance/rate_limiter.py
+# These limits are enforced at the code level — exceeding them risks account suspension
+
+KALSHI_RATE_LIMITS = {
+    # Verify against current Kalshi API documentation — these may change
+    "orders_per_second":        10,
+    "orders_per_minute":        100,
+    "market_data_per_second":   20,
+    "websocket_connections":    1,      # One WS connection per account
+    "cancel_per_second":        10,
+}
+
+import time
+from collections import deque
+from threading import Lock
+
+class KalshiRateLimiter:
+    """
+    Thread-safe token bucket rate limiter.
+    Must wrap ALL order placement and cancellation calls.
+    """
+
+    def __init__(self, max_per_second: int, max_per_minute: int):
+        self.max_per_second  = max_per_second
+        self.max_per_minute  = max_per_minute
+        self.second_window   = deque()
+        self.minute_window   = deque()
+        self.lock            = Lock()
+
+    def acquire(self, timeout: float = 5.0) -> bool:
+        """
+        Block until a request slot is available.
+        Returns False if timeout exceeded — caller must handle gracefully.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                now = time.monotonic()
+                # Evict expired entries
+                while self.second_window and self.second_window[0] < now - 1.0:
+                    self.second_window.popleft()
+                while self.minute_window and self.minute_window[0] < now - 60.0:
+                    self.minute_window.popleft()
+
+                if (len(self.second_window) < self.max_per_second and
+                    len(self.minute_window) < self.max_per_minute):
+                    self.second_window.append(now)
+                    self.minute_window.append(now)
+                    return True
+
+            time.sleep(0.05)
+
+        # Timeout — log and return False
+        logger.error("Rate limiter timeout — request dropped to avoid exchange penalty")
+        return False
+
+# Global limiter instances
+order_limiter  = KalshiRateLimiter(
+    max_per_second=KALSHI_RATE_LIMITS["orders_per_second"],
+    max_per_minute=KALSHI_RATE_LIMITS["orders_per_minute"],
+)
+data_limiter   = KalshiRateLimiter(max_per_second=KALSHI_RATE_LIMITS["market_data_per_second"], max_per_minute=500)
+```
+
+## Self-Limiting Behavior (Proactive Compliance)
+```python
+# compliance/self_limiter.py
+# Conservative self-imposed limits BELOW Kalshi's hard limits
+# Buffer prevents accidental violations during latency spikes
+
+SELF_IMPOSED_LIMITS = {
+    # Target 80% of Kalshi's hard limits as our ceiling
+    "orders_per_second":     8,      # 80% of 10
+    "orders_per_minute":     80,     # 80% of 100
+    "market_data_per_second": 16,    # 80% of 20
+
+    # Additional self-imposed behavioral limits
+    "max_orders_per_contract":  4,   # Max 4 order attempts per 15-min contract
+    "min_seconds_between_entries": 10,  # Never re-enter within 10 seconds
+    "max_cancel_retry_attempts": 2,  # Cancel and re-try max twice before giving up
+}
+
+def check_behavioral_limits(trade_state: dict) -> tuple[bool, str | None]:
+    """Check self-imposed behavioral limits beyond raw rate limits."""
+    if trade_state["orders_this_contract"] >= SELF_IMPOSED_LIMITS["max_orders_per_contract"]:
+        return False, "MAX_ORDERS_PER_CONTRACT"
+    time_since_last = time.time() - trade_state["last_entry_time"]
+    if time_since_last < SELF_IMPOSED_LIMITS["min_seconds_between_entries"]:
+        return False, "MIN_ENTRY_INTERVAL"
+    return True, None
+```
+
+## Audit Trail Requirements
+```python
+# Every order action must be logged with full context for compliance
+# Logs must be retained for minimum 5 years (CFTC requirement for derivatives)
+
+class ComplianceLogger:
+    """
+    Writes immutable, append-only audit records for every order action.
+    Separate from the operational trade_logger — this is the legal record.
+    """
+
+    REQUIRED_FIELDS = [
+        "event_id",         # UUID, unique per event
+        "timestamp_utc",    # ISO 8601 with microsecond precision
+        "event_type",       # ORDER_SUBMITTED | ORDER_FILLED | ORDER_CANCELED | ORDER_REJECTED
+        "order_id",         # Kalshi order ID
+        "ticker",           # Market ticker
+        "side",             # 'yes' or 'no'
+        "contracts",        # Number of contracts
+        "price_cents",      # Order price
+        "fill_price_cents", # Actual fill price (if filled)
+        "fill_contracts",   # Actual fill quantity
+        "rejection_code",   # If rejected
+        "signal_trigger",   # What signal triggered this order (OBI/ROC/coordinator)
+        "bot_version",      # Version of bot code running at time of order
+        "session",          # ASIA | LONDON | US_OPEN | US_MAIN | US_CLOSE
+    ]
+
+    def log(self, event: dict):
+        for field in self.REQUIRED_FIELDS:
+            if field not in event:
+                raise ValueError(f"Compliance log missing required field: {field}")
+        # Write to append-only compliance log (never update, never delete)
+        self._write_to_compliance_store(event)
+```
+
+## Pattern Monitoring (Exchange Scrutiny Prevention)
+```python
+# Patterns that could draw Kalshi's automated surveillance attention
+# Monitor weekly and flag if thresholds approached
+
+SCRUTINY_PATTERNS = {
+    "wash_trading_risk": {
+        "description": "Rapid consecutive entry/exit on same contract",
+        "detection":   "Same contract, < 60 seconds between entry and exit",
+        "threshold":   0,    # Zero tolerance — never allow
+        "action":      "Immediate alert + manual review",
+    },
+    "order_stuffing_risk": {
+        "description": "High cancel-to-fill ratio suggests order stuffing",
+        "detection":   "cancel_count / fill_count > 5 in a single hour",
+        "threshold":   5.0,
+        "action":      "Pause for 1 hour, review order pricing logic",
+    },
+    "spoofing_risk": {
+        "description": "Pattern of placing and canceling large orders",
+        "detection":   "Cancel rate > 80% of orders on single contract",
+        "threshold":   0.80,
+        "action":      "Flag for compliance review — check entry logic",
+    },
+    "excessive_activity": {
+        "description": "Unusually high order rate relative to fills",
+        "detection":   "More than 50 orders/hour sustained for 2+ hours",
+        "threshold":   50,
+        "action":      "Auto-pause entries, human review required",
+    },
+}
+
+def monitor_compliance_patterns(hourly_stats: dict) -> list[str]:
+    flags = []
+    if hourly_stats["cancel_to_fill_ratio"] > SCRUTINY_PATTERNS["order_stuffing_risk"]["threshold"]:
+        flags.append("ORDER_STUFFING_RISK_DETECTED")
+    if hourly_stats["cancel_rate_pct"] > SCRUTINY_PATTERNS["spoofing_risk"]["threshold"]:
+        flags.append("HIGH_CANCEL_RATE_REVIEW")
+    if hourly_stats["orders_per_hour"] > SCRUTINY_PATTERNS["excessive_activity"]["threshold"]:
+        flags.append("EXCESSIVE_ACTIVITY_PAUSE")
+    return flags
+```
+
+## Regulatory Record-Keeping
+```python
+RECORD_KEEPING_POLICY = {
+    "audit_log_retention":      "7 years",   # CFTC minimum + 2 year buffer
+    "trade_records_retention":  "7 years",
+    "configuration_changes":    "7 years",   # Every parameter change, with rationale
+    "communication_records":    "3 years",   # Alerts, interventions, decisions
+    "backup_location":          "DO Spaces + local encrypted copy",
+    "format":                   "Append-only JSONL — never modify historical records",
+    "encryption":               "AES-256 at rest for all compliance records",
+}
+```
+
+## Compliance Checklist (Weekly Review)
+```
+[ ] API rate limit usage: Peak usage stayed below 80% of Kalshi limits
+[ ] Cancel-to-fill ratio: Below 5.0 for all hours
+[ ] Order stuffing check: No hour with > 50 orders/hr sustained 2+ hours
+[ ] Audit log integrity: Compliance logs are complete and unmodified
+[ ] No rejected orders due to rate limiting (would appear in Kalshi error logs)
+[ ] Bot version logged in all audit records matches deployed version
+[ ] All manual overrides logged with reason and approver
+[ ] Record retention: Backups confirmed for audit/trade/config records
+```
+
+## Guardrails
+- Rate limiter wraps 100% of order and cancellation calls — no exceptions for "just this one"
+- Audit logs are append-only and encrypted — never delete or modify historical records
+- Any pattern that triggers a scrutiny flag requires human review before trading resumes
+- Self-imposed limits are always set conservatively below Kalshi's hard limits
+- Keep a written record of every parameter change with rationale and approver — config is compliance evidence

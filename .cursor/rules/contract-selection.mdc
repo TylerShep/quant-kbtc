@@ -1,0 +1,183 @@
+---
+name: contract-selection
+description: Logic for selecting which specific Kalshi BTC 15-minute contract to trade at any given moment. Use this skill when building contract selection logic, evaluating liquidity thresholds per contract, managing the transition between expiring and active contracts, or deciding between nearest-expiry vs. next-expiry contracts.
+---
+
+# Contract Selection
+
+## Role Purpose
+At any given moment, multiple Kalshi BTC 15-minute contracts may be open simultaneously (current interval, next interval, etc.). This skill governs which contract the bot selects to trade, how it handles the handoff as contracts expire, and how it avoids entering positions in contracts too close to settlement.
+
+## Kalshi BTC 15-Min Contract Structure
+```
+Each contract covers one 15-minute window.
+Example at 14:00 UTC:
+  - Contract A: 14:00–14:15 (current, approaching expiry)
+  - Contract B: 14:15–14:30 (next, newly opened)
+  - Contract C: 14:30–14:45 (following, may have thin liquidity)
+
+Bot should always be trading Contract B when Contract A has < 3 min remaining.
+```
+
+## Contract Selection Rules
+```python
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+EXPIRY_AVOIDANCE_MIN  = 3     # Never enter a contract with < 3 min to expiry
+MIN_LIQUIDITY_VOLUME  = 500   # Minimum combined book volume to trade a contract
+MIN_CONTRACT_AGE_SEC  = 30    # Wait 30s after contract opens before trading (book stabilization)
+
+@dataclass
+class KalshiContract:
+    ticker:         str
+    expiry:         datetime
+    open_time:      datetime
+    yes_bid:        int        # cents
+    yes_ask:        int        # cents
+    total_volume:   float      # combined book depth
+
+class ContractSelector:
+
+    def select_contract(self, available_contracts: list[KalshiContract]) -> KalshiContract | None:
+        """
+        From a list of open contracts, select the best one to trade.
+        Returns None if no contract meets all criteria.
+        """
+        now = datetime.now(timezone.utc)
+        candidates = []
+
+        for contract in available_contracts:
+            mins_to_expiry = (contract.expiry - now).total_seconds() / 60
+            age_sec        = (now - contract.open_time).total_seconds()
+
+            # Hard exclusion: too close to expiry
+            if mins_to_expiry < EXPIRY_AVOIDANCE_MIN:
+                continue
+
+            # Hard exclusion: contract too new (book not yet stabilized)
+            if age_sec < MIN_CONTRACT_AGE_SEC:
+                continue
+
+            # Hard exclusion: book too thin
+            if contract.total_volume < MIN_LIQUIDITY_VOLUME:
+                continue
+
+            candidates.append((contract, mins_to_expiry))
+
+        if not candidates:
+            return None
+
+        # Prefer the contract with the most time remaining (most liquid window)
+        # among candidates — avoids chasing near-expiry contracts
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+```
+
+## Contract Transition Logic
+```python
+# The bot must handle the handoff between expiring and incoming contracts
+# without leaving an open position in an about-to-expire contract
+
+class ContractTransitionManager:
+
+    def __init__(self, selector: ContractSelector):
+        self.selector        = selector
+        self.active_contract = None
+        self.next_contract   = None
+
+    def on_candle_close(self, available_contracts: list[KalshiContract], position_manager):
+        now             = datetime.now(timezone.utc)
+        best_contract   = self.selector.select_contract(available_contracts)
+
+        # If we're switching contracts, close any open position first
+        if self.active_contract and best_contract:
+            if best_contract.ticker != self.active_contract.ticker:
+                if position_manager.has_open():
+                    logger.info(f"Contract transition: closing position on {self.active_contract.ticker}")
+                    position_manager.force_close(reason="CONTRACT_TRANSITION")
+                self.active_contract = best_contract
+                logger.info(f"Switched to contract: {best_contract.ticker}")
+
+        elif best_contract and not self.active_contract:
+            self.active_contract = best_contract
+
+        return self.active_contract
+
+    def time_until_active_expiry(self) -> float | None:
+        """Returns minutes until active contract expires. None if no active contract."""
+        if not self.active_contract:
+            return None
+        now = datetime.now(timezone.utc)
+        return (self.active_contract.expiry - now).total_seconds() / 60
+```
+
+## Liquidity Scoring (When Multiple Contracts Qualify)
+```python
+def score_contract_liquidity(contract: KalshiContract) -> float:
+    """
+    Composite score for contract selection when multiple pass filters.
+    Higher = better.
+    """
+    spread_cents  = contract.yes_ask - contract.yes_bid
+    mid_price     = (contract.yes_bid + contract.yes_ask) / 2
+
+    # Prefer contracts near 50 cents (maximum uncertainty = most liquid)
+    distance_from_50 = abs(mid_price - 50)
+
+    # Tighter spread = better fill quality
+    spread_score  = max(0, 10 - spread_cents)   # 10 = 0-cent spread, 0 = 10+ cents
+
+    # More volume = more reliable OBI signal
+    volume_score  = min(contract.total_volume / 1000, 10)   # Cap at 10
+
+    # Penalize contracts far from 50 (already heavily one-sided)
+    price_score   = max(0, 10 - distance_from_50 / 5)
+
+    return spread_score + volume_score + price_score
+
+# Use scoring as tiebreaker when multiple contracts pass all hard filters
+```
+
+## Contract Metadata Fetching
+```python
+# Fetch active BTC contracts from Kalshi API
+async def fetch_active_btc_contracts(kalshi_client) -> list[KalshiContract]:
+    raw = await kalshi_client._request("GET", "/markets?status=open&tag=KXBTC")
+    contracts = []
+    for m in raw.get("markets", []):
+        if "15" not in m.get("title", ""):   # Filter to 15-min contracts only
+            continue
+        ob = await kalshi_client.get_orderbook(m["ticker"], depth=10)
+        total_vol = sum(b["size"] for b in ob["bids"]) + sum(a["size"] for a in ob["asks"])
+        contracts.append(KalshiContract(
+            ticker      = m["ticker"],
+            expiry      = datetime.fromisoformat(m["close_time"]),
+            open_time   = datetime.fromisoformat(m["open_time"]),
+            yes_bid     = ob["bids"][0]["price"] if ob["bids"] else 0,
+            yes_ask     = ob["asks"][0]["price"] if ob["asks"] else 100,
+            total_volume= total_vol,
+        ))
+    return contracts
+```
+
+## Logging Requirements
+```python
+{
+    "timestamp":          ...,
+    "evaluated_contracts": [...],   # All contracts considered
+    "selected_ticker":    ...,
+    "selection_reason":   ...,      # Why this one was chosen
+    "mins_to_expiry":     ...,
+    "book_volume":        ...,
+    "spread_cents":       ...,
+    "skipped_tickers":    [...],    # Contracts that failed filters + why
+}
+```
+
+## Guardrails
+- Never enter a contract with less than EXPIRY_AVOIDANCE_MIN minutes remaining
+- Always close the current position before transitioning to a new contract
+- If no contract meets liquidity criteria, log "NO_ELIGIBLE_CONTRACT" and skip — do not force a trade
+- Validate contract ticker against Kalshi API before submitting any order — tickers expire
+- Contract selection must re-run on every candle close — do not cache the selected contract across candles

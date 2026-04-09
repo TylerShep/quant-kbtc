@@ -1,0 +1,174 @@
+---
+name: data-pipeline-architect
+description: Role context for the Data Pipeline Architect on the Kalshi BTC 15min trading bot. Use this skill when designing or building data ingestion from external BTC feeds (Binance, Coinbase), merging external price data with Kalshi order book data, detecting price discrepancies between venues, or maintaining the reliability of all data pipelines feeding the bot.
+---
+
+# Data Pipeline Architect
+
+## Role Purpose
+Manages the ingestion of high-frequency BTC price data from external exchanges and merges it with Kalshi's internal order book data. The goal is to detect pricing discrepancies between what Kalshi contracts imply about BTC price and what spot markets are actually doing — a potential alpha source and a critical data quality signal.
+
+## Primary Responsibilities
+- Design and maintain multi-source data ingestion pipelines
+- Normalize and align timestamps across Binance, Coinbase, and Kalshi data
+- Detect lead-lag relationships between spot BTC and Kalshi contract prices
+- Monitor pipeline health and alert on ingestion failures within seconds
+- Maintain data lineage so every trade can be traced back to the data that drove it
+
+## Multi-Source Data Flow
+```
+Source A: Binance BTCUSDT (15min OHLCV + real-time trades)
+  → REST poll every 15min for candle close
+  → WebSocket stream for real-time price reference
+
+Source B: Coinbase BTCUSD (15min OHLCV)
+  → REST poll every 15min
+  → Used as cross-validation against Binance
+
+Source C: Kalshi BTC Market (WebSocket L2 + settlement prices)
+  → Primary trading data
+  → Order book sampled every 30 seconds
+
+Merged Output: Unified candle store with all sources aligned by timestamp
+  → QD reads from here for live signals
+  → QR reads from here for backtesting
+  → ML Quant reads from here for feature engineering
+```
+
+## Pipeline Implementation
+```python
+# data/pipelines/unified_pipeline.py
+
+import asyncio
+from datetime import datetime, timezone
+
+class UnifiedBTCPipeline:
+    """
+    Manages concurrent ingestion from all sources.
+    Merges into a single canonical 15-minute OHLCV stream.
+    """
+
+    async def run(self):
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.binance_candle_collector())
+            tg.create_task(self.coinbase_candle_collector())
+            tg.create_task(self.kalshi_ob_collector())
+            tg.create_task(self.merger_and_validator())
+            tg.create_task(self.health_monitor())
+
+    async def binance_candle_collector(self):
+        """Poll Binance REST API on each 15-min boundary."""
+        while True:
+            await self.sleep_until_next_candle_close(interval_min=15)
+            candles = await fetch_binance_candles(symbol="BTCUSDT", interval="15m", limit=2)
+            closed  = candles[-2]   # Second-to-last = fully closed candle
+            await self.candle_store.write(closed, source="binance")
+
+    async def coinbase_candle_collector(self):
+        """Poll Coinbase REST API on each 15-min boundary."""
+        while True:
+            await self.sleep_until_next_candle_close(interval_min=15)
+            candles = await fetch_coinbase_candles(product="BTC-USD", granularity=900)
+            closed  = candles[1]    # Coinbase returns newest first
+            await self.candle_store.write(closed, source="coinbase")
+
+    async def merger_and_validator(self):
+        """
+        Merge multi-source candles into a single validated record.
+        Flags discrepancies > 0.1% between sources.
+        """
+        while True:
+            await asyncio.sleep(60)   # Check every minute
+            ts = self.latest_aligned_timestamp()
+            binance  = await self.candle_store.get(ts, source="binance")
+            coinbase = await self.candle_store.get(ts, source="coinbase")
+
+            if binance and coinbase:
+                discrepancy = abs(binance["close"] - coinbase["close"]) / binance["close"]
+                if discrepancy > 0.001:
+                    await self.alert(
+                        f"Price discrepancy: Binance={binance['close']}, "
+                        f"Coinbase={coinbase['close']} ({discrepancy:.3%})"
+                    )
+                # Write canonical candle using Binance as primary
+                canonical = {**binance, "coinbase_close": coinbase["close"], "discrepancy": discrepancy}
+                await self.canonical_store.write(canonical)
+```
+
+## Kalshi vs Spot Lead-Lag Detection
+```python
+def detect_lead_lag(kalshi_ob_history: list, spot_price_history: list, max_lag_candles: int = 4) -> dict:
+    """
+    Detect whether Kalshi OBI leads or lags spot BTC price movement.
+    A positive lag means Kalshi OBI leads spot price → can be exploited.
+    """
+    from scipy import stats
+    import numpy as np
+
+    obi_series   = [ob["obi"] for ob in kalshi_ob_history]
+    price_series = [s["close"] for s in spot_price_history]
+    price_returns = np.diff(price_series) / price_series[:-1]
+
+    best_lag, best_ic = 0, 0
+    for lag in range(1, max_lag_candles + 1):
+        ic, _ = stats.spearmanr(obi_series[:-lag], price_returns[lag:])
+        if abs(ic) > abs(best_ic):
+            best_ic, best_lag = ic, lag
+
+    return {
+        "best_lag_candles": best_lag,
+        "information_coeff": best_ic,
+        "direction": "OBI leads spot" if best_lag > 0 else "spot leads OBI",
+    }
+```
+
+## Pipeline Health Monitoring
+```python
+PIPELINE_HEALTH_THRESHOLDS = {
+    "max_ingestion_lag_sec":   120,    # Alert if any source is >2 min behind
+    "max_candle_gap_min":      30,     # Alert if there's a 30min gap in data
+    "max_price_discrepancy":   0.005,  # Alert if Binance vs Coinbase differ > 0.5%
+    "min_ob_snapshots_per_hr": 100,    # Alert if fewer than 100 OB snapshots/hour
+}
+
+class PipelineHealthMonitor:
+    async def run(self):
+        while True:
+            await asyncio.sleep(60)
+            await self.check_ingestion_lag()
+            await self.check_candle_gaps()
+            await self.check_ob_snapshot_rate()
+
+    async def check_ingestion_lag(self):
+        for source in ["binance", "coinbase", "kalshi"]:
+            latest_ts = await self.store.get_latest_timestamp(source)
+            lag_sec   = (datetime.now(timezone.utc) - latest_ts).total_seconds()
+            if lag_sec > PIPELINE_HEALTH_THRESHOLDS["max_ingestion_lag_sec"]:
+                await self.alert(f"{source} ingestion lag: {lag_sec:.0f}s", level="WARNING")
+```
+
+## Timestamp Alignment Protocol
+```python
+# All sources use different timestamp formats — normalize everything to UTC Unix ms
+def normalize_timestamp(raw_ts, source: str) -> int:
+    """Returns Unix milliseconds UTC."""
+    if source == "binance":
+        return int(raw_ts)                          # Already Unix ms
+    if source == "coinbase":
+        return int(datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp() * 1000)
+    if source == "kalshi":
+        return int(datetime.fromisoformat(raw_ts).timestamp() * 1000)
+
+# Snap all candle timestamps to 15-min boundaries
+def snap_to_15min(unix_ms: int) -> int:
+    """Floor timestamp to nearest 15-minute boundary."""
+    interval_ms = 15 * 60 * 1000
+    return (unix_ms // interval_ms) * interval_ms
+```
+
+## Guardrails
+- Never drop a data point silently — log every gap, error, or discrepancy
+- Always store raw data before normalization — raw is the audit trail
+- Binance is the primary price source; Coinbase is cross-validation only
+- Pipeline failures must page within 2 minutes — stale data is silent risk
+- Timestamp alignment is non-negotiable — misaligned data poisons backtests

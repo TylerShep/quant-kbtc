@@ -1,0 +1,185 @@
+---
+name: signal-conflict-resolver
+description: Dedicated logic for resolving agreement, conflict, and neutrality between OBI and ROC signals on the Kalshi BTC 15min bot. Use this skill when building or modifying the signal coordination layer, defining how multiple signals interact, adjusting conviction levels, or adding new signals to the coordination table.
+---
+
+# Signal Conflict Resolver
+
+## Role Purpose
+The Signal Conflict Resolver is the brain that sits between individual strategy modules (OBI, ROC) and the order manager. It aggregates all active signals, detects conflicts, assigns conviction levels, and produces a single clean trade decision. Every trade the bot places passes through this layer — it is the final arbiter before an order is submitted.
+
+## Core Principle
+Individual signals are never acted on directly. They are inputs to the resolver. The resolver's output — direction + conviction — is the only thing the order manager ever sees.
+
+## Signal State Definitions
+```python
+from enum import Enum
+
+class SignalDirection(Enum):
+    LONG    = "long"
+    SHORT   = "short"
+    NEUTRAL = "neutral"   # Signal evaluated but no strong reading
+
+class Conviction(Enum):
+    HIGH    = "HIGH"    # All active signals agree → full size
+    NORMAL  = "NORMAL"  # Primary signal only, secondary neutral → standard size
+    LOW     = "LOW"     # Secondary signal only, primary neutral → reduced size
+    NONE    = None      # Conflict or no signal → no trade
+```
+
+## Coordination Table (Full Matrix)
+```python
+# (obi_direction, roc_direction) → (trade_direction, conviction)
+# This table is the single source of truth — all signal interaction lives here
+
+COORDINATION_TABLE = {
+    # Both agree — highest conviction
+    (SignalDirection.LONG,    SignalDirection.LONG):    (SignalDirection.LONG,  Conviction.HIGH),
+    (SignalDirection.SHORT,   SignalDirection.SHORT):   (SignalDirection.SHORT, Conviction.HIGH),
+
+    # Primary (OBI) fires, secondary (ROC) neutral
+    (SignalDirection.LONG,    SignalDirection.NEUTRAL): (SignalDirection.LONG,  Conviction.NORMAL),
+    (SignalDirection.SHORT,   SignalDirection.NEUTRAL): (SignalDirection.SHORT, Conviction.NORMAL),
+
+    # Secondary (ROC) fires, primary (OBI) neutral — lower conviction
+    (SignalDirection.NEUTRAL, SignalDirection.LONG):    (SignalDirection.LONG,  Conviction.LOW),
+    (SignalDirection.NEUTRAL, SignalDirection.SHORT):   (SignalDirection.SHORT, Conviction.LOW),
+
+    # Hard conflicts — NEVER trade
+    (SignalDirection.LONG,    SignalDirection.SHORT):   (None, Conviction.NONE),
+    (SignalDirection.SHORT,   SignalDirection.LONG):    (None, Conviction.NONE),
+
+    # Both neutral — no signal
+    (SignalDirection.NEUTRAL, SignalDirection.NEUTRAL): (None, Conviction.NONE),
+}
+```
+
+## Resolver Implementation
+```python
+from dataclasses import dataclass
+
+@dataclass
+class TradeDecision:
+    direction:   SignalDirection | None
+    conviction:  Conviction
+    obi_dir:     SignalDirection
+    roc_dir:     SignalDirection
+    skip_reason: str | None = None
+
+class SignalConflictResolver:
+
+    def resolve(
+        self,
+        obi_direction: SignalDirection,
+        roc_direction: SignalDirection,
+        atr_regime:    str,
+        can_trade:     bool,
+    ) -> TradeDecision:
+        """
+        Single entry point for all signal resolution.
+        Always returns a TradeDecision — never raises.
+        """
+
+        # Gate 1: Risk/circuit breaker says no
+        if not can_trade:
+            return TradeDecision(
+                direction=None, conviction=Conviction.NONE,
+                obi_dir=obi_direction, roc_dir=roc_direction,
+                skip_reason="CIRCUIT_BREAKER_ACTIVE",
+            )
+
+        # Gate 2: ATR regime blocks all trading
+        if atr_regime == "HIGH":
+            return TradeDecision(
+                direction=None, conviction=Conviction.NONE,
+                obi_dir=obi_direction, roc_dir=roc_direction,
+                skip_reason="ATR_REGIME_HIGH",
+            )
+
+        # Gate 3: Coordination table lookup
+        key = (obi_direction, roc_direction)
+        trade_dir, conviction = COORDINATION_TABLE.get(key, (None, Conviction.NONE))
+
+        skip_reason = None
+        if conviction == Conviction.NONE:
+            if obi_direction != roc_direction and \
+               obi_direction != SignalDirection.NEUTRAL and \
+               roc_direction != SignalDirection.NEUTRAL:
+                skip_reason = "SIGNAL_CONFLICT"
+            else:
+                skip_reason = "NO_SIGNAL"
+
+        return TradeDecision(
+            direction=trade_dir,
+            conviction=conviction,
+            obi_dir=obi_direction,
+            roc_dir=roc_direction,
+            skip_reason=skip_reason,
+        )
+```
+
+## Conviction → Position Size Mapping
+```python
+# Conviction level maps directly to a size multiplier
+# Applied by risk-position-sizing module
+
+CONVICTION_SIZE_MAP = {
+    Conviction.HIGH:   1.30,   # Both signals agree → 130% of base size
+    Conviction.NORMAL: 1.00,   # Standard → 100%
+    Conviction.LOW:    0.65,   # Weak signal → 65% of base size
+    Conviction.NONE:   0.00,   # No trade
+}
+
+def get_size_multiplier(conviction: Conviction) -> float:
+    return CONVICTION_SIZE_MAP[conviction]
+```
+
+## Adding a New Signal to the Resolver
+```
+When QR specifies a new signal (e.g., Volume Imbalance Divergence):
+
+Step 1 — Define its direction output: LONG | SHORT | NEUTRAL
+Step 2 — Determine its role: PRIMARY (like OBI) or CONFIRMATION (like ROC)
+Step 3 — Expand the coordination table:
+          Add all (new_signal, existing_signal) combinations
+          Define conviction for each combination
+Step 4 — Update CONVICTION_SIZE_MAP if new conviction tiers are needed
+Step 5 — Update resolver.resolve() signature to accept new signal param
+Step 6 — Backtest conviction distribution: ensure HIGH is not too rare or too common
+Step 7 — QA regression tests must pass before deployment
+```
+
+## Logging Requirements
+```python
+# Every resolver call must be logged — this is the decision audit trail
+{
+    "timestamp":     ...,
+    "obi_direction": ...,
+    "roc_direction": ...,
+    "atr_regime":    ...,
+    "decision":      "LONG | SHORT | NO_TRADE",
+    "conviction":    "HIGH | NORMAL | LOW | NONE",
+    "skip_reason":   "SIGNAL_CONFLICT | NO_SIGNAL | ATR_HIGH | CIRCUIT_BREAKER",
+    "size_mult":     ...,
+}
+```
+
+## Conflict Rate Monitoring
+```python
+# Track conflict rate weekly — high conflict = signals mis-calibrated
+# Target: conflict rate < 15% of non-neutral evaluations
+
+def compute_conflict_rate(signal_log: list[dict]) -> float:
+    non_neutral = [s for s in signal_log
+                   if s["obi_direction"] != "neutral" and s["roc_direction"] != "neutral"]
+    conflicts   = [s for s in non_neutral if s["skip_reason"] == "SIGNAL_CONFLICT"]
+    return len(conflicts) / len(non_neutral) if non_neutral else 0.0
+
+# If conflict_rate > 0.20 → thresholds may be miscalibrated, escalate to QR
+```
+
+## Guardrails
+- The coordination table is the only place signal interaction is defined — never hardcode conflict logic elsewhere
+- Adding a new signal requires expanding the full matrix — partial additions cause undefined behavior
+- Conviction.HIGH should represent 20–40% of actual trade entries — if it's higher, thresholds are too loose
+- Never bypass the resolver to submit an order directly — all orders must flow through resolve()

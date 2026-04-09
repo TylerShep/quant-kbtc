@@ -1,0 +1,257 @@
+---
+name: environment-management
+description: Dev, paper, and production environment separation for the Kalshi BTC 15min trading bot. Use this skill when setting up environment configs, implementing feature flags, safely testing changes without touching live, managing environment-specific secrets, or designing the promotion process from dev → paper → production.
+---
+
+# Environment Management
+
+## Role Purpose
+The bot operates across three environments: development (local), paper (live data, fake money), and production (live data, real money). Clear separation between these environments prevents the most catastrophic class of trading bot errors — accidentally running untested code with real capital.
+
+## Environment Definitions
+```python
+ENVIRONMENTS = {
+    "development": {
+        "description":    "Local machine, mocked Kalshi API, synthetic data",
+        "kalshi_api":     "mock",           # No real API calls
+        "data_source":    "local_files",    # Pre-recorded historical data
+        "order_execution":"simulated",      # No real orders
+        "bankroll":       "virtual",
+        "logging_level":  "DEBUG",
+        "alerts":         "disabled",       # Don't spam Slack during dev
+        "db":             "local_postgres", # Docker DB, reset freely
+    },
+    "paper": {
+        "description":    "Cloud server, live Kalshi data, simulated orders",
+        "kalshi_api":     "live_read_only", # Reads live market data, no order submission
+        "data_source":    "live",
+        "order_execution":"paper_fill_model", # Realistic fill simulation
+        "bankroll":       "virtual_10000",
+        "logging_level":  "INFO",
+        "alerts":         "slack_only",     # Alerts go to Slack, no SMS/pager
+        "db":             "do_managed_paper_schema",
+    },
+    "production": {
+        "description":    "Cloud server, live Kalshi data, real orders",
+        "kalshi_api":     "live_full",      # Full read + write API access
+        "data_source":    "live",
+        "order_execution":"live",
+        "bankroll":       "real",
+        "logging_level":  "INFO",
+        "alerts":         "full",           # All channels including pager/SMS
+        "db":             "do_managed_prod_schema",
+    },
+}
+```
+
+## Environment Detection & Config Loading
+```python
+# config/environment.py
+
+import os
+from dataclasses import dataclass
+
+BOT_ENV = os.getenv("BOT_ENV", "development")
+
+@dataclass
+class EnvironmentConfig:
+    name:             str
+    is_production:    bool
+    is_paper:         bool
+    use_live_api:     bool
+    use_real_orders:  bool
+    log_level:        str
+    alert_level:      str   # "full" | "slack_only" | "disabled"
+    db_schema:        str
+
+def load_env_config() -> EnvironmentConfig:
+    if BOT_ENV == "production":
+        return EnvironmentConfig(
+            name="production", is_production=True, is_paper=False,
+            use_live_api=True, use_real_orders=True,
+            log_level="INFO", alert_level="full", db_schema="prod",
+        )
+    elif BOT_ENV == "paper":
+        return EnvironmentConfig(
+            name="paper", is_production=False, is_paper=True,
+            use_live_api=True, use_real_orders=False,
+            log_level="INFO", alert_level="slack_only", db_schema="paper",
+        )
+    else:
+        return EnvironmentConfig(
+            name="development", is_production=False, is_paper=False,
+            use_live_api=False, use_real_orders=False,
+            log_level="DEBUG", alert_level="disabled", db_schema="dev",
+        )
+
+ENV = load_env_config()
+
+# Safety check: never run real orders unless BOT_ENV is explicitly "production"
+def assert_production_safe(action: str):
+    if ENV.use_real_orders and BOT_ENV != "production":
+        raise RuntimeError(
+            f"SAFETY VIOLATION: Attempted real order ({action}) outside production env. "
+            f"BOT_ENV={BOT_ENV}. This should never happen."
+        )
+```
+
+## Feature Flags
+```python
+# config/feature_flags.py
+# Use feature flags to safely test changes in production without a full deployment
+# Flags can be toggled via DB or environment variable without restarting the bot
+
+import os
+
+class FeatureFlags:
+    """
+    All new features start behind a flag.
+    Flag is OFF by default in production.
+    Turn on in paper first, then production.
+    """
+
+    # OBI enhancements
+    USE_DYNAMIC_OBI_THRESHOLDS  = os.getenv("FF_DYNAMIC_OBI",     "false") == "true"
+    USE_SESSION_BASED_THRESHOLDS = os.getenv("FF_SESSION_OBI",    "false") == "true"
+
+    # ROC enhancements
+    USE_VOLUME_CONFIRMATION      = os.getenv("FF_VOLUME_CONFIRM",  "false") == "true"
+
+    # ML model integration
+    USE_ML_SIGNAL_LAYER          = os.getenv("FF_ML_SIGNALS",      "false") == "true"
+    ML_SIGNAL_WEIGHT             = float(os.getenv("FF_ML_WEIGHT", "0.3"))
+
+    # Risk adjustments
+    USE_DRAWDOWN_REDUCTION       = os.getenv("FF_DD_REDUCTION",    "true")  == "true"
+    USE_SESSION_SIZE_SCALING     = os.getenv("FF_SESSION_SIZING",  "false") == "true"
+
+    # New markets
+    ENABLE_ETH_MARKET            = os.getenv("FF_ETH_MARKET",      "false") == "true"
+
+FLAGS = FeatureFlags()
+
+# Usage in strategy code:
+# if FLAGS.USE_DYNAMIC_OBI_THRESHOLDS:
+#     threshold = session_threshold_manager.get_threshold(current_session)
+# else:
+#     threshold = config.OBI_LONG_THRESHOLD
+```
+
+## Docker Compose Environment Files
+```yaml
+# docker-compose.yml       (base — shared config)
+# docker-compose.dev.yml   (development overrides)
+# docker-compose.paper.yml (paper overrides)
+# docker-compose.prod.yml  (production overrides)
+
+# --- docker-compose.paper.yml ---
+services:
+  bot:
+    environment:
+      BOT_ENV:          paper
+      LOG_LEVEL:        INFO
+      FF_DYNAMIC_OBI:   "false"   # All new flags OFF in paper until tested
+      FF_ML_SIGNALS:    "false"
+    volumes:
+      - kalshi-paper-data:/mnt/data   # Separate data volume from prod
+
+  db:
+    # Use separate schema within same managed DB
+    environment:
+      POSTGRES_SCHEMA:  paper
+
+# --- docker-compose.prod.yml ---
+services:
+  bot:
+    environment:
+      BOT_ENV:          production
+      LOG_LEVEL:        INFO
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2G
+```
+
+## Promotion Process (Dev → Paper → Production)
+```
+STEP 1: Development
+  - Code written and unit tests passing locally
+  - Integration tests pass against mock Kalshi API
+  - Manual smoke test: does the bot start, evaluate signals, simulate trades?
+  - Code review complete
+
+STEP 2: Paper Deployment
+  - Merge to `staging` branch
+  - CI/CD auto-deploys to paper environment
+  - Paper trading runs for MINIMUM 4 weeks (or 100 trades, whichever is later)
+  - QA/Simulation Engineer validates paper results vs. backtest expectations
+  - Strats reviews performance attribution on paper results
+
+STEP 3: Production Deployment
+  - QT sign-off on paper results
+  - Risk Quant confirms risk parameters unchanged (or approves changes)
+  - Deploy to production during low-volatility window (NOT during US open)
+  - Monitor first 24h live closely
+  - Rollback plan confirmed before deployment starts
+
+PROMOTION GATES:
+  Paper → Production requires ALL of:
+  [ ] Paper Sharpe > 0.8 (allows some degradation from backtest)
+  [ ] Paper win rate within 5pp of backtest
+  [ ] Paper fill rate > 75%
+  [ ] No critical bugs or unexpected behavior in paper
+  [ ] Regression test suite 100% passing
+```
+
+## Environment Isolation Rules
+```python
+# Hard rules enforced in code — these cannot be bypassed by config
+
+ISOLATION_RULES = [
+    # Rule 1: Real orders only in production
+    "Never submit real Kalshi orders unless BOT_ENV == 'production'",
+
+    # Rule 2: Production DB never touched by dev or paper bots
+    "Dev and paper bots use separate DB schemas — never write to 'prod' schema",
+
+    # Rule 3: Production credentials never in dev/paper environments
+    "KALSHI_API_KEY_ID in dev/paper must be a read-only or sandbox key",
+
+    # Rule 4: Alerts in dev are always disabled
+    "Alert webhooks in dev must point to a dev-only Slack channel or /dev/null",
+
+    # Rule 5: New feature flags start OFF in production
+    "Any feature flag defaults to 'false' in production until explicitly enabled",
+]
+```
+
+## Environment Variable Reference
+```bash
+# Required in all environments
+BOT_ENV                = development | paper | production
+MARKET                 = BTC
+LOG_LEVEL              = DEBUG | INFO | WARNING
+DATABASE_URL           = postgresql://...
+KALSHI_API_KEY_ID      = your_key_id
+KALSHI_PRIVATE_KEY_PATH = /run/secrets/kalshi_key.pem
+
+# Required in paper + production only
+ALERT_WEBHOOK_URL      = https://hooks.slack.com/...
+
+# Required in production only
+SLACK_CRITICAL_WEBHOOK = https://hooks.slack.com/...
+SMS_ALERT_WEBHOOK      = https://...
+
+# Feature flags (all default to "false")
+FF_DYNAMIC_OBI         = false
+FF_ML_SIGNALS          = false
+FF_ETH_MARKET          = false
+```
+
+## Guardrails
+- BOT_ENV must be explicitly set — never rely on a default for production
+- Real order submission must assert BOT_ENV == "production" in code, not just by convention
+- Paper and production must never share a database schema — data corruption risk
+- New features must run in paper for minimum 2 weeks before any production flag flip
+- Feature flag changes in production require QT + Strats approval — log the change

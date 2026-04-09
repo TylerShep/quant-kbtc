@@ -1,0 +1,371 @@
+---
+name: docker-backend
+description: Containerize and manage the Kalshi trading bot backend using Docker and Docker Compose. Use this skill when writing Dockerfiles, configuring docker-compose services, setting up container networking, managing environment variables in containers, configuring health checks, or handling container orchestration for the trading bot stack.
+---
+
+# Docker Backend — Trading Bot Containerization
+
+## What This Skill Covers
+Packaging the trading bot and all its dependencies into Docker containers for reproducible, portable deployment on DigitalOcean. Covers Dockerfile authoring, multi-service compose configuration, volume management, health checks, and container lifecycle management.
+
+## Project Structure
+```
+kalshi-bot/
+  docker-compose.yml
+  docker-compose.prod.yml
+  .env.example              # Template — never commit actual .env
+  .dockerignore
+  services/
+    bot/
+      Dockerfile
+      requirements.txt
+      src/
+        main.py
+        strategies/
+        filters/
+        risk/
+        kalshi/
+        ml/
+    data-collector/
+      Dockerfile
+      requirements.txt
+      src/
+        collector.py
+    trainer/
+      Dockerfile
+      requirements.txt
+      src/
+        train.py
+    dashboard/              # Optional monitoring UI
+      Dockerfile
+      src/
+```
+
+## Main Bot Dockerfile
+```dockerfile
+# services/bot/Dockerfile
+FROM python:3.11-slim
+
+# Security: run as non-root
+RUN groupadd -r botuser && useradd -r -g botuser botuser
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
+COPY src/ ./src/
+
+# Switch to non-root
+RUN chown -R botuser:botuser /app
+USER botuser
+
+# Health check endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python src/healthcheck.py || exit 1
+
+CMD ["python", "-u", "src/main.py"]
+```
+
+## Docker Compose — Development
+```yaml
+# docker-compose.yml
+version: "3.9"
+
+services:
+  bot:
+    build: ./services/bot
+    container_name: kalshi-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - kalshi-data:/mnt/data           # Persistent data volume
+      - ./services/bot/src:/app/src     # Hot reload in dev only
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - kalshi-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  data-collector:
+    build: ./services/data-collector
+    container_name: kalshi-collector
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - kalshi-data:/mnt/data
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - kalshi-net
+
+  trainer:
+    build: ./services/trainer
+    container_name: kalshi-trainer
+    restart: "no"                        # Run on-demand, not continuously
+    env_file: .env
+    volumes:
+      - kalshi-data:/mnt/data
+    profiles: ["training"]               # Only starts when explicitly called
+    networks:
+      - kalshi-net
+
+  db:
+    image: postgres:16-alpine
+    container_name: kalshi-db
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./services/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kalshi-net
+
+volumes:
+  kalshi-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/kalshi-data        # Maps to DO Block Storage mount
+  postgres-data:
+
+networks:
+  kalshi-net:
+    driver: bridge
+```
+
+## Docker Compose Override — Production
+```yaml
+# docker-compose.prod.yml
+# Run with: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+version: "3.9"
+
+services:
+  bot:
+    volumes:
+      - kalshi-data:/mnt/data           # No source mount in prod
+    environment:
+      BOT_ENV: production
+      LOG_LEVEL: INFO
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  data-collector:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  db:
+    # In production, use DO Managed DB instead — remove this service
+    # and update DATABASE_URL env var to point to managed DB
+    profiles: ["local-only"]
+```
+
+## Environment Variables Template
+```bash
+# .env.example — copy to .env and fill in values
+# NEVER commit .env to git
+
+# Kalshi API
+KALSHI_API_KEY_ID=
+KALSHI_PRIVATE_KEY_PATH=/run/secrets/kalshi_private_key
+
+# Database
+POSTGRES_DB=kalshi
+POSTGRES_USER=kalshi_bot
+POSTGRES_PASSWORD=
+DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
+# In production (DO Managed DB):
+# DATABASE_URL=postgresql://user:pass@private-db-host:25060/kalshi?sslmode=require
+
+# Bot Configuration
+BOT_ENV=development        # development | production
+LOG_LEVEL=DEBUG            # DEBUG | INFO | WARNING | ERROR
+MARKET=BTC                 # BTC | ETH
+INITIAL_BANKROLL=1000.00
+
+# Alerting
+ALERT_WEBHOOK_URL=         # Slack/Discord webhook URL
+
+# DigitalOcean Spaces (backups)
+DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
+DO_SPACES_KEY=
+DO_SPACES_SECRET=
+DO_SPACES_BUCKET=kalshi-backups
+```
+
+## Docker Secrets (Production Sensitive Values)
+```yaml
+# For production, use Docker secrets for the RSA private key
+# instead of mounting as a file
+
+# docker-compose.prod.yml addition:
+services:
+  bot:
+    secrets:
+      - kalshi_private_key
+
+secrets:
+  kalshi_private_key:
+    file: /home/botuser/.secrets/kalshi_private.pem
+```
+
+## Health Check Implementation
+```python
+# services/bot/src/healthcheck.py
+import sys
+import requests
+import psycopg2
+import os
+
+def check_db():
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    conn.close()
+
+def check_kalshi_api():
+    # Just check connectivity, not auth
+    r = requests.get("https://trading-api.kalshi.com/trade-api/v2/exchange/status", timeout=5)
+    r.raise_for_status()
+
+def check_bot_heartbeat():
+    # Bot writes a heartbeat timestamp to DB every 60s
+    # Fail if heartbeat is older than 5 minutes
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM bot_state WHERE key = 'last_heartbeat'")
+    row = cur.fetchone()
+    if not row:
+        sys.exit(1)
+    import json, datetime
+    last = datetime.datetime.fromisoformat(json.loads(row[0])["timestamp"])
+    age = (datetime.datetime.utcnow() - last).total_seconds()
+    if age > 300:  # 5 minutes
+        sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        check_db()
+        check_kalshi_api()
+        check_bot_heartbeat()
+        sys.exit(0)
+    except Exception as e:
+        print(f"Health check failed: {e}", file=sys.stderr)
+        sys.exit(1)
+```
+
+## .dockerignore
+```
+.git
+.env
+*.pyc
+__pycache__
+.pytest_cache
+*.egg-info
+dist/
+build/
+.venv
+venv/
+*.log
+backtest_reports/
+*.pem
+*.key
+.secrets/
+```
+
+## Common Commands
+```bash
+# Development
+docker compose up -d                          # Start all services
+docker compose logs -f bot                    # Tail bot logs
+docker compose exec bot python -c "..."       # Run command in bot container
+docker compose restart bot                    # Restart bot only
+
+# Production deploy
+docker compose -f docker-compose.yml \
+               -f docker-compose.prod.yml \
+               up -d --build                  # Build and start
+
+# Run ML training manually
+docker compose --profile training run trainer # One-off training run
+
+# Maintenance
+docker compose down                           # Stop all
+docker system prune -f                        # Clean unused images/containers
+docker compose exec db psql -U kalshi_bot -d kalshi  # DB shell
+
+# View resource usage
+docker stats
+
+# Check health
+docker inspect --format='{{.State.Health.Status}}' kalshi-bot
+```
+
+## Systemd Service (Auto-start on Reboot)
+```ini
+# /etc/systemd/system/kalshi-bot.service
+[Unit]
+Description=Kalshi Trading Bot
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/botuser/kalshi-bot
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=300
+User=botuser
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# Enable auto-start
+sudo systemctl enable kalshi-bot
+sudo systemctl start kalshi-bot
+sudo systemctl status kalshi-bot
+```
+
+## Common Pitfalls to Avoid
+- **Running containers as root**: Always set a non-root USER in your Dockerfile
+- **Committing .env files**: Add .env to .gitignore immediately — rotate any keys that were exposed
+- **No restart policy**: Set `restart: unless-stopped` on the bot container — it must survive reboots
+- **Missing health checks**: Without health checks, Docker won't know your bot silently crashed
+- **Bloated images**: Use slim/alpine base images and multi-stage builds to keep image sizes small
+- **No log rotation**: Set `max-size` and `max-file` on all logging configs — unrotated logs fill disk fast
+- **Database in same container as bot**: Always separate DB into its own service (or use DO Managed DB in prod)

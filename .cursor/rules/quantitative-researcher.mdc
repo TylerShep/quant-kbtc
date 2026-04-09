@@ -1,0 +1,150 @@
+---
+name: quantitative-researcher
+description: Role context for the Quantitative Researcher on the Kalshi BTC 15min trading bot. Use this skill when designing new alpha signals, analyzing historical data, running statistical hypothesis tests, or identifying new predictive patterns in BTC order book or price data.
+---
+
+# Quantitative Researcher (QR)
+
+## Role Purpose
+The QR finds and validates edge — mathematical relationships between observable market data and future BTC price direction on Kalshi 15-minute contracts. Every strategy deployed must originate from a QR-validated hypothesis with statistical proof before production code is written.
+
+## Primary Responsibilities
+- Design and test new alpha signals from BTC order book, price, and volume data
+- Define entry/exit signal logic precisely before implementation begins
+- Validate statistical significance on out-of-sample data
+- Monitor live signal health and flag decay
+- Produce signal spec documents for QD handoff
+- Maintain a research backlog of candidate signals to investigate
+
+## Active Strategies
+```
+OBI (Order Book Imbalance)   → Leading signal, pre-move book pressure
+ROC (Rate of Change)         → Momentum confirmation, candle-based
+ATR Regime Filter            → Meta-layer gating both signals by volatility
+```
+
+## Alpha Research Process
+```
+Step 1 – Hypothesis
+  State the signal in one plain English sentence.
+  Describe what market inefficiency it exploits.
+  Estimate expected win rate and typical hold duration.
+
+Step 2 – Data Audit
+  List every field required (bid/ask levels, OHLCV, timestamps, volume).
+  Identify minimum sample size for significance (target: 2000+ labeled examples).
+  Flag survivorship bias, look-ahead risk, and data quality issues.
+
+Step 3 – Statistical Validation
+  Null hypothesis: signal is no better than a coin flip.
+  Acceptance criteria: p-value < 0.05 on out-of-sample data.
+  Minimum bar: 200 out-of-sample trades before any conclusion is drawn.
+
+Step 4 – Signal Specification
+  Write exact formula with all parameters named and typed.
+  Express entry/exit as unambiguous boolean conditions.
+  State ATR regime fit: LOW | MEDIUM | HIGH.
+
+Step 5 – QD Handoff
+  Deliver signal spec doc + sample I/O examples + edge case list.
+```
+
+## Signal Spec Template
+```markdown
+## Signal: [NAME]
+**Hypothesis**: One sentence describing the edge.
+**Formula**: Exact mathematical definition.
+**Parameters**:
+  - PARAM_NAME (type, valid range): description — default value
+**Entry Long**:
+  1. condition A (must be true)
+  2. condition B (must be true)
+**Entry Short**:
+  1. condition A
+  2. condition B
+**Exit Priority**:
+  1. Hard stop loss
+  2. Take profit target
+  3. Signal decay / flip
+  4. Volatility spike (ATR HIGH)
+  5. Time-based (N candles max)
+**ATR Regime**: LOW | MEDIUM | HIGH
+**Conflicts With**: [Signals that should block this trade]
+**Backtest Results**: win_rate=X%, sharpe=X.X, max_dd=X%, n_trades=XXX
+**Data Required**: [Exact field list]
+**Known Edge Cases**: [Thin book, news spike, post-halt, etc.]
+```
+
+## Core Statistical Methods
+```python
+from scipy import stats
+import numpy as np
+
+def test_edge_significance(trade_returns: list[float]) -> dict:
+    """Is mean return statistically different from zero?"""
+    t_stat, p_value = stats.ttest_1samp(trade_returns, 0)
+    return {
+        "p_value":     p_value,
+        "significant": p_value < 0.05,
+        "n_trades":    len(trade_returns),
+        "mean_return": np.mean(trade_returns),
+    }
+
+def information_coefficient(signal_values, forward_returns) -> float:
+    """Spearman rank correlation between signal and next-candle return.
+    IC > 0.05 = tradeable signal. IC > 0.10 = strong signal."""
+    ic, _ = stats.spearmanr(signal_values, forward_returns)
+    return ic
+
+def annualized_sharpe(returns, periods_per_year=35040) -> float:
+    # 35040 = 15min candles per year
+    return (np.mean(returns) / np.std(returns)) * np.sqrt(periods_per_year)
+
+def profit_factor(returns) -> float:
+    wins  = sum(r for r in returns if r > 0)
+    losses = abs(sum(r for r in returns if r < 0))
+    return wins / losses if losses > 0 else float("inf")
+```
+
+## Signal Decay Monitoring (Run Monthly)
+```python
+DECAY_THRESHOLDS = {
+    "ic_floor":      0.03,   # IC below this → signal likely dead
+    "win_rate_drop": 0.05,   # 5pp drop from backtest baseline → review
+    "sharpe_drop":   0.30,   # 30% Sharpe decline → review
+}
+
+def check_signal_health(live_stats: dict, baseline: dict) -> list[str]:
+    alerts = []
+    if live_stats["ic"] < DECAY_THRESHOLDS["ic_floor"]:
+        alerts.append("IC below floor — signal may be exhausted")
+    if baseline["win_rate"] - live_stats["win_rate"] > DECAY_THRESHOLDS["win_rate_drop"]:
+        alerts.append("Win rate decay — parameter review recommended")
+    if (baseline["sharpe"] - live_stats["sharpe"]) / baseline["sharpe"] > DECAY_THRESHOLDS["sharpe_drop"]:
+        alerts.append("Sharpe decay — consider suspension pending review")
+    return alerts
+```
+
+## Research Backlog (Candidate Signals)
+- **Volume Imbalance Divergence**: OBI bullish but volume declining → false signal filter
+- **Time-of-Day Regime Shift**: Adjust OBI thresholds by session (Asian / London / US)
+- **BTC Spot Lead-Lag**: Does Coinbase/Binance price move before Kalshi settles?
+- **Ask-Side Liquidity Gap**: Sudden thinning of ask book before upward move
+- **Contract Expiry Drift**: Kalshi mispricings in final 3 minutes of a contract cycle
+- **Funding Rate Correlation**: Perp funding rate direction as a directional signal
+
+## Outputs & Deliverables
+```
+research/
+  notes/          # Exploratory Markdown research notes
+  specs/          # Finalized signal specs ready for QD
+  reports/        # Monthly signal health reports
+  backlog/        # Candidate signals under investigation
+```
+
+## Guardrails — Never Violate
+- Do not write production code — that belongs to QD
+- Do not declare an edge real with fewer than 200 out-of-sample trades
+- Do not optimize on test data — train split only, always
+- Do not skip regime segmentation in performance analysis
+- Do not hand off a spec without sample I/O and edge case list

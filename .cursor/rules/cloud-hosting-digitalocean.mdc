@@ -1,0 +1,252 @@
+---
+name: cloud-hosting-digitalocean
+description: Set up and manage cloud infrastructure on DigitalOcean for the Kalshi trading bot. Use this skill when provisioning Droplets, configuring firewalls, setting up managed databases, configuring DNS, managing SSH access, or handling deployment pipelines to DigitalOcean.
+---
+
+# Cloud Hosting — DigitalOcean
+
+## What This Skill Covers
+Provisioning and managing the DigitalOcean infrastructure that runs the trading bot 24/7. Covers Droplet setup, firewall rules, managed databases, block storage, monitoring, and deployment automation.
+
+## Recommended Architecture
+```
+┌─────────────────────────────────────────────┐
+│              DigitalOcean                   │
+│                                             │
+│  ┌─────────────┐     ┌──────────────────┐   │
+│  │  Droplet    │     │  Managed DB      │   │
+│  │  (Bot)      │────▶│  (PostgreSQL)    │   │
+│  │  2vCPU/4GB  │     │  Trade logs      │   │
+│  └─────────────┘     └──────────────────┘   │
+│         │                                   │
+│  ┌─────────────┐     ┌──────────────────┐   │
+│  │  Block      │     │  Spaces (S3)     │   │
+│  │  Storage    │     │  Model backups   │   │
+│  │  (Data)     │     │  Historical data │   │
+│  └─────────────┘     └──────────────────┘   │
+└─────────────────────────────────────────────┘
+```
+
+## Droplet Specification
+```yaml
+# Recommended Droplet for trading bot
+name:     kalshi-bot-prod
+region:   nyc3           # New York — lowest latency to Kalshi
+size:     s-2vcpu-4gb    # 2 vCPU, 4GB RAM — sufficient for bot + ML
+image:    ubuntu-24-04-x64
+backups:  true           # Enable automated backups
+monitoring: true         # Enable DO monitoring agent
+
+# Estimated cost: ~$24/month + $5 backups = ~$29/month
+```
+
+## Initial Droplet Setup
+```bash
+# 1. Create non-root user
+adduser botuser
+usermod -aG sudo botuser
+su - botuser
+
+# 2. Configure SSH key auth only (disable password auth)
+mkdir ~/.ssh && chmod 700 ~/.ssh
+echo "YOUR_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+
+# Edit /etc/ssh/sshd_config:
+# PasswordAuthentication no
+# PermitRootLogin no
+sudo systemctl restart sshd
+
+# 3. Configure UFW firewall
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH
+sudo ufw allow 9090  # Prometheus metrics (internal only)
+sudo ufw enable
+
+# 4. Update system
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y fail2ban htop curl git unzip
+```
+
+## Firewall Rules (DigitalOcean Cloud Firewall)
+```
+# Inbound rules — minimal surface
+SSH (22)     → Your IP only (not 0.0.0.0/0)
+Metrics (9090) → Monitoring Droplet IP only
+
+# Outbound rules — bot needs these
+HTTPS (443)  → api.anthropic.com (if used)
+HTTPS (443)  → trading-api.kalshi.com
+WSS   (443)  → trading-api.kalshi.com (WebSocket)
+PostgreSQL (5432) → Managed DB IP only
+```
+
+## Managed PostgreSQL Setup
+```bash
+# Create via DO console or doctl
+doctl databases create kalshi-db \
+  --engine pg \
+  --version 16 \
+  --size db-s-1vcpu-1gb \
+  --region nyc3 \
+  --num-nodes 1
+
+# Connect from Droplet using connection string from DO console
+# Store in environment variable — never hardcode
+
+# Required tables
+CREATE TABLE trades (
+    id              SERIAL PRIMARY KEY,
+    timestamp       TIMESTAMPTZ NOT NULL,
+    strategy        VARCHAR(20) NOT NULL,
+    market          VARCHAR(50) NOT NULL,
+    direction       VARCHAR(10) NOT NULL,
+    entry_price     DECIMAL(10,4),
+    exit_price      DECIMAL(10,4),
+    contracts       INTEGER,
+    pnl_cents       INTEGER,
+    pnl_pct         DECIMAL(8,4),
+    exit_reason     VARCHAR(30),
+    regime          VARCHAR(10),
+    candles_held    INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE bot_state (
+    key             VARCHAR(100) PRIMARY KEY,
+    value           JSONB,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE signal_log (
+    id              SERIAL PRIMARY KEY,
+    timestamp       TIMESTAMPTZ NOT NULL,
+    market          VARCHAR(50),
+    strategy        VARCHAR(20),
+    obi_value       DECIMAL(6,4),
+    roc_value       DECIMAL(8,4),
+    atr_regime      VARCHAR(10),
+    action          VARCHAR(20),
+    skip_reason     VARCHAR(50),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+## Block Storage (Persistent Data Volume)
+```bash
+# Create and attach a volume for candle data + model files
+doctl compute volume create kalshi-data \
+  --size 50GiB \
+  --region nyc3 \
+  --fs-type ext4
+
+# Mount the volume
+sudo mkdir -p /mnt/kalshi-data
+sudo mount -o discard,defaults /dev/disk/by-id/scsi-0DO_Volume_kalshi-data /mnt/kalshi-data
+
+# Add to /etc/fstab for persistence across reboots
+echo "/dev/disk/by-id/scsi-0DO_Volume_kalshi-data /mnt/kalshi-data ext4 defaults,nofail,discard 0 2" | sudo tee -a /etc/fstab
+
+# Directory structure
+/mnt/kalshi-data/
+  candles/          # Historical OHLCV data
+  orderbook/        # Historical OB snapshots
+  models/           # Trained ML models (versioned)
+  backtest_reports/ # All backtest outputs
+  logs/             # Rotated application logs
+```
+
+## Environment Variables & Secrets
+```bash
+# Store secrets in /etc/environment (not in code or .env files committed to git)
+sudo tee -a /etc/environment << EOF
+KALSHI_API_KEY_ID=your_key_id
+KALSHI_PRIVATE_KEY_PATH=/home/botuser/.secrets/kalshi_private.pem
+DATABASE_URL=postgresql://user:pass@db-host:25060/kalshi?sslmode=require
+DO_SPACES_KEY=your_spaces_key
+DO_SPACES_SECRET=your_spaces_secret
+BOT_ENV=production
+EOF
+
+# Secure the private key
+mkdir ~/.secrets && chmod 700 ~/.secrets
+# Copy your RSA key here
+chmod 600 ~/.secrets/kalshi_private.pem
+```
+
+## Monitoring & Alerting
+```bash
+# Install DO monitoring agent (do this on first setup)
+curl -sSL https://repos.insights.digitalocean.com/install.sh | sudo bash
+
+# Set up alerts in DO console:
+# CPU > 80% for 5 min      → Email alert
+# Memory > 85%             → Email alert
+# Disk > 80%               → Email alert
+# Droplet unreachable      → Email + SMS alert
+
+# Application-level alerting via simple webhook
+def send_alert(msg, level="WARNING"):
+    """Send to Slack/Discord webhook for trade-critical events."""
+    payload = {"text": f"[{level}] Kalshi Bot: {msg}"}
+    requests.post(os.getenv("ALERT_WEBHOOK_URL"), json=payload)
+
+# Alert on:
+# - Circuit breaker triggered (daily/weekly loss limit)
+# - API auth failure
+# - Bot process crash / restart
+# - Drawdown exceeding threshold
+# - Order fill failures
+```
+
+## Deployment Process
+```bash
+# Simple deploy script — run from local machine
+#!/bin/bash
+DROPLET_IP="your.droplet.ip"
+DEPLOY_USER="botuser"
+
+# 1. Push latest code
+rsync -avz --exclude='.git' --exclude='__pycache__' \
+  ./kalshi-bot/ ${DEPLOY_USER}@${DROPLET_IP}:/home/botuser/kalshi-bot/
+
+# 2. SSH in and restart
+ssh ${DEPLOY_USER}@${DROPLET_IP} << 'EOF'
+  cd /home/botuser/kalshi-bot
+  pip install -r requirements.txt --quiet
+  sudo systemctl restart kalshi-bot
+  sudo systemctl status kalshi-bot
+EOF
+```
+
+## Backups
+```bash
+# Automated database backups via DO managed DB (handled automatically)
+# Additional: back up models and config to DO Spaces daily
+
+#!/bin/bash
+# /etc/cron.daily/backup-bot-data
+DATE=$(date +%Y%m%d)
+s3cmd sync /mnt/kalshi-data/models/ s3://kalshi-backups/models/${DATE}/
+s3cmd sync /home/botuser/kalshi-bot/config/ s3://kalshi-backups/config/${DATE}/
+```
+
+## Cost Estimate
+```
+Droplet (2vCPU/4GB):     $24/month
+Droplet backups:          $5/month
+Managed PostgreSQL (1GB): $15/month
+Block Storage (50GB):     $5/month
+Spaces (250GB):           $5/month
+─────────────────────────────────
+Total:                   ~$54/month
+```
+
+## Common Pitfalls to Avoid
+- **Running as root**: Always use a non-root user for the bot process
+- **Hardcoded secrets**: Never commit API keys or DB passwords — use environment variables
+- **No firewall**: Lock down SSH to your IP only from day one
+- **Single point of failure**: Enable Droplet backups — if it gets corrupted you need a restore point
+- **Ignoring disk usage**: OB snapshots fill disk fast — set up log rotation and old data archival
+- **No alerting**: You won't be watching the bot 24/7 — you need alerts for critical failures

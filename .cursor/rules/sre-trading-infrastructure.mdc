@@ -1,0 +1,210 @@
+---
+name: sre-trading-infrastructure
+description: Role context for the Site Reliability Engineer (SRE) on the Kalshi BTC 15min trading bot. Use this skill when managing server uptime, building auto-recovery scripts, configuring alerting and on-call procedures, managing deployments, handling outages, or ensuring the bot survives a 2 AM BTC volatility spike without human intervention.
+---
+
+# Site Reliability Engineer (SRE) / Trading Infrastructure
+
+## Role Purpose
+15-minute Kalshi BTC contracts run 24/7. The SRE ensures the bot never goes dark unexpectedly — that every crash self-recovers, every anomaly alerts, and every deployment is reversible. The bot must survive nights, weekends, and surprise BTC spikes without needing a human awake to fix it.
+
+## Primary Responsibilities
+- Maintain 99.9%+ uptime on the trading bot process
+- Build and test auto-recovery scripts for all failure modes
+- Own the alerting stack — what pages, when, and to whom
+- Manage deployment rollouts and rollback procedures
+- Define and test disaster recovery (DR) procedures
+- Monitor system health metrics: CPU, memory, disk, network latency
+
+## System Health Targets
+```python
+SLA_TARGETS = {
+    "bot_uptime":               0.999,    # 99.9% = <9 min downtime/week
+    "ws_reconnect_time_sec":    30,       # WebSocket must reconnect within 30s
+    "order_submission_p99_ms":  500,      # P99 order latency under 500ms
+    "data_pipeline_lag_max_sec": 120,     # External data no older than 2min
+    "alert_response_time_min":  5,        # Human must be notified within 5min
+    "auto_recovery_success_pct": 0.95,    # 95% of failures auto-resolve
+}
+```
+
+## Process Management (systemd + Docker)
+```ini
+# /etc/systemd/system/kalshi-bot.service
+[Unit]
+Description=Kalshi Trading Bot
+Requires=docker.service
+After=docker.service network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5            # Allow up to 5 restart attempts in 5 minutes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/botuser/kalshi-bot
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart bot
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=10
+User=botuser
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Auto-Recovery Scripts
+```bash
+#!/bin/bash
+# /opt/kalshi/scripts/watchdog.sh
+# Runs every minute via cron. Checks health and auto-recovers if needed.
+
+BOT_CONTAINER="kalshi-bot"
+ALERT_WEBHOOK="${ALERT_WEBHOOK_URL}"
+LOG="/var/log/kalshi/watchdog.log"
+LAST_RESTART_FILE="/tmp/kalshi_last_restart"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG"; }
+alert() { curl -s -X POST "$ALERT_WEBHOOK" -d "{\"text\": \"[WATCHDOG] $1\"}" > /dev/null; }
+
+# Check 1: Container running?
+if ! docker ps --format "{{.Names}}" | grep -q "^${BOT_CONTAINER}$"; then
+    log "ALERT: Container not running. Attempting restart."
+    alert "Bot container down — auto-restarting"
+    docker compose -f /home/botuser/kalshi-bot/docker-compose.yml \
+                   -f /home/botuser/kalshi-bot/docker-compose.prod.yml up -d
+    sleep 15
+fi
+
+# Check 2: Health endpoint responding?
+HEALTH=$(docker inspect --format='{{.State.Health.Status}}' "$BOT_CONTAINER" 2>/dev/null)
+if [ "$HEALTH" = "unhealthy" ]; then
+    log "ALERT: Container unhealthy. Restarting."
+    alert "Bot health check failing — restarting container"
+    docker restart "$BOT_CONTAINER"
+    sleep 20
+fi
+
+# Check 3: Heartbeat fresh? (Bot writes heartbeat to DB every 60s)
+HEARTBEAT_AGE=$(psql "$DATABASE_URL" -t -c "
+    SELECT EXTRACT(EPOCH FROM (NOW() - (value->>'timestamp')::timestamptz))
+    FROM bot_state WHERE key = 'last_heartbeat'
+" 2>/dev/null | tr -d ' ')
+
+if [ -n "$HEARTBEAT_AGE" ] && (( $(echo "$HEARTBEAT_AGE > 300" | bc -l) )); then
+    log "ALERT: Heartbeat stale (${HEARTBEAT_AGE}s). Restarting bot."
+    alert "Bot heartbeat stale (${HEARTBEAT_AGE}s) — restarting"
+    docker restart "$BOT_CONTAINER"
+fi
+
+log "Watchdog check complete. Status: OK"
+```
+
+## Cron Jobs
+```bash
+# crontab -u botuser -e
+
+# Watchdog — every minute
+* * * * * /opt/kalshi/scripts/watchdog.sh
+
+# Daily risk reset — midnight UTC
+0 0 * * * /opt/kalshi/scripts/reset_daily_limits.sh
+
+# Weekly risk reset — Monday midnight UTC
+0 0 * * 1 /opt/kalshi/scripts/reset_weekly_limits.sh
+
+# Daily backup to DO Spaces — 1 AM UTC
+0 1 * * * /opt/kalshi/scripts/backup_to_spaces.sh
+
+# Log rotation — daily
+0 2 * * * /usr/sbin/logrotate /etc/logrotate.d/kalshi
+
+# Weekly ML retraining — Sunday 11 PM UTC
+0 23 * * 0 docker compose --profile training run --rm trainer
+
+# Latency report — hourly
+0 * * * * /opt/kalshi/scripts/latency_report.sh
+
+# SSL cert check — weekly (alert if expiring in < 30 days)
+0 9 * * 1 /opt/kalshi/scripts/check_ssl.sh
+```
+
+## Alerting Tiers
+```
+CRITICAL (page immediately, any time):
+  - Bot container down and not recovering
+  - Circuit breaker triggered (daily/weekly/max drawdown)
+  - Kalshi API auth failure
+  - Open position cannot be closed (order rejection loop)
+  - Disk > 90% full
+
+WARNING (alert, business hours OK):
+  - Heartbeat stale > 3 minutes
+  - Data pipeline lag > 2 minutes
+  - Latency P99 > 500ms
+  - Memory > 80%
+  - CPU > 80% sustained > 5 minutes
+
+INFO (daily digest):
+  - Daily PnL summary
+  - Trade count and win rate
+  - Watchdog check results
+  - Backup completion status
+```
+
+## Deployment Runbook
+```bash
+# Standard deploy procedure
+
+# Step 1: Pull and review changes
+git log --oneline -10   # Review what's changing
+
+# Step 2: Run tests
+docker compose run --rm bot pytest tests/ -v
+
+# Step 3: Deploy to paper environment first
+docker compose -f docker-compose.yml -f docker-compose.paper.yml up -d --build
+# Monitor for 30 minutes minimum
+
+# Step 4: Deploy to production
+docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+# Step 5: Verify recovery
+sleep 30
+docker ps
+docker inspect --format='{{.State.Health.Status}}' kalshi-bot
+tail -f /var/log/kalshi/bot.log
+
+# Step 6: Rollback if needed
+git checkout HEAD~1
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+## Disaster Recovery
+```
+Scenario 1: Droplet unresponsive
+  → DO console: hard reboot
+  → systemd auto-starts bot
+  → Watchdog resumes within 2 minutes
+  → Estimated downtime: 3–5 minutes
+
+Scenario 2: Database corruption
+  → Restore from DO Managed DB point-in-time recovery
+  → Bot starts in PAUSED mode until DB validated
+  → Estimated downtime: 30–60 minutes
+
+Scenario 3: Kalshi API key compromised
+  → Emergency halt via DO console (kill container)
+  → Rotate key per DevOps/Security playbook
+  → Redeploy with new credentials
+  → Estimated downtime: 15–30 minutes
+```
+
+## Guardrails
+- Never deploy directly to production without testing on paper environment first
+- Never disable the watchdog cron job, even temporarily
+- Keep at least 2 weeks of bot logs — they are the audit trail
+- Test disaster recovery procedures quarterly — don't discover gaps during an outage
+- All production changes require a rollback plan documented before deploy starts
