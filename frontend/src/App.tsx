@@ -32,13 +32,17 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
+export type ChartMode = 'pnl' | 'account';
+
 function App() {
   const { lastMessage, connected } = useWebSocket();
   const status = useStatus(5000);
   const [features, setFeatures] = useState<Features | null>(null);
   const [marketState, setMarketState] = useState<MarketState | null>(null);
   const [pnlHistory, setPnlHistory] = useState<PnLPoint[]>([]);
+  const [accountHistory, setAccountHistory] = useState<PnLPoint[]>([]);
   const [timeRange, setTimeRange] = useState<'24H' | '1W' | '1M' | 'All'>('24H');
+  const [chartMode, setChartMode] = useState<ChartMode>('pnl');
 
   useEffect(() => {
     if (!lastMessage || lastMessage.type !== 'market_update') return;
@@ -49,13 +53,17 @@ function App() {
   useEffect(() => {
     if (!status?.risk) return;
     const bankroll = status.risk.bankroll ?? 0;
-    const peak = status.risk.peak_bankroll ?? bankroll;
-    const pnl = bankroll - peak;
+    const initial = status.risk.peak_bankroll ?? bankroll;
+    const pnl = bankroll - initial;
+    const now = Math.floor(Date.now() / 1000);
 
     setPnlHistory((prev) => {
-      const now = Math.floor(Date.now() / 1000);
       if (prev.length > 0 && prev[prev.length - 1].time >= now) return prev;
       return [...prev, { time: now, value: pnl }].slice(-2000);
+    });
+    setAccountHistory((prev) => {
+      if (prev.length > 0 && prev[prev.length - 1].time >= now) return prev;
+      return [...prev, { time: now, value: bankroll }].slice(-2000);
     });
   }, [status?.risk?.bankroll, status?.risk?.peak_bankroll]);
 
@@ -88,6 +96,8 @@ function App() {
           connected={connected}
           timeRange={timeRange}
           onTimeRangeChange={setTimeRange}
+          chartMode={chartMode}
+          onChartModeChange={setChartMode}
         />
         <div className="flex flex-1 overflow-hidden">
           <Sidebar
@@ -97,7 +107,10 @@ function App() {
           />
           <main className="flex-1 flex flex-col overflow-hidden">
             <div className="flex-1 min-h-0 p-3">
-              <PnLChart data={pnlHistory} />
+              <PnLChart
+                data={chartMode === 'pnl' ? pnlHistory : accountHistory}
+                mode={chartMode}
+              />
             </div>
             <SignalPanel
               features={mergedFeatures}

@@ -1,12 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { createChart, AreaSeries, type IChartApi, type ISeriesApi } from 'lightweight-charts';
 import type { PnLPoint } from '../types';
+import type { ChartMode } from '../App';
 
 interface PnLChartProps {
   data: PnLPoint[];
+  mode: ChartMode;
 }
 
-export function PnLChart({ data }: PnLChartProps) {
+export function PnLChart({ data, mode }: PnLChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
@@ -84,18 +86,26 @@ export function PnLChart({ data }: PnLChartProps) {
 
       if (chartData.length === 0) return;
 
-      const isPositive = chartData[chartData.length - 1].value >= 0;
-      seriesRef.current.applyOptions({
-        lineColor: isPositive ? '#0ecb81' : '#f6465d',
-        topColor: isPositive ? '#0ecb8133' : '#f6465d33',
-        bottomColor: isPositive ? '#0ecb8105' : '#f6465d05',
-      });
+      if (mode === 'account') {
+        seriesRef.current.applyOptions({
+          lineColor: '#3b82f6',
+          topColor: '#3b82f633',
+          bottomColor: '#3b82f605',
+        });
+      } else {
+        const isPositive = chartData[chartData.length - 1].value >= 0;
+        seriesRef.current.applyOptions({
+          lineColor: isPositive ? '#0ecb81' : '#f6465d',
+          topColor: isPositive ? '#0ecb8133' : '#f6465d33',
+          bottomColor: isPositive ? '#0ecb8105' : '#f6465d05',
+        });
+      }
 
       seriesRef.current.setData(chartData);
     } catch {
       // lightweight-charts can throw on edge-case data; ignore
     }
-  }, [data]);
+  }, [data, mode]);
 
   return (
     <div ref={containerRef} className="w-full h-full rounded-lg overflow-hidden" />

@@ -1,12 +1,21 @@
+import type { ChartMode } from '../App';
+
 interface TopBarProps {
   connected: boolean;
   timeRange: string;
   onTimeRangeChange: (range: '24H' | '1W' | '1M' | 'All') => void;
+  chartMode: ChartMode;
+  onChartModeChange: (mode: ChartMode) => void;
 }
 
 const ranges: Array<'24H' | '1W' | '1M' | 'All'> = ['24H', '1W', '1M', 'All'];
 
-export function TopBar({ connected, timeRange, onTimeRangeChange }: TopBarProps) {
+const chartModes: Array<{ key: ChartMode; label: string }> = [
+  { key: 'pnl', label: 'PnL' },
+  { key: 'account', label: 'Account Value' },
+];
+
+export function TopBar({ connected, timeRange, onTimeRangeChange, chartMode, onChartModeChange }: TopBarProps) {
   return (
     <header className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
       <div className="flex items-center gap-4">
@@ -38,11 +47,16 @@ export function TopBar({ connected, timeRange, onTimeRangeChange }: TopBarProps)
         ))}
       </div>
 
-      <div className="flex items-center gap-2">
-        {['PnL', 'Account Value'].map((label) => (
+      <div className="flex items-center gap-1">
+        {chartModes.map(({ key, label }) => (
           <button
-            key={label}
-            className="px-3 py-1 text-xs rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors"
+            key={key}
+            onClick={() => onChartModeChange(key)}
+            className={`px-3 py-1 text-xs rounded transition-colors ${
+              chartMode === key
+                ? 'bg-[var(--bg-tertiary)] text-[var(--text-primary)] ring-1 ring-[var(--border)]'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+            }`}
           >
             {label}
           </button>
