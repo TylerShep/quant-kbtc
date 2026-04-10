@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS trades (
     candles_held    INTEGER,
     entry_obi       NUMERIC(6,4),
     entry_roc       NUMERIC(10,4),
-    closed_at       TIMESTAMPTZ
+    closed_at       TIMESTAMPTZ,
+    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper'
 );
 SELECT create_hypertable('trades', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker, timestamp DESC);
@@ -77,7 +78,8 @@ CREATE TABLE IF NOT EXISTS bankroll_history (
     peak_bankroll   NUMERIC(14,4)   NOT NULL,
     drawdown_pct    NUMERIC(8,4),
     daily_pnl       NUMERIC(14,4),
-    trade_count     INTEGER
+    trade_count     INTEGER,
+    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper'
 );
 SELECT create_hypertable('bankroll_history', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 
@@ -105,6 +107,29 @@ SELECT create_hypertable('pipeline_health', 'timestamp', chunk_time_interval => 
 CREATE TABLE IF NOT EXISTS errored_trades (LIKE trades INCLUDING ALL);
 ALTER TABLE errored_trades ADD COLUMN IF NOT EXISTS error_reason VARCHAR(100);
 ALTER TABLE errored_trades ADD COLUMN IF NOT EXISTS flagged_at TIMESTAMPTZ DEFAULT NOW();
+
+-- Parameter tuning recommendations
+CREATE TABLE IF NOT EXISTS param_recommendations (
+    timestamp           TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    current_params      JSONB           NOT NULL,
+    recommended_params  JSONB           NOT NULL,
+    edge_consistency    NUMERIC(6,4),
+    avg_oos_sharpe      NUMERIC(8,4),
+    should_apply        BOOLEAN         DEFAULT FALSE,
+    reason              VARCHAR(200),
+    changes             JSONB
+);
+SELECT create_hypertable('param_recommendations', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
+
+-- Daily attribution snapshots (one row per calendar day)
+CREATE TABLE IF NOT EXISTS daily_attribution (
+    date            DATE            NOT NULL PRIMARY KEY,
+    total_trades    INTEGER         NOT NULL,
+    total_pnl       NUMERIC(14,4)   NOT NULL,
+    attribution     JSONB           NOT NULL,
+    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper',
+    created_at      TIMESTAMPTZ     DEFAULT NOW()
+);
 
 -- Bot state (key-value for heartbeat, bankroll persistence, etc.)
 CREATE TABLE IF NOT EXISTS bot_state (

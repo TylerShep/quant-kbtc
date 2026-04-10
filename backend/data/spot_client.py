@@ -24,6 +24,10 @@ class SpotPriceClient:
         self.on_price = on_price
         self._running = False
         self._latest: Dict[str, float] = {}
+        self.connected = False
+        self.last_message_time: Optional[float] = None
+        self.message_count = 0
+        self.connect_attempts = 0
 
     async def start(self):
         self._running = True
@@ -61,12 +65,14 @@ class SpotPriceClient:
         if not products:
             return
 
+        self.connect_attempts += 1
         async with websockets.connect(
             settings.spot.coinbase_ws_url,
             ping_interval=20,
             ping_timeout=10,
             additional_headers={"User-Agent": "KBTC/1.0"},
         ) as ws:
+            self.connected = True
             await ws.send(
                 json.dumps(
                     {"type": "subscribe", "product_ids": products, "channel": "ticker"}
@@ -74,14 +80,19 @@ class SpotPriceClient:
             )
             logger.info("spot_client.subscribed", products=products)
 
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    msg = json.loads(raw)
-                    self._handle(msg)
-                except json.JSONDecodeError:
-                    pass
+            try:
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                        self.last_message_time = __import__("time").time()
+                        self.message_count += 1
+                        self._handle(msg)
+                    except json.JSONDecodeError:
+                        pass
+            finally:
+                self.connected = False
 
     def _handle(self, msg: dict):
         channel = msg.get("channel", "")

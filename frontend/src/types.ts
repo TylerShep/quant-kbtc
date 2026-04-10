@@ -137,6 +137,25 @@ export interface StatusResponse {
   atr: ATRState;
   risk: RiskState;
   paper: PaperState;
+  trading_mode?: string;
+  trading_paused?: boolean;
+}
+
+export interface WSFeedInfo {
+  connected: boolean;
+  last_message_age_sec: number | null;
+  message_count: number;
+  connect_attempts: number;
+  active_tickers: Record<string, string>;
+}
+
+export interface DiagnosticsResponse {
+  kalshi_ws: WSFeedInfo;
+  spot_ws: WSFeedInfo;
+  tick_count: number;
+  candle_count: number;
+  atr_regime: string;
+  trading_mode: string;
 }
 
 export interface PnLPoint {

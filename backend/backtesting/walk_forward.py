@@ -1,9 +1,11 @@
 """
-Walk-forward optimizer — rolling train/test windows.
+Walk-forward optimizer — rolling train/test windows with overfitting diagnosis.
 Per the walk-forward-optimizer skill.
 """
 from __future__ import annotations
 
+import random
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,13 +13,14 @@ from backtesting.backtester import Backtester
 
 
 WALK_FORWARD_CONFIG = {
-    "total_candles": 17520,
     "train_window": 3500,
     "test_window": 500,
     "step_size": 500,
     "min_trades_per_window": 30,
-    "train_test_ratio": 0.70,
 }
+
+MAX_GRID_COMBOS = 10000
+RANDOM_TRIALS = 200
 
 
 @dataclass
@@ -84,16 +87,26 @@ class WalkForwardOptimizer:
     def _optimize_on_window(
         self, train_range: tuple[int, int], param_space: dict, objective: str
     ) -> tuple[dict, float]:
-        """Grid search over param_space on training window."""
+        """Grid search (or random search if grid is too large) on training window."""
         train_candles = self.candles[train_range[0] : train_range[1]]
+
+        full_grid = self._expand_grid(param_space)
+        if len(full_grid) > MAX_GRID_COMBOS:
+            param_combos = [
+                {k: random.choice(v) for k, v in param_space.items()}
+                for _ in range(RANDOM_TRIALS)
+            ]
+        else:
+            param_combos = full_grid
 
         best_params = {}
         best_score = float("-inf")
 
-        param_combos = self._expand_grid(param_space)
         for params in param_combos:
             bt = Backtester(train_candles, self.ob_history, params)
             result = bt.run()
+            if result["total_trades"] < 30:
+                continue
             score = result.get(objective, 0)
             if score > best_score:
                 best_score = score
@@ -120,29 +133,88 @@ class WalkForwardOptimizer:
 
     @staticmethod
     def select_final_params(results: list[WindowResult]) -> Optional[dict]:
+        """Per-parameter majority vote across winning windows.
+
+        Instead of voting on whole parameter sets, each parameter is voted
+        on independently — the most common value for each key across all
+        profitable windows is selected.  This is more robust than string-matching
+        entire param dicts (per walk-forward-optimizer skill).
         """
-        Majority vote across winning windows.
-        Returns the most common parameter set among windows with Sharpe > 1.0.
-        """
-        winning = [r for r in results if r.test_sharpe > 1.0]
+        winning = [r for r in results if r.test_sharpe > 0.5]
         if not winning:
             return None
 
-        param_counts: dict[str, int] = {}
+        param_votes: dict[str, Counter] = {}
         for r in winning:
-            key = str(sorted(r.best_params.items()))
-            param_counts[key] = param_counts.get(key, 0) + 1
+            for key, val in r.best_params.items():
+                if key not in param_votes:
+                    param_votes[key] = Counter()
+                param_votes[key][val] += 1
 
-        best_key = max(param_counts, key=param_counts.get)
-        for r in winning:
-            if str(sorted(r.best_params.items())) == best_key:
-                return r.best_params
-
-        return winning[0].best_params
+        return {key: counter.most_common(1)[0][0] for key, counter in param_votes.items()}
 
     @staticmethod
     def edge_consistency(results: list[WindowResult]) -> float:
-        """Fraction of test windows with Sharpe > 1.0."""
+        """Fraction of test windows with Sharpe > 0.5."""
         if not results:
             return 0.0
-        return sum(1 for r in results if r.test_sharpe > 1.0) / len(results)
+        return sum(1 for r in results if r.test_sharpe > 0.5) / len(results)
+
+    @staticmethod
+    def diagnose_overfitting(results: list[WindowResult]) -> dict:
+        """Analyze walk-forward results for signs of overfitting.
+
+        Returns a dict with core metrics, boolean flags, and a recommendation
+        string per the walk-forward-optimizer skill.
+        """
+        if not results:
+            return {
+                "avg_train_sharpe": 0,
+                "avg_test_sharpe": 0,
+                "avg_overfitting_gap": 0,
+                "pct_windows_profitable": 0,
+                "high_overfitting": False,
+                "inconsistent_edge": True,
+                "edge_confirmed": False,
+                "recommendation": "INSUFFICIENT DATA — no valid windows",
+            }
+
+        train_sharpes = [w.train_sharpe for w in results]
+        test_sharpes = [w.test_sharpe for w in results]
+        gaps = [w.overfitting_gap for w in results]
+
+        avg_train = sum(train_sharpes) / len(train_sharpes)
+        avg_test = sum(test_sharpes) / len(test_sharpes)
+        avg_gap = sum(gaps) / len(gaps)
+
+        pct_profitable = sum(1 for s in test_sharpes if s > 0) / len(test_sharpes)
+        pct_strong = sum(1 for s in test_sharpes if s > 0.5) / len(test_sharpes)
+
+        high_overfitting = avg_gap > 1.0
+        inconsistent_edge = pct_strong < 0.6
+        edge_confirmed = avg_test > 1.0 and avg_gap < 1.0
+
+        recommendation = _overfitting_recommendation(avg_gap, avg_test)
+
+        return {
+            "avg_train_sharpe": round(avg_train, 4),
+            "avg_test_sharpe": round(avg_test, 4),
+            "avg_overfitting_gap": round(avg_gap, 4),
+            "pct_windows_profitable": round(pct_profitable, 4),
+            "high_overfitting": high_overfitting,
+            "inconsistent_edge": inconsistent_edge,
+            "edge_confirmed": edge_confirmed,
+            "recommendation": recommendation,
+        }
+
+
+def _overfitting_recommendation(avg_gap: float, avg_test_sharpe: float) -> str:
+    if avg_test_sharpe < 0:
+        return "ABANDON — signal has no OOS edge"
+    if avg_gap > 2.0:
+        return "HIGH OVERFITTING — reduce parameter space, use simpler model"
+    if avg_gap > 1.0:
+        return "MODERATE OVERFITTING — widen test windows, reduce combos"
+    if avg_test_sharpe > 1.0 and avg_gap < 1.0:
+        return "DEPLOY CANDIDATE — edge appears robust"
+    return "MARGINAL — gather more data before deploying"

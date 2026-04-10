@@ -140,6 +140,10 @@ class BotConfig:
     discord_risk_webhook: str = field(default_factory=lambda: _env("DISCORD_RISK_WEBHOOK"))
     discord_heartbeat_webhook: str = field(default_factory=lambda: _env("DISCORD_HEARTBEAT_WEBHOOK"))
     discord_errors_webhook: str = field(default_factory=lambda: _env("DISCORD_ERRORS_WEBHOOK"))
+    discord_attribution_webhook: str = field(default_factory=lambda: _env("DISCORD_ATTRIBUTION_WEBHOOK"))
+    tuning_interval_hours: int = field(
+        default_factory=lambda: _env_int("TUNING_INTERVAL_HOURS", 6)
+    )
     cors_origins: str = field(
         default_factory=lambda: _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
     )

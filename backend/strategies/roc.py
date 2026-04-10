@@ -33,9 +33,11 @@ def evaluate_roc(
     atr_regime: str,
     obi_direction: Direction,
     has_position: bool,
+    overrides: Optional[dict] = None,
 ) -> Direction:
-    """Evaluate ROC signal direction."""
+    """Evaluate ROC signal direction. overrides: optional dict for backtesting."""
     cfg = settings.roc
+    ov = overrides or {}
 
     if has_position:
         return Direction.NEUTRAL
@@ -43,17 +45,24 @@ def evaluate_roc(
     if atr_regime == "LOW":
         return Direction.NEUTRAL
 
-    roc = calculate_roc(closes, cfg.lookback)
+    lookback = ov.get("roc_lookback", cfg.lookback)
+    roc = calculate_roc(closes, lookback)
     if roc is None:
         return Direction.NEUTRAL
 
-    if roc >= cfg.long_threshold and roc <= cfg.max_cap:
-        if candle_direction_count(candles, "up") >= cfg.candle_confirm_min:
+    long_thresh = ov.get("roc_long_threshold", cfg.long_threshold)
+    short_thresh = ov.get("roc_short_threshold", cfg.short_threshold)
+    max_cap = ov.get("roc_max_cap", cfg.max_cap)
+    min_cap = ov.get("roc_min_cap", cfg.min_cap)
+    confirm_min = ov.get("roc_candle_confirm_min", cfg.candle_confirm_min)
+
+    if roc >= long_thresh and roc <= max_cap:
+        if candle_direction_count(candles, "up") >= confirm_min:
             if obi_direction != Direction.SHORT:
                 return Direction.LONG
 
-    if roc <= cfg.short_threshold and roc >= cfg.min_cap:
-        if candle_direction_count(candles, "down") >= cfg.candle_confirm_min:
+    if roc <= short_thresh and roc >= min_cap:
+        if candle_direction_count(candles, "down") >= confirm_min:
             if obi_direction != Direction.LONG:
                 return Direction.SHORT
 
@@ -67,28 +76,35 @@ def check_roc_exit(
     current_roc: Optional[float],
     latest_candle: Optional[dict],
     candles_held: int,
+    overrides: Optional[dict] = None,
 ) -> Optional[str]:
-    """Check ROC-specific exit conditions."""
+    """Check ROC-specific exit conditions. overrides: optional dict for backtesting."""
     cfg = settings.roc
     risk = settings.risk
+    ov = overrides or {}
 
-    if pnl_pct <= -risk.stop_loss_pct:
+    stop_loss = ov.get("stop_loss_pct", risk.stop_loss_pct)
+    profit_mult = ov.get("profit_target_mult", risk.profit_target_mult)
+
+    if pnl_pct <= -stop_loss:
         return "STOP_LOSS"
 
-    if pnl_pct >= risk.stop_loss_pct * risk.profit_target_mult:
+    if pnl_pct >= stop_loss * profit_mult:
         return "TAKE_PROFIT"
 
+    blowoff = ov.get("roc_blowoff_single_candle", cfg.blowoff_single_candle)
     if latest_candle and pnl_pct > 0:
         candle_move = (
             abs(latest_candle["close"] - latest_candle["open"])
             / latest_candle["open"]
             * 100
         )
-        if candle_move >= cfg.blowoff_single_candle:
+        if candle_move >= blowoff:
             return "BLOWOFF_TAKE_PROFIT"
 
+    stall_ratio = ov.get("roc_momentum_stall_ratio", cfg.momentum_stall_ratio)
     if current_roc is not None and entry_roc != 0:
-        if abs(current_roc) < abs(entry_roc) * cfg.momentum_stall_ratio:
+        if abs(current_roc) < abs(entry_roc) * stall_ratio:
             return "MOMENTUM_STALL"
 
     if latest_candle:
@@ -97,7 +113,8 @@ def check_roc_exit(
         if direction == "short" and latest_candle["close"] > latest_candle["open"]:
             return "CANDLE_REVERSAL"
 
-    if candles_held >= cfg.max_candles_in_trade:
+    max_candles = ov.get("roc_max_candles_in_trade", cfg.max_candles_in_trade)
+    if candles_held >= max_candles:
         return "TIME_EXIT"
 
     return None

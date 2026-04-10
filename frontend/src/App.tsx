@@ -9,6 +9,12 @@ import { PnLChart } from './components/PnLChart';
 import { PositionTable } from './components/PositionTable';
 import { SignalPanel } from './components/SignalPanel';
 import { TopBar } from './components/TopBar';
+import { SystemHealth } from './components/SystemHealth';
+import { StatsPanel } from './components/StatsPanel';
+import { BacktestPanel } from './components/BacktestPanel';
+import { AttributionPanel } from './components/AttributionPanel';
+import { BtcPriceChart } from './components/BtcPriceChart';
+import { useDiagnostics } from './hooks/useDiagnostics';
 import type { PnLPoint, Features, MarketState } from './types';
 import './index.css';
 
@@ -45,10 +51,12 @@ function App() {
   const { data: tradesData, loading: tradesLoading } = useTrades(tradesPage);
   const [erroredPage, setErroredPage] = useState(1);
   const { data: erroredData, loading: erroredLoading } = useErroredTrades(erroredPage);
+  const diagnostics = useDiagnostics(10000);
   const [features, setFeatures] = useState<Features | null>(null);
   const [marketState, setMarketState] = useState<MarketState | null>(null);
   const [timeRange, setTimeRange] = useState<'24H' | '1W' | '1M' | 'All'>('All');
   const [chartMode, setChartMode] = useState<ChartMode>('account');
+  const [chartTab, setChartTab] = useState<'equity' | 'btc'>('equity');
 
   useEffect(() => {
     if (!lastMessage || lastMessage.type !== 'market_update') return;
@@ -58,16 +66,27 @@ function App() {
 
   const initialBankroll = stats?.initial_bankroll ?? 1000;
 
-  const equityData: PnLPoint[] = equity?.equity?.map((e) => ({
+  const allEquityData: PnLPoint[] = equity?.equity?.map((e) => ({
     time: e.time,
     value: chartMode === 'pnl' ? e.bankroll - initialBankroll : e.bankroll,
   })) ?? [];
 
   const liveEquity = stats?.equity ?? status?.risk?.bankroll ?? initialBankroll;
-  const livePoint: PnLPoint | null = {
+  const livePoint: PnLPoint = {
     time: Math.floor(Date.now() / 1000),
     value: chartMode === 'pnl' ? liveEquity - initialBankroll : liveEquity,
   };
+
+  const timeRangeCutoffs: Record<string, number> = {
+    '24H': 86400,
+    '1W': 604800,
+    '1M': 2592000,
+  };
+  const cutoffSec = timeRangeCutoffs[timeRange];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const equityData = cutoffSec
+    ? allEquityData.filter((p) => p.time >= nowSec - cutoffSec)
+    : allEquityData;
 
   const chartData: PnLPoint[] = [...equityData, livePoint];
 
@@ -109,16 +128,47 @@ function App() {
             paper={status?.paper ?? null}
             features={mergedFeatures}
             stats={stats ?? null}
+            tradingMode={status?.trading_mode ?? 'paper'}
+            tradingPaused={status?.trading_paused ?? false}
           />
           <main className="flex-1 flex flex-col overflow-hidden">
+            <div className="flex items-center gap-1 px-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setChartTab('equity')}
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  chartTab === 'equity'
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+                }`}
+              >
+                Equity
+              </button>
+              <button
+                type="button"
+                onClick={() => setChartTab('btc')}
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  chartTab === 'btc'
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+                }`}
+              >
+                BTC Price
+              </button>
+            </div>
             <div className="flex-1 min-h-0 p-3">
-              <PnLChart data={chartData} mode={chartMode} />
+              {chartTab === 'equity' ? (
+                <PnLChart data={chartData} mode={chartMode} />
+              ) : (
+                <BtcPriceChart />
+              )}
             </div>
             <SignalPanel
               features={mergedFeatures}
               atr={status?.atr ?? null}
               marketState={mergedMarket}
             />
+            <SystemHealth diagnostics={diagnostics} />
             <PositionTable
               paper={status?.paper ?? null}
               tradesData={tradesData}
@@ -128,6 +178,9 @@ function App() {
               erroredLoading={erroredLoading}
               onErroredPageChange={setErroredPage}
             />
+            <StatsPanel stats={stats ?? null} />
+            <AttributionPanel />
+            <BacktestPanel />
           </main>
         </div>
       </div>

@@ -129,6 +129,76 @@ class KalshiRESTClient:
         return None
 
 
+class KalshiOrderClient:
+    """Kalshi REST client for order placement and portfolio queries."""
+
+    def __init__(self):
+        self.auth = KalshiAuth()
+        self.base_url = settings.kalshi.base_url
+
+    async def create_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str = "buy",
+        count: int = 1,
+        type: str = "market",
+        yes_price: int | None = None,
+        no_price: int | None = None,
+    ) -> dict:
+        """Place an order on Kalshi. side: 'yes'|'no', type: 'market'|'limit'."""
+        path = "/trade-api/v2/portfolio/orders"
+        headers = self.auth.get_headers("POST", path)
+        body = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": type,
+        }
+        if yes_price is not None:
+            body["yes_price"] = yes_price
+        if no_price is not None:
+            body["no_price"] = no_price
+
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as c:
+            r = await c.post("/portfolio/orders", headers=headers, json=body)
+            r.raise_for_status()
+            return r.json()
+
+    async def cancel_order(self, order_id: str) -> dict:
+        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        headers = self.auth.get_headers("DELETE", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.delete(f"/portfolio/orders/{order_id}", headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_order(self, order_id: str) -> dict:
+        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        headers = self.auth.get_headers("GET", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.get(f"/portfolio/orders/{order_id}", headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_positions(self) -> dict:
+        path = "/trade-api/v2/portfolio/positions"
+        headers = self.auth.get_headers("GET", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.get("/portfolio/positions", headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_balance(self) -> dict:
+        path = "/trade-api/v2/portfolio/balance"
+        headers = self.auth.get_headers("GET", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.get("/portfolio/balance", headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+
 class KalshiWebSocketClient:
     def __init__(self, markets: list[str], on_update: Callable[[str, dict], None]):
         self.markets = markets
@@ -139,6 +209,10 @@ class KalshiWebSocketClient:
         self.active_tickers: Dict[str, str] = {}
         self._active_close_times: Dict[str, str] = {}
         self._rest = KalshiRESTClient()
+        self.connected = False
+        self.last_message_time: Optional[float] = None
+        self.message_count = 0
+        self.connect_attempts = 0
 
     async def start(self):
         self._running = True
@@ -166,16 +240,35 @@ class KalshiWebSocketClient:
             else:
                 logger.warning("kalshi.no_active_contract", symbol=symbol)
 
+    def _ws_is_open(self) -> bool:
+        """Check if the WS connection is open (compatible with websockets 14.x)."""
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state is State.OPEN
+        except Exception:
+            return self.connected
+
     async def _refresh_loop(self):
         while self._running:
             await asyncio.sleep(300)
             if not self._running:
                 break
-            old = dict(self.active_tickers)
-            await self._resolve_tickers()
-            changed = {s for s, t in self.active_tickers.items() if old.get(s) != t}
-            if changed and self._ws and not self._ws.closed:
-                await self._subscribe(self._ws)
+            try:
+                old = dict(self.active_tickers)
+                await self._resolve_tickers()
+                changed = {s for s, t in self.active_tickers.items() if old.get(s) != t}
+                if changed and self._ws_is_open():
+                    logger.info("kalshi_ws.ticker_changed", changed=list(changed))
+                    await self._subscribe(self._ws)
+            except Exception as e:
+                logger.error("kalshi_ws.refresh_error", error=str(e))
+                from notifications import get_notifier
+                asyncio.create_task(get_notifier().unhandled_exception(
+                    location="kalshi_ws._refresh_loop",
+                    error=str(e),
+                ))
 
     async def _run_forever(self):
         from notifications import get_notifier
@@ -208,6 +301,7 @@ class KalshiWebSocketClient:
             "KALSHI-ACCESS-TIMESTAMP": ts_ms,
         }
 
+        self.connect_attempts += 1
         async with websockets.connect(
             settings.kalshi.ws_url,
             additional_headers=ws_headers,
@@ -215,15 +309,21 @@ class KalshiWebSocketClient:
             ping_timeout=10,
         ) as ws:
             self._ws = ws
+            self.connected = True
             await self._subscribe(ws)
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    msg = json.loads(raw)
-                    self._handle_message(msg)
-                except json.JSONDecodeError:
-                    pass
+            try:
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                        self.last_message_time = time.time()
+                        self.message_count += 1
+                        self._handle_message(msg)
+                    except json.JSONDecodeError:
+                        pass
+            finally:
+                self.connected = False
 
     async def _subscribe(self, ws):
         tickers = list(self.active_tickers.values())

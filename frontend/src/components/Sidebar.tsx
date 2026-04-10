@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { RiskState, PaperState, Features, CumulativeStats } from '../types';
 
 interface SidebarProps {
@@ -5,9 +6,11 @@ interface SidebarProps {
   paper: PaperState | null;
   features: Features | null;
   stats: CumulativeStats | null;
+  tradingMode?: string;
+  tradingPaused?: boolean;
 }
 
-export function Sidebar({ risk, paper, features, stats }: SidebarProps) {
+export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = false }: SidebarProps) {
   const equity = stats?.equity ?? risk?.bankroll ?? 0;
   const drawdown = risk?.drawdown_pct ?? 0;
   const dailyLoss = risk?.daily_loss_pct ?? 0;
@@ -24,7 +27,21 @@ export function Sidebar({ risk, paper, features, stats }: SidebarProps) {
 
   return (
     <aside className="w-56 border-r border-[var(--border)] bg-[var(--bg-secondary)] flex flex-col p-3 gap-4 overflow-y-auto">
-      <StatBlock label="Equity" value={`$${equity.toLocaleString('en-US', { minimumFractionDigits: 2 })}`} />
+      <div>
+        <div className="flex items-center gap-1.5 mb-0.5">
+          <div className="text-xs text-[var(--text-muted)]">Equity</div>
+          <span className={`text-[9px] font-medium px-1 py-0.5 rounded ${
+            tradingMode === 'live'
+              ? 'bg-amber-900/30 text-amber-400'
+              : 'bg-blue-900/30 text-blue-400'
+          }`}>
+            {tradingMode === 'live' ? 'LIVE' : 'PAPER'}
+          </span>
+        </div>
+        <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+          ${equity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+        </div>
+      </div>
 
       <div>
         <div className="flex justify-between text-xs mb-1">
@@ -71,18 +88,132 @@ export function Sidebar({ risk, paper, features, stats }: SidebarProps) {
       <StatBlock label="Trades Today" value={String(risk?.trades_today ?? 0)} />
       <StatBlock label="Total Trades" value={String(stats?.total_trades ?? paper?.total_trades ?? 0)} />
 
-      <div className="mt-auto">
-        <div
-          className={`text-xs font-medium px-2 py-1 rounded text-center ${
-            canTrade
-              ? 'bg-[var(--green-dim)] text-[var(--green)]'
-              : 'bg-[var(--red-dim)] text-[var(--red)]'
-          }`}
-        >
-          {canTrade ? 'TRADING ACTIVE' : risk?.halt_reason ?? 'HALTED'}
-        </div>
+      <div className="mt-auto flex flex-col gap-2">
+        <TradingModeToggle currentMode={tradingMode} hasPosition={paper?.has_position ?? false} />
+        <TradingActiveToggle canTrade={canTrade} paused={tradingPaused} haltReason={risk?.halt_reason ?? null} />
       </div>
     </aside>
+  );
+}
+
+function TradingModeToggle({ currentMode, hasPosition }: { currentMode: string; hasPosition: boolean }) {
+  const [confirming, setConfirming] = useState(false);
+  const [switching, setSwitching] = useState(false);
+  const isLive = currentMode === 'live';
+
+  const handleToggle = async () => {
+    const targetMode = isLive ? 'paper' : 'live';
+
+    if (targetMode === 'live' && !confirming) {
+      setConfirming(true);
+      return;
+    }
+
+    setSwitching(true);
+    try {
+      const res = await fetch('/api/trading-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: targetMode, confirm: true }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(data.error || 'Failed to switch mode');
+      }
+    } catch {
+      alert('Failed to switch trading mode');
+    } finally {
+      setSwitching(false);
+      setConfirming(false);
+    }
+  };
+
+  if (confirming) {
+    return (
+      <div className="bg-[var(--bg-tertiary)] border border-[var(--red)] rounded p-2 text-xs">
+        <div className="text-[var(--red)] font-medium mb-1">Switch to LIVE trading?</div>
+        <div className="text-[var(--text-muted)] mb-2">This will use real funds from your Kalshi wallet.</div>
+        <div className="flex gap-2">
+          <button
+            onClick={handleToggle}
+            disabled={switching || hasPosition}
+            className="flex-1 px-2 py-1 bg-[var(--red)] text-white rounded text-xs font-medium disabled:opacity-50"
+          >
+            {switching ? '...' : 'Confirm'}
+          </button>
+          <button
+            onClick={() => setConfirming(false)}
+            className="flex-1 px-2 py-1 bg-[var(--bg-secondary)] text-[var(--text-secondary)] rounded text-xs"
+          >
+            Cancel
+          </button>
+        </div>
+        {hasPosition && (
+          <div className="text-[var(--red)] mt-1">Close position first</div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={handleToggle}
+      disabled={switching || hasPosition}
+      className={`w-full text-xs font-medium px-2 py-1.5 rounded text-center transition-colors disabled:opacity-50 ${
+        isLive
+          ? 'bg-amber-900/30 text-amber-400 border border-amber-700/50'
+          : 'bg-blue-900/30 text-blue-400 border border-blue-700/50'
+      }`}
+    >
+      {switching ? 'Switching...' : isLive ? 'LIVE TRADING' : 'PAPER TRADING'}
+    </button>
+  );
+}
+
+function TradingActiveToggle({ canTrade, paused, haltReason }: { canTrade: boolean; paused: boolean; haltReason: string | null }) {
+  const [toggling, setToggling] = useState(false);
+
+  const effectivelyActive = canTrade && !paused;
+
+  const handleToggle = async () => {
+    setToggling(true);
+    try {
+      const res = await fetch('/api/trading-pause', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: !paused }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(data.error || 'Failed to toggle trading');
+      }
+    } catch {
+      alert('Failed to toggle trading');
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  const label = !canTrade
+    ? haltReason ?? 'HALTED'
+    : paused
+      ? 'TRADING PAUSED'
+      : 'TRADING ACTIVE';
+
+  return (
+    <button
+      type="button"
+      onClick={handleToggle}
+      disabled={toggling || !canTrade}
+      className={`w-full text-xs font-medium px-2 py-1.5 rounded text-center transition-colors cursor-pointer disabled:cursor-not-allowed ${
+        effectivelyActive
+          ? 'bg-[var(--green-dim)] text-[var(--green)] hover:bg-[var(--green)]/20'
+          : 'bg-[var(--red-dim)] text-[var(--red)] hover:bg-[var(--red)]/20'
+      }`}
+      title={effectivelyActive ? 'Click to pause trading' : paused ? 'Click to resume trading' : 'Circuit breaker halted'}
+    >
+      {toggling ? 'Switching...' : label}
+    </button>
   );
 }
 

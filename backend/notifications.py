@@ -1,12 +1,13 @@
 """
-Discord webhook notifier — sends rich embeds across four channels.
+Discord webhook notifier — sends rich embeds across five channels.
 
-Trades channel:    trade_opened, trade_closed
-Risk channel:      circuit_breaker_tripped, circuit_breaker_cleared,
-                   position_sizing_failed, atr_regime_changed
-Heartbeat channel: heartbeat_ping, periodic_summary, daily_summary
-Errors channel:    bot_started, bot_stopped, ws_disconnected,
-                   db_error, unhandled_exception
+Trades channel:       trade_opened, trade_closed
+Risk channel:         circuit_breaker_tripped, circuit_breaker_cleared,
+                      position_sizing_failed, atr_regime_changed
+Heartbeat channel:    heartbeat_ping, periodic_summary, daily_summary
+Errors channel:       bot_started, bot_stopped, ws_disconnected,
+                      db_error, unhandled_exception
+Attribution channel:  daily_attribution, weekly_digest
 
 Silently no-ops when webhook_url is empty so the bot works without Discord.
 """
@@ -95,7 +96,7 @@ def _retry_after(resp: httpx.Response) -> float:
 
 
 class DiscordNotifier:
-    """Posts rich Discord embeds to four webhook URLs (trades, risk, heartbeat, errors)."""
+    """Posts rich Discord embeds to five webhook URLs (trades, risk, heartbeat, errors, attribution)."""
 
     def __init__(
         self,
@@ -103,16 +104,18 @@ class DiscordNotifier:
         risk_url: str = "",
         heartbeat_url: str = "",
         errors_url: str = "",
+        attribution_url: str = "",
     ):
         self._trades_url = _clean_url(trades_url)
         self._risk_url = _clean_url(risk_url)
         self._heartbeat_url = _clean_url(heartbeat_url)
         self._errors_url = _clean_url(errors_url)
+        self._attribution_url = _clean_url(attribution_url)
         self._post_lock = asyncio.Lock()
 
     @property
     def is_configured(self) -> bool:
-        return bool(self._trades_url or self._risk_url or self._heartbeat_url or self._errors_url)
+        return bool(self._trades_url or self._risk_url or self._heartbeat_url or self._errors_url or self._attribution_url)
 
     # ── Transport ──────────────────────────────────────────────────────────────
 
@@ -445,6 +448,106 @@ class DiscordNotifier:
         }
         await self._post(self._errors_url, embed)
 
+    # ── #kbtc-attribution ──────────────────────────────────────────────────────
+
+    async def daily_attribution_report(self, date_str: str, attr: dict) -> None:
+        total_pnl = attr.get("total_pnl_dollars", 0)
+        total_trades = attr.get("total_trades", 0)
+        color = COLOR_GREEN if total_pnl >= 0 else COLOR_RED
+        pnl_str = f"{'+'if total_pnl >= 0 else ''}${total_pnl:.2f}"
+
+        fields = [
+            {"name": "Trades", "value": str(total_trades), "inline": True},
+            {"name": "Net PnL", "value": pnl_str, "inline": True},
+        ]
+
+        sig = attr.get("signal_attribution", {})
+        for conviction in ("HIGH", "NORMAL", "LOW"):
+            if conviction in sig:
+                s = sig[conviction]
+                fields.append({
+                    "name": f"{conviction} Conviction",
+                    "value": f"{s['trades']} trades | WR {s['win_rate']:.0%} | ${s['pnl_dollars']:+.2f}",
+                    "inline": False,
+                })
+
+        session = attr.get("session_attribution", {})
+        if session:
+            lines = []
+            for sname, sdata in session.items():
+                pnl_s = sdata.get("pnl_dollars", 0)
+                marker = "+" if pnl_s >= 0 else ""
+                lines.append(f"{sname}: {marker}${pnl_s:.2f} ({sdata.get('trades', 0)}t)")
+            fields.append({"name": "Sessions", "value": "\n".join(lines), "inline": False})
+
+        exe = attr.get("execution_attribution", {})
+        fee_pct = exe.get("fees_as_pct_of_gross", 0)
+        if exe:
+            fields.append({
+                "name": "Fee Drag",
+                "value": f"${exe.get('total_fees_dollars', 0):.2f} ({fee_pct:.1f}% of gross)",
+                "inline": True,
+            })
+
+        embed = {
+            "title": f"\U0001f4ca Daily Attribution \u2014 {date_str}",
+            "color": color,
+            "fields": fields,
+            "footer": self._footer(),
+        }
+        await self._post(self._attribution_url, embed)
+
+    async def weekly_digest(
+        self,
+        week_start: str,
+        week_end: str,
+        total_pnl: float,
+        total_trades: int,
+        conviction_breakdown: dict,
+        regime_breakdown: dict,
+        session_breakdown: dict,
+        fee_drag_pct: float,
+        flipped_sessions: list[str],
+        flipped_regimes: list[str],
+    ) -> None:
+        color = COLOR_GREEN if total_pnl >= 0 else COLOR_RED
+        pnl_str = f"{'+'if total_pnl >= 0 else ''}${total_pnl:.2f}"
+
+        fields = [
+            {"name": "Period", "value": f"{week_start} \u2192 {week_end}", "inline": False},
+            {"name": "Trades", "value": str(total_trades), "inline": True},
+            {"name": "Net PnL", "value": pnl_str, "inline": True},
+            {"name": "Fee Drag", "value": f"{fee_drag_pct:.1f}% of gross", "inline": True},
+        ]
+
+        if conviction_breakdown:
+            lines = [f"{k}: ${v:+.2f}" for k, v in conviction_breakdown.items()]
+            fields.append({"name": "PnL by Conviction", "value": "\n".join(lines), "inline": True})
+
+        if regime_breakdown:
+            lines = [f"{k}: ${v:+.2f}" for k, v in regime_breakdown.items()]
+            fields.append({"name": "PnL by Regime", "value": "\n".join(lines), "inline": True})
+
+        if session_breakdown:
+            lines = [f"{k}: ${v:+.2f}" for k, v in session_breakdown.items()]
+            fields.append({"name": "PnL by Session", "value": "\n".join(lines), "inline": True})
+
+        alerts: list[str] = []
+        if flipped_sessions:
+            alerts.append(f"Sessions flipped unprofitable: {', '.join(flipped_sessions)}")
+        if flipped_regimes:
+            alerts.append(f"Regimes flipped unprofitable: {', '.join(flipped_regimes)}")
+        if alerts:
+            fields.append({"name": "\u26a0\ufe0f Drift Alerts", "value": "\n".join(alerts), "inline": False})
+
+        embed = {
+            "title": f"\U0001f4c5 Weekly Attribution Digest",
+            "color": color,
+            "fields": fields,
+            "footer": self._footer(),
+        }
+        await self._post(self._attribution_url, embed)
+
 
 # Singleton, initialized lazily by main.py lifespan
 _notifier: Optional[DiscordNotifier] = None
@@ -459,6 +562,7 @@ def get_notifier() -> DiscordNotifier:
             risk_url=settings.bot.discord_risk_webhook,
             heartbeat_url=settings.bot.discord_heartbeat_webhook,
             errors_url=settings.bot.discord_errors_webhook,
+            attribution_url=settings.bot.discord_attribution_webhook,
         )
     return _notifier
 
@@ -472,5 +576,6 @@ def init_notifier() -> DiscordNotifier:
         risk_url=settings.bot.discord_risk_webhook,
         heartbeat_url=settings.bot.discord_heartbeat_webhook,
         errors_url=settings.bot.discord_errors_webhook,
+        attribution_url=settings.bot.discord_attribution_webhook,
     )
     return _notifier

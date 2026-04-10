@@ -8,15 +8,17 @@ import csv
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-
 MIN_CANDLES = 2000
 RECOMMENDED_CANDLES = 17520
 IDEAL_CANDLES = 35040
 
 
 def load_candles_csv(path: str | Path) -> list[dict]:
-    """Load 15m candles from a CSV file (Binance format)."""
+    """Load 15m candles from a CSV file (Binance format).
+
+    Binance CSVs use millisecond timestamps; this normalizes to seconds so
+    downstream gap detection (900 s) and OB snapshot lookup work correctly.
+    """
     candles = []
     with open(path) as f:
         reader = csv.reader(f)
@@ -24,9 +26,12 @@ def load_candles_csv(path: str | Path) -> list[dict]:
             if len(row) < 6:
                 continue
             try:
+                ts = float(row[0])
+                if ts > 1e12:
+                    ts /= 1000.0
                 candles.append(
                     {
-                        "timestamp": float(row[0]),
+                        "timestamp": ts,
                         "open": float(row[1]),
                         "high": float(row[2]),
                         "low": float(row[3]),
@@ -41,15 +46,22 @@ def load_candles_csv(path: str | Path) -> list[dict]:
 
 async def load_candles_db(pool, symbol: str = "BTCUSDT", source: str = "binance",
                           limit: int = IDEAL_CANDLES) -> list[dict]:
-    """Load candles from TimescaleDB."""
+    """Load candles from TimescaleDB.
+
+    ``source`` may be a single value or comma-separated list
+    (e.g. ``"live_spot,binance"``).
+    """
+    sources = [s.strip() for s in source.split(",")]
+    placeholders = ",".join(["%s"] * len(sources))
+    params: list = [symbol, *sources, limit]
     async with pool.connection() as conn:
         rows = await conn.execute(
-            """SELECT timestamp, open, high, low, close, volume
+            f"""SELECT timestamp, open, high, low, close, volume
                FROM candles
-               WHERE symbol = %s AND source = %s
+               WHERE symbol = %s AND source IN ({placeholders})
                ORDER BY timestamp ASC
                LIMIT %s""",
-            (symbol, source, limit),
+            params,
         )
         result = await rows.fetchall()
         return [
@@ -68,7 +80,7 @@ async def load_candles_db(pool, symbol: str = "BTCUSDT", source: str = "binance"
 async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
                                 limit: int = 100000) -> dict[float, dict]:
     """Load OB snapshots keyed by timestamp for backtest lookup."""
-    query = "SELECT timestamp, bids, asks, obi FROM ob_snapshots"
+    query = "SELECT timestamp, bids, asks, obi, total_bid_vol, total_ask_vol FROM ob_snapshots"
     params: list = []
     if ticker:
         query += " WHERE ticker = %s"
@@ -80,7 +92,13 @@ async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
         rows = await conn.execute(query, params)
         result = await rows.fetchall()
         return {
-            r[0].timestamp(): {"bids": r[1], "asks": r[2], "obi": float(r[3]) if r[3] else 0.5}
+            r[0].timestamp(): {
+                "bids": r[1],
+                "asks": r[2],
+                "obi": float(r[3]) if r[3] else 0.5,
+                "total_bid_vol": float(r[4]) if r[4] else 0,
+                "total_ask_vol": float(r[5]) if r[5] else 0,
+            }
             for r in result
         }
 
@@ -107,3 +125,26 @@ def validate_candles(candles: list[dict]) -> dict:
         else 0,
         "sufficient": n >= RECOMMENDED_CANDLES,
     }
+
+
+async def export_ob_to_csv(pool, output_path: str | Path, limit: int = 100000) -> int:
+    """Export OB snapshots from the DB to CSV for offline backtesting.
+
+    Returns the number of rows exported.
+    """
+    snapshots = await load_ob_snapshots_db(pool, limit=limit)
+    if not snapshots:
+        return 0
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "obi", "total_bid_vol", "total_ask_vol"])
+        for ts, snap in sorted(snapshots.items()):
+            writer.writerow([
+                ts,
+                snap.get("obi", 0.5),
+                snap.get("total_bid_vol", 0),
+                snap.get("total_ask_vol", 0),
+            ])
+
+    return len(snapshots)

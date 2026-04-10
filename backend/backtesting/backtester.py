@@ -7,9 +7,9 @@ from __future__ import annotations
 from typing import Optional
 
 from filters.atr_regime import ATRRegimeFilter
-from strategies.obi import evaluate_obi, check_obi_exit, Direction
-from strategies.roc import evaluate_roc, calculate_roc
-from strategies.resolver import SignalConflictResolver, Conviction
+from strategies.obi import evaluate_obi, check_obi_exit
+from strategies.roc import evaluate_roc, calculate_roc, check_roc_exit
+from strategies.resolver import SignalConflictResolver
 from backtesting.metrics import compute_metrics
 from config import settings
 
@@ -24,6 +24,7 @@ class Backtester:
         self.config = config or {}
         self.trades: list[dict] = []
         self.equity_curve: list[float] = []
+        self.signal_log: list[dict] = []
 
     def run(self, bankroll: float = 10000.0) -> dict:
         atr_filter = ATRRegimeFilter()
@@ -34,6 +35,7 @@ class Backtester:
 
         risk_pct = self.config.get("risk_per_trade_pct", settings.risk.risk_per_trade_pct)
         stop_loss = self.config.get("stop_loss_pct", settings.risk.stop_loss_pct)
+        overrides = self.config
 
         closes: list[float] = []
 
@@ -49,35 +51,73 @@ class Backtester:
                 pnl_pct = self._calc_pnl_pct(position, candle["close"])
                 position["candles_held"] += 1
 
+                if pnl_pct <= -stop_loss:
+                    self._close_position(position, candle, "STOP_LOSS", current_bankroll)
+                    current_bankroll = self.equity_curve[-1]
+                    position = None
+                    continue
+
                 exit_reason = check_obi_exit(
                     position["direction"], obi_val, pnl_pct,
                     position["candles_held"], regime,
+                    overrides=overrides,
                 )
+                if not exit_reason:
+                    current_roc = calculate_roc(closes, self.config.get("roc_lookback", settings.roc.lookback))
+                    exit_reason = check_roc_exit(
+                        position["direction"], pnl_pct,
+                        position["roc"], current_roc,
+                        candle, position["candles_held"],
+                        overrides=overrides,
+                    )
                 if exit_reason:
                     self._close_position(position, candle, exit_reason, current_bankroll)
                     current_bankroll = self.equity_curve[-1]
                     position = None
+                    continue
 
-            if position is None and ob:
-                total_vol = sum(b.get("size", 0) for b in ob.get("bids", [])) + \
-                            sum(a.get("size", 0) for a in ob.get("asks", []))
+            if position is None:
+                if ob:
+                    total_vol = ob.get("total_bid_vol", 0) + ob.get("total_ask_vol", 0)
+                    if total_vol == 0:
+                        total_vol = sum(b.get("size", 0) for b in ob.get("bids", [])) + \
+                                    sum(a.get("size", 0) for a in ob.get("asks", []))
+                else:
+                    total_vol = candle.get("volume", 1000)
 
                 obi_dir = evaluate_obi(
                     obi_history, total_vol, regime, False,
+                    overrides=overrides,
                 )
 
                 candle_dicts = self.candles[max(0, i - 5) : i + 1]
                 roc_dir = evaluate_roc(
                     closes, candle_dicts, regime, obi_dir, False,
+                    overrides=overrides,
                 )
 
                 decision = resolver.resolve(obi_dir, roc_dir, regime, True)
 
+                self.signal_log.append({
+                    "timestamp": candle["timestamp"],
+                    "obi": obi_val,
+                    "obi_dir": obi_dir.value,
+                    "roc_dir": roc_dir.value,
+                    "decision": decision.direction.value if decision.direction else None,
+                    "conviction": decision.conviction.value,
+                    "regime": regime,
+                    "skip_reason": decision.skip_reason,
+                })
+
                 if decision.should_trade:
                     risk_amount = current_bankroll * risk_pct
                     entry_price = candle["close"]
-                    contracts = int(risk_amount / (entry_price / 100)) if entry_price > 0 else 0
+                    if entry_price > 100:
+                        contracts = max(1, int(risk_amount / entry_price * 100))
+                    else:
+                        contracts = int(risk_amount / (entry_price / 100)) if entry_price > 0 else 0
                     if contracts >= 1:
+                        lookback = self.config.get("roc_lookback", settings.roc.lookback)
                         position = {
                             "direction": decision.direction.value,
                             "entry_price": entry_price,
@@ -88,7 +128,7 @@ class Backtester:
                             "regime": regime,
                             "candles_held": 0,
                             "obi": obi_val,
-                            "roc": calculate_roc(closes, settings.roc.lookback) or 0,
+                            "roc": calculate_roc(closes, lookback) or 0,
                         }
 
             self.equity_curve.append(current_bankroll)
