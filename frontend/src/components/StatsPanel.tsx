@@ -3,6 +3,7 @@ import type { CumulativeStats } from '../types';
 
 interface StatsPanelProps {
   stats: CumulativeStats | null;
+  tradingMode?: string;
 }
 
 interface DailyStatRow {
@@ -40,7 +41,7 @@ function formatPct(rate: number): string {
   return `${pct.toFixed(1)}%`;
 }
 
-export function StatsPanel({ stats }: StatsPanelProps) {
+export function StatsPanel({ stats, tradingMode }: StatsPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const [daily, setDaily] = useState<DailyStatRow[]>([]);
   const [regimes, setRegimes] = useState<RegimeStatRow[]>([]);
@@ -48,11 +49,12 @@ export function StatsPanel({ stats }: StatsPanelProps) {
 
   useEffect(() => {
     let cancelled = false;
+    const modeParam = tradingMode ? `?mode=${tradingMode}` : '';
     (async () => {
       try {
         const [dRes, rRes] = await Promise.all([
-          fetch('/api/stats/daily'),
-          fetch('/api/stats/by-regime'),
+          fetch(`/api/stats/daily${modeParam}`),
+          fetch(`/api/stats/by-regime${modeParam}`),
         ]);
         if (cancelled) return;
         if (dRes.ok) {
@@ -71,7 +73,7 @@ export function StatsPanel({ stats }: StatsPanelProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [tradingMode]);
 
   const best = stats?.best_trade;
   const worst = stats?.worst_trade;

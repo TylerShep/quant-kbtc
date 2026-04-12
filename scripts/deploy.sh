@@ -3,10 +3,54 @@ set -euo pipefail
 
 # Deploy KBTC bot to DigitalOcean droplet
 # Usage: ./scripts/deploy.sh [user@host]
+#        ./scripts/deploy.sh --force          # skip safety check
 
-REMOTE="${1:-botuser@64.23.133.157}"
 PROJECT_DIR="/home/botuser/kbtc"
+FORCE=false
+REMOTE="botuser@64.23.133.157"
 
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    *@*)     REMOTE="$arg" ;;
+  esac
+done
+
+# ── Pre-deploy safety check ──────────────────────────────────────────────
+echo "=== Pre-deploy safety check ==="
+
+DEPLOY_CHECK=$(ssh "${REMOTE}" "curl -sf http://localhost:8000/api/deploy-check 2>/dev/null" || echo "UNREACHABLE")
+
+if [[ "$DEPLOY_CHECK" == "UNREACHABLE" ]]; then
+  echo "  Bot is not running or unreachable — safe to deploy (cold start)."
+else
+  SAFE=$(echo "$DEPLOY_CHECK" | python3 -c "import sys,json; print(json.load(sys.stdin).get('safe_to_deploy', False))" 2>/dev/null || echo "False")
+  MESSAGE=$(echo "$DEPLOY_CHECK" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message', 'unknown'))" 2>/dev/null || echo "unknown")
+
+  if [[ "$SAFE" == "True" ]]; then
+    echo "  $MESSAGE"
+  else
+    echo ""
+    echo "  DEPLOY BLOCKED: $MESSAGE"
+    echo ""
+    echo "  The bot has open live positions or resting orders on Kalshi."
+    echo "  Restarting now would orphan these positions."
+    echo ""
+    echo "  Options:"
+    echo "    1. Wait for positions to settle, then re-run deploy"
+    echo "    2. Pause live trading in the dashboard and wait for settling"
+    echo "    3. Run with --force to skip this check (NOT recommended)"
+    echo ""
+
+    if [[ "$FORCE" == "true" ]]; then
+      echo "  --force flag set, proceeding anyway..."
+    else
+      exit 1
+    fi
+  fi
+fi
+
+# ── Sync files ───────────────────────────────────────────────────────────
 echo "=== Deploying KBTC to ${REMOTE} ==="
 
 rsync -avz --progress \

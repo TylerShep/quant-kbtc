@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import type { PaperState, DBTrade, TradesResponse, ErroredTrade, ErroredTradesResponse } from '../types';
+import type { PaperState, DBTrade, TradesResponse, ErroredTrade, ErroredTradesResponse, OrphanedPosition } from '../types';
 
 interface PositionTableProps {
   paper: PaperState | null;
+  orphanedPositions: OrphanedPosition[];
   tradesData: TradesResponse | null;
   tradesLoading: boolean;
   onPageChange: (page: number) => void;
@@ -20,11 +21,12 @@ const TAB_LABELS: Record<Tab, string> = {
 };
 
 export function PositionTable({
-  paper, tradesData, tradesLoading, onPageChange,
+  paper, orphanedPositions, tradesData, tradesLoading, onPageChange,
   erroredData, erroredLoading, onErroredPageChange,
 }: PositionTableProps) {
   const [activeTab, setActiveTab] = useState<Tab>('trades');
   const erroredCount = erroredData?.total ?? 0;
+  const positionCount = (paper?.position ? 1 : 0) + orphanedPositions.length;
 
   return (
     <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)]">
@@ -40,6 +42,11 @@ export function PositionTable({
             }`}
           >
             {TAB_LABELS[tab]}
+            {tab === 'positions' && positionCount > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[var(--accent-dim,rgba(59,130,246,0.15))] text-[var(--accent)]">
+                {positionCount}
+              </span>
+            )}
             {tab === 'errored' && erroredCount > 0 && (
               <span className="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[var(--red-dim)] text-[var(--red)]">
                 {erroredCount}
@@ -54,7 +61,7 @@ export function PositionTable({
 
       <div className="overflow-x-auto" style={{ maxHeight: '260px' }}>
         {activeTab === 'positions' ? (
-          <PositionsView position={paper?.position ?? null} />
+          <PositionsView position={paper?.position ?? null} orphanedPositions={orphanedPositions} />
         ) : activeTab === 'errored' ? (
           <ErroredTradesView
             data={erroredData}
@@ -73,8 +80,11 @@ export function PositionTable({
   );
 }
 
-function PositionsView({ position }: { position: PaperState['position'] }) {
-  if (!position) {
+function PositionsView({ position, orphanedPositions }: {
+  position: PaperState['position'];
+  orphanedPositions: OrphanedPosition[];
+}) {
+  if (!position && orphanedPositions.length === 0) {
     return (
       <div className="text-center py-6 text-xs text-[var(--text-muted)]">
         No open positions
@@ -86,7 +96,8 @@ function PositionsView({ position }: { position: PaperState['position'] }) {
     <table className="w-full text-xs">
       <thead>
         <tr className="text-[var(--text-muted)]">
-          <th className="text-left px-4 py-2 font-normal">Asset</th>
+          <th className="text-left px-4 py-2 font-normal">Ticker</th>
+          <th className="text-left px-4 py-2 font-normal">Status</th>
           <th className="text-left px-4 py-2 font-normal">Type</th>
           <th className="text-right px-4 py-2 font-normal">Contracts</th>
           <th className="text-right px-4 py-2 font-normal">Entry Price</th>
@@ -95,18 +106,46 @@ function PositionsView({ position }: { position: PaperState['position'] }) {
         </tr>
       </thead>
       <tbody>
-        <tr className="border-t border-[var(--border)]">
-          <td className="px-4 py-2 font-medium">BTC</td>
-          <td className="px-4 py-2">
-            <DirectionBadge direction={position.direction} />
-          </td>
-          <td className="px-4 py-2 text-right font-mono">{position.contracts}</td>
-          <td className="px-4 py-2 text-right font-mono">{position.entry_price}c</td>
-          <td className="px-4 py-2 text-right font-mono">{position.candles_held}</td>
-          <td className="px-4 py-2 text-right">
-            <ConvictionBadge conviction={position.conviction} />
-          </td>
-        </tr>
+        {position && (
+          <tr className="border-t border-[var(--border)]">
+            <td className="px-4 py-2 font-mono text-[var(--accent)]">{position.ticker}</td>
+            <td className="px-4 py-2">
+              <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-[var(--green-dim)] text-[var(--green)]">
+                ACTIVE
+              </span>
+            </td>
+            <td className="px-4 py-2">
+              <DirectionBadge direction={position.direction} />
+            </td>
+            <td className="px-4 py-2 text-right font-mono">{position.contracts}</td>
+            <td className="px-4 py-2 text-right font-mono">{position.entry_price}c</td>
+            <td className="px-4 py-2 text-right font-mono">{position.candles_held}</td>
+            <td className="px-4 py-2 text-right">
+              <ConvictionBadge conviction={position.conviction} />
+            </td>
+          </tr>
+        )}
+        {orphanedPositions.map((o) => (
+          <tr key={o.ticker} className="border-t border-[var(--border)] opacity-70">
+            <td className="px-4 py-2 font-mono text-[var(--yellow,#eab308)]">{o.ticker}</td>
+            <td className="px-4 py-2">
+              <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-[var(--yellow-dim,rgba(234,179,8,0.15))] text-[var(--yellow,#eab308)]">
+                ORPHAN
+              </span>
+            </td>
+            <td className="px-4 py-2">
+              <DirectionBadge direction={o.direction} />
+            </td>
+            <td className="px-4 py-2 text-right font-mono">{o.contracts}</td>
+            <td className="px-4 py-2 text-right font-mono">{o.avg_entry_price}c</td>
+            <td className="px-4 py-2 text-right font-mono text-[var(--text-muted)]">-</td>
+            <td className="px-4 py-2 text-right text-[var(--text-muted)] text-[10px]">
+              {new Date(o.detected_at).toLocaleTimeString(undefined, {
+                hour: '2-digit', minute: '2-digit'
+              })}
+            </td>
+          </tr>
+        ))}
       </tbody>
     </table>
   );

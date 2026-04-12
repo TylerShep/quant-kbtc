@@ -105,17 +105,19 @@ class DiscordNotifier:
         heartbeat_url: str = "",
         errors_url: str = "",
         attribution_url: str = "",
+        live_trades_url: str = "",
     ):
         self._trades_url = _clean_url(trades_url)
         self._risk_url = _clean_url(risk_url)
         self._heartbeat_url = _clean_url(heartbeat_url)
         self._errors_url = _clean_url(errors_url)
         self._attribution_url = _clean_url(attribution_url)
+        self._live_trades_url = _clean_url(live_trades_url)
         self._post_lock = asyncio.Lock()
 
     @property
     def is_configured(self) -> bool:
-        return bool(self._trades_url or self._risk_url or self._heartbeat_url or self._errors_url or self._attribution_url)
+        return bool(self._trades_url or self._risk_url or self._heartbeat_url or self._errors_url or self._attribution_url or self._live_trades_url)
 
     # ── Transport ──────────────────────────────────────────────────────────────
 
@@ -154,10 +156,12 @@ class DiscordNotifier:
         conviction: str,
         obi: float = 0.0,
         roc: float = 0.0,
+        mode: str = "paper",
     ) -> None:
+        mode_badge = "[LIVE]" if mode == "live" else "[PAPER]"
         side_icon = "\U0001f53c LONG (YES)" if direction == "long" else "\U0001f53d SHORT (NO)"
         embed = {
-            "title": f"\U0001f4c8 Trade Opened \u2014 {ticker}",
+            "title": f"\U0001f4c8 {mode_badge} Trade Opened \u2014 {ticker}",
             "color": COLOR_BLUE,
             "fields": [
                 {"name": "Side", "value": side_icon, "inline": True},
@@ -170,6 +174,8 @@ class DiscordNotifier:
             "footer": self._footer(),
         }
         await self._post(self._trades_url, embed)
+        if mode == "live" and self._live_trades_url:
+            await self._post(self._live_trades_url, embed)
 
     async def trade_closed(
         self,
@@ -183,12 +189,14 @@ class DiscordNotifier:
         exit_reason: str,
         candles_held: int,
         bankroll: float,
+        mode: str = "paper",
     ) -> None:
+        mode_badge = "[LIVE]" if mode == "live" else "[PAPER]"
         won = pnl >= 0
         icon = "\u2705" if won else "\u274c"
         pnl_str = f"{'+'if pnl >= 0 else ''}${pnl:.4f}"
         embed = {
-            "title": f"{icon} Trade Closed \u2014 {ticker}",
+            "title": f"{icon} {mode_badge} Trade Closed \u2014 {ticker}",
             "color": COLOR_GREEN if won else COLOR_RED,
             "fields": [
                 {"name": "Direction", "value": direction.upper(), "inline": True},
@@ -204,6 +212,8 @@ class DiscordNotifier:
             "footer": self._footer(),
         }
         await self._post(self._trades_url, embed)
+        if mode == "live" and self._live_trades_url:
+            await self._post(self._live_trades_url, embed)
 
     # ── #kbtc-risk ─────────────────────────────────────────────────────────────
 
@@ -563,6 +573,7 @@ def get_notifier() -> DiscordNotifier:
             heartbeat_url=settings.bot.discord_heartbeat_webhook,
             errors_url=settings.bot.discord_errors_webhook,
             attribution_url=settings.bot.discord_attribution_webhook,
+            live_trades_url=settings.bot.discord_live_trades_webhook,
         )
     return _notifier
 
@@ -577,5 +588,6 @@ def init_notifier() -> DiscordNotifier:
         heartbeat_url=settings.bot.discord_heartbeat_webhook,
         errors_url=settings.bot.discord_errors_webhook,
         attribution_url=settings.bot.discord_attribution_webhook,
+        live_trades_url=settings.bot.discord_live_trades_webhook,
     )
     return _notifier

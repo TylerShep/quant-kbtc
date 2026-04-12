@@ -42,13 +42,16 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
 }
 
 export type ChartMode = 'pnl' | 'account';
+export type ViewMode = 'paper' | 'live';
 
 function App() {
   const { lastMessage, connected } = useWebSocket();
   const status = useStatus(5000);
-  const { equity, stats } = useEquity();
+  const tradingMode = status?.trading_mode;
+  const [viewMode, setViewMode] = useState<ViewMode>('paper');
+  const { equity, stats } = useEquity(viewMode);
   const [tradesPage, setTradesPage] = useState(1);
-  const { data: tradesData, loading: tradesLoading } = useTrades(tradesPage);
+  const { data: tradesData, loading: tradesLoading } = useTrades(tradesPage, 10, viewMode);
   const [erroredPage, setErroredPage] = useState(1);
   const { data: erroredData, loading: erroredLoading } = useErroredTrades(erroredPage);
   const diagnostics = useDiagnostics(10000);
@@ -57,6 +60,18 @@ function App() {
   const [timeRange, setTimeRange] = useState<'24H' | '1W' | '1M' | 'All'>('All');
   const [chartMode, setChartMode] = useState<ChartMode>('account');
   const [chartTab, setChartTab] = useState<'equity' | 'btc'>('equity');
+
+  // Sync viewMode to tradingMode when it changes (default view follows active mode)
+  useEffect(() => {
+    if (tradingMode === 'live' || tradingMode === 'paper') {
+      setViewMode(tradingMode as ViewMode);
+    }
+  }, [tradingMode]);
+
+  // Reset trades page when switching viewMode
+  useEffect(() => {
+    setTradesPage(1);
+  }, [viewMode]);
 
   useEffect(() => {
     if (!lastMessage || lastMessage.type !== 'market_update') return;
@@ -71,7 +86,7 @@ function App() {
     value: chartMode === 'pnl' ? e.bankroll - initialBankroll : e.bankroll,
   })) ?? [];
 
-  const liveEquity = stats?.equity ?? status?.risk?.bankroll ?? initialBankroll;
+  const liveEquity = stats?.equity ?? initialBankroll;
   const livePoint: PnLPoint = {
     time: Math.floor(Date.now() / 1000),
     value: chartMode === 'pnl' ? liveEquity - initialBankroll : liveEquity,
@@ -112,6 +127,9 @@ function App() {
     mid_price: statusMarket.mid,
   } : null);
 
+  const viewTraderState = viewMode === 'live' ? status?.live : status?.paper;
+  const viewRisk = viewMode === 'live' ? (status?.live_risk ?? status?.risk) : (status?.paper_risk ?? status?.risk);
+
   return (
     <ErrorBoundary>
       <div className="flex flex-col h-screen bg-[var(--bg-primary)]">
@@ -124,15 +142,41 @@ function App() {
         />
         <div className="flex flex-1 overflow-hidden">
           <Sidebar
-            risk={status?.risk ?? null}
-            paper={status?.paper ?? null}
+            risk={viewRisk ?? null}
+            paper={viewTraderState ?? null}
             features={mergedFeatures}
             stats={stats ?? null}
-            tradingMode={status?.trading_mode ?? 'paper'}
-            tradingPaused={status?.trading_paused ?? false}
+            tradingMode={tradingMode ?? 'paper'}
+            tradingPaused={status?.trading_paused ?? 'off'}
+            viewMode={viewMode}
           />
           <main className="flex-1 flex flex-col overflow-hidden">
-            <div className="flex items-center gap-1 px-3 pt-2">
+            {/* View mode tabs */}
+            <div className="flex items-center gap-1 px-3 pt-2 border-b border-[var(--border)] pb-2">
+              <div className="flex bg-[var(--bg-tertiary)] rounded p-0.5 mr-3">
+                <button
+                  type="button"
+                  onClick={() => setViewMode('paper')}
+                  className={`px-3 py-1 text-xs rounded transition-colors font-medium ${
+                    viewMode === 'paper'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  Paper
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('live')}
+                  className={`px-3 py-1 text-xs rounded transition-colors font-medium ${
+                    viewMode === 'live'
+                      ? 'bg-amber-600 text-white'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  Live
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={() => setChartTab('equity')}
@@ -155,6 +199,12 @@ function App() {
               >
                 BTC Price
               </button>
+              {tradingMode === 'live' && viewMode === 'paper' && (
+                <span className="ml-auto text-[10px] text-amber-400/70 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  Live trading active
+                </span>
+              )}
             </div>
             <div className="flex-1 min-h-0 p-3">
               {chartTab === 'equity' ? (
@@ -170,7 +220,8 @@ function App() {
             />
             <SystemHealth diagnostics={diagnostics} />
             <PositionTable
-              paper={status?.paper ?? null}
+              paper={viewTraderState ?? null}
+              orphanedPositions={viewMode === 'live' ? (status?.orphaned_positions ?? []) : []}
               tradesData={tradesData}
               tradesLoading={tradesLoading}
               onPageChange={setTradesPage}
@@ -178,8 +229,8 @@ function App() {
               erroredLoading={erroredLoading}
               onErroredPageChange={setErroredPage}
             />
-            <StatsPanel stats={stats ?? null} />
-            <AttributionPanel />
+            <StatsPanel stats={stats ?? null} tradingMode={viewMode} />
+            <AttributionPanel tradingMode={viewMode} />
             <BacktestPanel />
           </main>
         </div>

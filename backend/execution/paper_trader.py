@@ -143,6 +143,13 @@ class PaperTrader:
         )
         return trade
 
+    def handle_settlement(self, result: str) -> Optional[PaperTrade]:
+        """Handle contract settlement by recording PnL at settled price."""
+        if self.position is None:
+            return None
+        settled_price = 100 if result == "yes" else 0
+        return self.exit(settled_price, "CONTRACT_SETTLED")
+
     def get_state(self) -> dict:
         return {
             "has_position": self.has_position,

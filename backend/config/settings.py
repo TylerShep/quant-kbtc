@@ -141,6 +141,7 @@ class BotConfig:
     discord_heartbeat_webhook: str = field(default_factory=lambda: _env("DISCORD_HEARTBEAT_WEBHOOK"))
     discord_errors_webhook: str = field(default_factory=lambda: _env("DISCORD_ERRORS_WEBHOOK"))
     discord_attribution_webhook: str = field(default_factory=lambda: _env("DISCORD_ATTRIBUTION_WEBHOOK"))
+    discord_live_trades_webhook: str = field(default_factory=lambda: _env("DISCORD_LIVE_TRADES_WEBHOOK"))
     tuning_interval_hours: int = field(
         default_factory=lambda: _env_int("TUNING_INTERVAL_HOURS", 6)
     )

@@ -132,13 +132,38 @@ export interface PaperState {
   recent_trades: PaperTrade[];
 }
 
+export interface OrphanedPosition {
+  ticker: string;
+  direction: string;
+  contracts: number;
+  avg_entry_price: number;
+  detected_at: string;
+}
+
+export interface Decision {
+  direction: string | null;
+  conviction: string;
+  obi_dir: string;
+  roc_dir: string;
+  skip_reason: string | null;
+  should_trade: boolean;
+}
+
 export interface StatusResponse {
   market_states: Record<string, MarketState>;
   atr: ATRState;
   risk: RiskState;
   paper: PaperState;
+  live: PaperState;
   trading_mode?: string;
-  trading_paused?: boolean;
+  trading_paused?: 'off' | 'settling' | 'paused';
+  orphaned_positions?: OrphanedPosition[];
+  paper_bankroll?: number;
+  live_bankroll?: number;
+  paper_decision?: Decision | null;
+  live_decision?: Decision | null;
+  paper_risk?: RiskState;
+  live_risk?: RiskState;
 }
 
 export interface WSFeedInfo {

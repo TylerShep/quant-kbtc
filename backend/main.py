@@ -80,12 +80,14 @@ async def _heartbeat_loop(notifier):
             state = coordinator.data_manager.states.get(settings.bot.market)
             spot = state.spot_price if state else None
             ticker = state.kalshi_ticker if state else None
+            has_pos = coordinator.paper_trader.has_position or coordinator.live_trader.has_position
+            bankroll = coordinator.live_sizer.bankroll if coordinator.live_enabled else coordinator.paper_sizer.bankroll
             await notifier.heartbeat_ping(
                 uptime_str=uptime,
                 spot_price=spot,
                 ticker=ticker,
-                has_position=coordinator.paper_trader.has_position,
-                bankroll=coordinator.position_sizer.bankroll,
+                has_position=has_pos,
+                bankroll=bankroll,
             )
         except Exception as e:
             logger.warning("heartbeat.failed", error=str(e))
@@ -102,11 +104,14 @@ async def _periodic_summary_loop(notifier):
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
 
-            # Daily summary at midnight UTC (hour 0)
+            # Pick the primary trader for summaries based on mode
+            primary_trader = coordinator.live_trader if coordinator.live_enabled else coordinator.paper_trader
+            primary_sizer = coordinator.live_sizer if coordinator.live_enabled else coordinator.paper_sizer
+
             if now.hour == 0 and last_daily != now.day:
                 last_daily = now.day
-                trades = coordinator.paper_trader.trades
-                today_trades = trades  # all trades since boot; refine once daily resets are in
+                trades = primary_trader.trades
+                today_trades = trades
                 wins = sum(1 for t in today_trades if t.pnl >= 0)
                 losses = len(today_trades) - wins
                 gross = sum(t.pnl for t in today_trades)
@@ -119,28 +124,26 @@ async def _periodic_summary_loop(notifier):
                     gross_pnl=gross,
                     best_trade_pnl=best,
                     worst_trade_pnl=worst,
-                    start_bankroll=coordinator.position_sizer.daily_start_bankroll,
-                    end_bankroll=coordinator.position_sizer.bankroll,
-                    peak_drawdown_pct=coordinator.position_sizer.current_drawdown,
+                    start_bankroll=primary_sizer.daily_start_bankroll,
+                    end_bankroll=primary_sizer.bankroll,
+                    peak_drawdown_pct=primary_sizer.current_drawdown,
                 )
 
-            # Periodic summary every N hours
             if now.hour % interval_hours == 0 and now.minute < 5:
-                sizer = coordinator.position_sizer
-                trades = coordinator.paper_trader.trades
+                trades = primary_trader.trades
                 wins = sum(1 for t in trades if t.pnl >= 0)
                 losses = len(trades) - wins
                 net_pnl = sum(t.pnl for t in trades)
-                pos = coordinator.paper_trader.position
+                pos = primary_trader.position
                 await notifier.periodic_summary(
                     hours=interval_hours,
                     trades_count=len(trades),
                     wins=wins,
                     losses=losses,
                     net_pnl=net_pnl,
-                    bankroll=sizer.bankroll,
-                    drawdown_pct=sizer.current_drawdown,
-                    has_position=coordinator.paper_trader.has_position,
+                    bankroll=primary_sizer.bankroll,
+                    drawdown_pct=primary_sizer.current_drawdown,
+                    has_position=primary_trader.has_position,
                     position_ticker=pos.ticker if pos else None,
                 )
         except Exception as e:

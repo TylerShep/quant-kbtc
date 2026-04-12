@@ -1,0 +1,32 @@
+---
+description: Deployment rules for the Kalshi BTC trading bot. Always deploy to remote production after making changes.
+alwaysApply: true
+---
+
+# Deployment
+
+The bot runs in production on a DigitalOcean droplet at `botuser@64.23.133.157`.
+
+## After any code or config change:
+
+1. If frontend files were modified, rebuild first: `cd frontend && npm run build` then `cp -r dist/* ../backend/static/`
+2. Deploy to remote: `bash scripts/deploy.sh` (rsyncs files, rebuilds Docker image, restarts container)
+3. If database schema changed or a data wipe is needed, run SQL via the remote DB container: `ssh botuser@64.23.133.157 "docker exec kbtc-db psql -U kalshi -d kbtc -c '<SQL>'"`
+
+## Key details
+
+- The dashboard is served from `64.23.133.157:8000`, NOT localhost
+- `backend/static/` contains the built frontend — this is what the bot serves
+- `scripts/deploy.sh` handles rsync, port remapping, and `docker compose up --build`
+- The remote server does NOT have `pip3` — run DB operations via `docker exec kbtc-db psql` instead of Python scripts
+- Local Docker (`localhost:8001`) is for dev only; the user sees the remote instance
+- Always verify the remote API after deploy: `ssh botuser@64.23.133.157 "curl -s 'http://localhost:8000/api/status'"`
+
+## CRITICAL: Paper vs Live data separation
+
+- **NEVER** wipe paper trading data unless explicitly asked. Paper trade history is valuable for strategy validation.
+- When wiping data, ALWAYS use `--mode live` or `--mode paper` to target only one mode.
+- `clean_start.py --mode live --yes` wipes only live trades, errored trades, bankroll history, and attribution. Paper data is untouched.
+- Only use `clean_start.py` without `--mode` for a full reset of ALL data (requires explicit user confirmation).
+- Tables with `trading_mode` column (mode-filterable): `trades`, `errored_trades`, `bankroll_history`, `daily_attribution`
+- Shared tables (no mode column, wiped only in full reset): `signal_log`, `bot_state`, `latency_metrics`, `pipeline_health`, `param_recommendations`

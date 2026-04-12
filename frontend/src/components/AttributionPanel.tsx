@@ -57,7 +57,7 @@ const CONVICTION_ORDER = ['HIGH', 'NORMAL', 'LOW'];
 const SESSION_ORDER = ['ASIA', 'LONDON', 'US_OPEN', 'US_MAIN', 'US_CLOSE'];
 const REGIME_ORDER = ['LOW', 'MEDIUM', 'HIGH'];
 
-export function AttributionPanel() {
+export function AttributionPanel({ tradingMode }: { tradingMode?: string }) {
   const [expanded, setExpanded] = useState(false);
   const [attr, setAttr] = useState<Attribution | null>(null);
   const [mode, setMode] = useState<string>('');
@@ -65,9 +65,10 @@ export function AttributionPanel() {
 
   useEffect(() => {
     let cancelled = false;
+    const modeParam = tradingMode ? `?mode=${tradingMode}` : '';
     (async () => {
       try {
-        const res = await fetch('/api/attribution');
+        const res = await fetch(`/api/attribution${modeParam}`);
         if (cancelled) return;
         if (res.ok) {
           const j: AttrResponse = await res.json();
@@ -80,7 +81,7 @@ export function AttributionPanel() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [tradingMode]);
 
   const sig = attr?.signal_attribution ?? {};
   const sess = attr?.session_attribution ?? {};

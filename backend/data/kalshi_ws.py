@@ -145,17 +145,25 @@ class KalshiOrderClient:
         type: str = "market",
         yes_price: int | None = None,
         no_price: int | None = None,
+        client_order_id: str | None = None,
     ) -> dict:
-        """Place an order on Kalshi. side: 'yes'|'no', type: 'market'|'limit'."""
+        """Place an order on Kalshi. side: 'yes'|'no', type: 'market'|'limit'.
+
+        client_order_id is a deduplication key — if the same ID is submitted
+        multiple times, Kalshi recognises it as a duplicate and returns the
+        existing order instead of creating a new one.
+        """
         path = "/trade-api/v2/portfolio/orders"
         headers = self.auth.get_headers("POST", path)
-        body = {
+        body: dict = {
             "ticker": ticker,
             "action": action,
             "side": side,
             "count": count,
             "type": type,
         }
+        if client_order_id is not None:
+            body["client_order_id"] = client_order_id
         if yes_price is not None:
             body["yes_price"] = yes_price
         if no_price is not None:
@@ -182,11 +190,22 @@ class KalshiOrderClient:
             r.raise_for_status()
             return r.json()
 
-    async def get_positions(self) -> dict:
+    async def get_positions(
+        self,
+        ticker: str | None = None,
+        count_filter: str | None = None,
+    ) -> dict:
+        """Fetch portfolio positions. Use ticker to query a single market,
+        count_filter='position' to return only non-zero positions."""
         path = "/trade-api/v2/portfolio/positions"
         headers = self.auth.get_headers("GET", path)
+        params: dict = {}
+        if ticker is not None:
+            params["ticker"] = ticker
+        if count_filter is not None:
+            params["count_filter"] = count_filter
         async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get("/portfolio/positions", headers=headers)
+            r = await c.get("/portfolio/positions", headers=headers, params=params or None)
             r.raise_for_status()
             return r.json()
 
@@ -195,6 +214,23 @@ class KalshiOrderClient:
         headers = self.auth.get_headers("GET", path)
         async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
             r = await c.get("/portfolio/balance", headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def get_orders(self, status: str = "resting") -> dict:
+        path = "/trade-api/v2/portfolio/orders"
+        headers = self.auth.get_headers("GET", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.get("/portfolio/orders", headers=headers,
+                            params={"status": status, "limit": 100})
+            r.raise_for_status()
+            return r.json()
+
+    async def get_market(self, ticker: str) -> dict:
+        path = f"/trade-api/v2/markets/{ticker}"
+        headers = self.auth.get_headers("GET", path)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
+            r = await c.get(f"/markets/{ticker}", headers=headers)
             r.raise_for_status()
             return r.json()
 
@@ -208,6 +244,7 @@ class KalshiWebSocketClient:
         self._ws = None
         self.active_tickers: Dict[str, str] = {}
         self._active_close_times: Dict[str, str] = {}
+        self.watched_position_tickers: Dict[str, str] = {}
         self._rest = KalshiRESTClient()
         self.connected = False
         self.last_message_time: Optional[float] = None
@@ -252,7 +289,7 @@ class KalshiWebSocketClient:
 
     async def _refresh_loop(self):
         while self._running:
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
             if not self._running:
                 break
             try:
@@ -361,18 +398,41 @@ class KalshiWebSocketClient:
                 result = m.get("result")
                 ticker = m.get("market_ticker")
                 if result in ("yes", "no") and ticker:
-                    symbol = self._ticker_to_symbol(ticker)
-                    if symbol:
-                        self.on_update(
-                            symbol,
-                            {"type": "lifecycle_settled", "data": {"result": result, "market_ticker": ticker}},
-                        )
+                    active = ticker in self.active_tickers.values()
+                    watched = ticker in self.watched_position_tickers
+                    if active or watched:
+                        symbol = self._ticker_to_symbol(ticker)
+                        if not symbol and watched:
+                            symbol = self.watched_position_tickers[ticker]
+                        if symbol:
+                            self.on_update(
+                                symbol,
+                                {"type": "lifecycle_settled", "data": {"result": result, "market_ticker": ticker}},
+                            )
+                            if active:
+                                asyncio.create_task(self._on_contract_settled(symbol))
+                    else:
+                        logger.debug("kalshi_ws.lifecycle_ignored",
+                                     ticker=ticker, event_type=et)
             return
 
         if msg_type in ("orderbook_snapshot", "orderbook_delta", "ticker", "trade"):
             ticker = msg.get("msg", {}).get("market_ticker", "")
             symbol = self._ticker_to_symbol(ticker) or ticker
             self.on_update(symbol, {"type": msg_type, "data": msg.get("msg", {})})
+
+    async def _on_contract_settled(self, symbol: str):
+        """Re-resolve ticker immediately when the active contract settles."""
+        logger.info("kalshi_ws.contract_settled_reressolve", symbol=symbol)
+        try:
+            old = dict(self.active_tickers)
+            await self._resolve_tickers()
+            changed = {s for s, t in self.active_tickers.items() if old.get(s) != t}
+            if changed and self._ws_is_open():
+                logger.info("kalshi_ws.ticker_changed_post_settle", changed=list(changed))
+                await self._subscribe(self._ws)
+        except Exception as e:
+            logger.error("kalshi_ws.settle_reressolve_failed", error=str(e))
 
     def _ticker_to_symbol(self, ticker: str) -> Optional[str]:
         for sym, tk in self.active_tickers.items():

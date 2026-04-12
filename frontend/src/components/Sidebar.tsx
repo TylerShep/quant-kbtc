@@ -7,10 +7,11 @@ interface SidebarProps {
   features: Features | null;
   stats: CumulativeStats | null;
   tradingMode?: string;
-  tradingPaused?: boolean;
+  tradingPaused?: 'off' | 'settling' | 'paused';
+  viewMode?: string;
 }
 
-export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = false }: SidebarProps) {
+export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = 'off', viewMode = 'paper' }: SidebarProps) {
   const equity = stats?.equity ?? risk?.bankroll ?? 0;
   const drawdown = risk?.drawdown_pct ?? 0;
   const dailyLoss = risk?.daily_loss_pct ?? 0;
@@ -31,11 +32,11 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
         <div className="flex items-center gap-1.5 mb-0.5">
           <div className="text-xs text-[var(--text-muted)]">Equity</div>
           <span className={`text-[9px] font-medium px-1 py-0.5 rounded ${
-            tradingMode === 'live'
+            viewMode === 'live'
               ? 'bg-amber-900/30 text-amber-400'
               : 'bg-blue-900/30 text-blue-400'
           }`}>
-            {tradingMode === 'live' ? 'LIVE' : 'PAPER'}
+            {viewMode === 'live' ? 'LIVE' : 'PAPER'}
           </span>
         </div>
         <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
@@ -89,17 +90,22 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
       <StatBlock label="Total Trades" value={String(stats?.total_trades ?? paper?.total_trades ?? 0)} />
 
       <div className="mt-auto flex flex-col gap-2">
-        <TradingModeToggle currentMode={tradingMode} hasPosition={paper?.has_position ?? false} />
-        <TradingActiveToggle canTrade={canTrade} paused={tradingPaused} haltReason={risk?.halt_reason ?? null} />
+        <LiveToggle isLive={tradingMode === 'live'} tradingPaused={tradingPaused} />
+        <LivePauseToggle
+          isLive={tradingMode === 'live'}
+          canTrade={canTrade}
+          tradingPaused={tradingPaused}
+          haltReason={risk?.halt_reason ?? null}
+        />
       </div>
     </aside>
   );
 }
 
-function TradingModeToggle({ currentMode, hasPosition }: { currentMode: string; hasPosition: boolean }) {
+function LiveToggle({ isLive, tradingPaused }: { isLive: boolean; tradingPaused: string }) {
   const [confirming, setConfirming] = useState(false);
   const [switching, setSwitching] = useState(false);
-  const isLive = currentMode === 'live';
+  const isSettling = tradingPaused === 'settling';
 
   const handleToggle = async () => {
     const targetMode = isLive ? 'paper' : 'live';
@@ -128,15 +134,38 @@ function TradingModeToggle({ currentMode, hasPosition }: { currentMode: string; 
     }
   };
 
+  if (isSettling) {
+    return (
+      <div className="bg-[var(--bg-tertiary)] border border-amber-700/50 rounded p-2 text-xs">
+        <div className="text-amber-400 font-medium mb-1 animate-pulse">Settling Live Trades...</div>
+        <div className="text-[var(--text-muted)] mb-2">Waiting for open live position to exit naturally before disabling.</div>
+        <button
+          onClick={async () => {
+            try {
+              await fetch('/api/trading-pause', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ paused: false }),
+              });
+            } catch {}
+          }}
+          className="w-full px-2 py-1 bg-[var(--bg-secondary)] text-[var(--text-secondary)] rounded text-xs hover:bg-[var(--border)]"
+        >
+          Cancel & Resume
+        </button>
+      </div>
+    );
+  }
+
   if (confirming) {
     return (
       <div className="bg-[var(--bg-tertiary)] border border-[var(--red)] rounded p-2 text-xs">
-        <div className="text-[var(--red)] font-medium mb-1">Switch to LIVE trading?</div>
-        <div className="text-[var(--text-muted)] mb-2">This will use real funds from your Kalshi wallet.</div>
+        <div className="text-[var(--red)] font-medium mb-1">Enable LIVE trading?</div>
+        <div className="text-[var(--text-muted)] mb-2">Real funds will be used. Paper trading continues in background.</div>
         <div className="flex gap-2">
           <button
             onClick={handleToggle}
-            disabled={switching || hasPosition}
+            disabled={switching}
             className="flex-1 px-2 py-1 bg-[var(--red)] text-white rounded text-xs font-medium disabled:opacity-50"
           >
             {switching ? '...' : 'Confirm'}
@@ -148,9 +177,6 @@ function TradingModeToggle({ currentMode, hasPosition }: { currentMode: string; 
             Cancel
           </button>
         </div>
-        {hasPosition && (
-          <div className="text-[var(--red)] mt-1">Close position first</div>
-        )}
       </div>
     );
   }
@@ -158,22 +184,29 @@ function TradingModeToggle({ currentMode, hasPosition }: { currentMode: string; 
   return (
     <button
       onClick={handleToggle}
-      disabled={switching || hasPosition}
+      disabled={switching}
       className={`w-full text-xs font-medium px-2 py-1.5 rounded text-center transition-colors disabled:opacity-50 ${
         isLive
           ? 'bg-amber-900/30 text-amber-400 border border-amber-700/50'
-          : 'bg-blue-900/30 text-blue-400 border border-blue-700/50'
+          : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] border border-[var(--border)] hover:text-[var(--text-primary)] hover:border-amber-700/50'
       }`}
     >
-      {switching ? 'Switching...' : isLive ? 'LIVE TRADING' : 'PAPER TRADING'}
+      {switching ? 'Switching...' : isLive ? 'LIVE TRADING ON' : 'ENABLE LIVE TRADING'}
     </button>
   );
 }
 
-function TradingActiveToggle({ canTrade, paused, haltReason }: { canTrade: boolean; paused: boolean; haltReason: string | null }) {
+function LivePauseToggle({ isLive, canTrade, tradingPaused, haltReason }: {
+  isLive: boolean;
+  canTrade: boolean;
+  tradingPaused: string;
+  haltReason: string | null;
+}) {
   const [toggling, setToggling] = useState(false);
 
-  const effectivelyActive = canTrade && !paused;
+  const isOff = tradingPaused === 'off';
+  const isSettling = tradingPaused === 'settling';
+  const isPaused = tradingPaused === 'paused';
 
   const handleToggle = async () => {
     setToggling(true);
@@ -181,36 +214,60 @@ function TradingActiveToggle({ canTrade, paused, haltReason }: { canTrade: boole
       const res = await fetch('/api/trading-pause', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paused: !paused }),
+        body: JSON.stringify({ paused: isOff }),
       });
       const data = await res.json();
       if (!data.success) {
-        alert(data.error || 'Failed to toggle trading');
+        alert(data.error || 'Failed to toggle');
       }
     } catch {
-      alert('Failed to toggle trading');
+      alert('Failed to toggle');
     } finally {
       setToggling(false);
     }
   };
 
-  const label = !canTrade
+  if (!isLive) {
+    return (
+      <div className="w-full text-[10px] text-center text-[var(--text-muted)] py-1">
+        Paper trading always active
+      </div>
+    );
+  }
+
+  const liveHalted = !canTrade;
+
+  const label = liveHalted
     ? haltReason ?? 'HALTED'
-    : paused
-      ? 'TRADING PAUSED'
-      : 'TRADING ACTIVE';
+    : isSettling
+      ? 'SETTLING...'
+      : isPaused
+        ? 'LIVE PAUSED'
+        : 'LIVE ACTIVE';
+
+  const title = isOff
+    ? 'Click to pause live trading'
+    : isSettling
+      ? 'Waiting for live position to settle'
+      : isPaused
+        ? 'Click to resume live trading'
+        : 'Circuit breaker halted';
+
+  const colorClass = liveHalted
+    ? 'bg-[var(--red-dim)] text-[var(--red)]'
+    : isSettling
+      ? 'bg-amber-900/30 text-amber-400 animate-pulse'
+      : isPaused
+        ? 'bg-[var(--red-dim)] text-[var(--red)] hover:bg-[var(--red)]/20'
+        : 'bg-[var(--green-dim)] text-[var(--green)] hover:bg-[var(--green)]/20';
 
   return (
     <button
       type="button"
       onClick={handleToggle}
-      disabled={toggling || !canTrade}
-      className={`w-full text-xs font-medium px-2 py-1.5 rounded text-center transition-colors cursor-pointer disabled:cursor-not-allowed ${
-        effectivelyActive
-          ? 'bg-[var(--green-dim)] text-[var(--green)] hover:bg-[var(--green)]/20'
-          : 'bg-[var(--red-dim)] text-[var(--red)] hover:bg-[var(--red)]/20'
-      }`}
-      title={effectivelyActive ? 'Click to pause trading' : paused ? 'Click to resume trading' : 'Circuit breaker halted'}
+      disabled={toggling || liveHalted}
+      className={`w-full text-xs font-medium px-2 py-1.5 rounded text-center transition-colors cursor-pointer disabled:cursor-not-allowed ${colorClass}`}
+      title={title}
     >
       {toggling ? 'Switching...' : label}
     </button>

@@ -68,7 +68,8 @@ async def diagnostics():
         "candle_count": len(candle_agg.candles),
         "last_candle_close": last_candle.close if last_candle else None,
         "last_candle_time": last_candle.timestamp if last_candle else None,
-        "has_position": coordinator.paper_trader.has_position,
+        "has_paper_position": coordinator.paper_trader.has_position,
+        "has_live_position": coordinator.live_trader.has_position,
         "trading_mode": coordinator.trading_mode,
         "can_trade": coordinator.circuit_breaker.can_trade(),
         "book_healthy": book_healthy,
@@ -94,15 +95,45 @@ async def status():
             "volume": state.volume,
         }
 
+    orphans = [
+        {
+            "ticker": o.ticker,
+            "direction": o.direction,
+            "contracts": o.contracts,
+            "avg_entry_price": o.avg_entry_price,
+            "detected_at": (
+                o.detected_at if isinstance(o.detected_at, str)
+                else o.detected_at.isoformat() if o.detected_at is not None
+                else None
+            ),
+        }
+        for o in coordinator.live_trader.orphaned_positions
+    ]
+
+    wallet_balance = None
+    if coordinator.live_enabled:
+        try:
+            balance_data = await coordinator.live_trader.client.get_balance()
+            wallet_balance = round(float(balance_data.get("balance", 0)) / 100, 2)
+        except Exception:
+            pass
+
     return {
         "market_states": states,
         "atr": coordinator.atr_filter.get_state(),
         "risk": coordinator.circuit_breaker.get_state(),
-        "paper": coordinator.active_trader.get_state(),
+        "paper": coordinator.paper_trader.get_state(),
+        "live": coordinator.live_trader.get_state(),
         "trading_mode": coordinator.trading_mode,
         "trading_paused": coordinator.trading_paused,
         "paper_bankroll": round(coordinator.paper_sizer.bankroll, 2),
         "live_bankroll": round(coordinator.live_sizer.bankroll, 2),
+        "wallet_balance": wallet_balance,
+        "orphaned_positions": orphans,
+        "paper_decision": coordinator._serialize_decision("paper"),
+        "live_decision": coordinator._serialize_decision("live") if coordinator.live_enabled else None,
+        "paper_risk": coordinator.paper_breaker.get_state(),
+        "live_risk": coordinator.live_breaker.get_state(),
     }
 
 
@@ -121,9 +152,15 @@ async def set_trading_mode(req: TradingModeRequest):
             "requires_confirmation": True,
         }
 
-    if coordinator.active_trader.has_position:
+    if coordinator.trading_paused == "settling":
         return {
-            "error": "Cannot switch mode while a position is open. Close position first.",
+            "error": "Settling open live position, please wait.",
+            "success": False,
+        }
+
+    if req.mode == "paper" and coordinator.live_trader.has_position:
+        return {
+            "error": "Cannot disable live while a live position is open. Pause trading first to settle.",
             "success": False,
         }
 
@@ -131,13 +168,91 @@ async def set_trading_mode(req: TradingModeRequest):
     if old_mode == req.mode:
         return {"success": True, "mode": req.mode, "message": f"Already in {req.mode} mode"}
 
-    coordinator.trading_mode = req.mode
+    if req.mode == "live":
+        try:
+            wallet = await coordinator.sync_live_bankroll()
+        except Exception as e:
+            return {
+                "error": f"Failed to fetch Kalshi balance: {e}",
+                "success": False,
+            }
 
-    return {
+    coordinator.trading_mode = req.mode
+    if req.mode == "paper":
+        coordinator.trading_paused = "off"
+    import asyncio
+    asyncio.create_task(coordinator._save_state())
+
+    resp = {
         "success": True,
         "mode": req.mode,
         "previous_mode": old_mode,
         "message": f"Switched from {old_mode} to {req.mode} trading",
+    }
+    if req.mode == "live":
+        resp["live_bankroll"] = round(coordinator.live_sizer.bankroll, 2)
+    return resp
+
+
+@router.post("/reset-drawdown")
+async def reset_drawdown(mode: str = None):
+    """Reset drawdown peak to current bankroll for the given mode (paper/live)."""
+    from main import coordinator
+    import asyncio
+
+    target_mode = mode or coordinator.trading_mode
+
+    if target_mode == "live":
+        try:
+            await coordinator.sync_live_bankroll()
+        except Exception as e:
+            return {"success": False, "error": f"Failed to fetch balance: {e}"}
+        sizer = coordinator.live_sizer
+    else:
+        sizer = coordinator.paper_sizer
+
+    old_peak = sizer.peak_bankroll
+    sizer.peak_bankroll = sizer.bankroll
+    sizer.daily_start_bankroll = sizer.bankroll
+    sizer.weekly_start_bankroll = sizer.bankroll
+
+    asyncio.create_task(coordinator._save_state())
+
+    return {
+        "success": True,
+        "mode": target_mode,
+        "bankroll": round(sizer.bankroll, 2),
+        "old_peak": round(old_peak, 2),
+        "new_peak": round(sizer.peak_bankroll, 2),
+        "drawdown_pct": round(sizer.current_drawdown * 100, 2),
+    }
+
+
+@router.post("/trade-limit")
+async def set_trade_limit(req: dict = {}):
+    """Set or reset the live trade limit.
+
+    Body: {"limit": 1}     → allow 1 more trade then stop
+          {"limit": null}   → remove limit (unlimited)
+          {"reset": true}   → reset counter to 0 (allow limit more trades)
+    """
+    from main import coordinator
+
+    pm = coordinator.live_trader.position_manager
+    new_limit = req.get("limit", pm.live_trade_limit)
+    reset = req.get("reset", False)
+
+    if reset:
+        pm.reset_trade_counter()
+
+    if "limit" in req:
+        pm.live_trade_limit = new_limit
+
+    return {
+        "success": True,
+        "live_trade_limit": pm.live_trade_limit,
+        "completed_live_trades": pm._completed_live_trades,
+        "can_enter": pm.can_enter,
     }
 
 
@@ -146,14 +261,170 @@ async def set_trading_pause(req: TradingPauseRequest):
     """Pause or resume automated trading. Pausing stops new entries but allows exits."""
     from main import coordinator
 
-    coordinator.trading_paused = req.paused
+    if req.paused:
+        if coordinator.live_trader.has_position:
+            coordinator.trading_paused = "settling"
+            status = "settling"
+            message = "Waiting for open live position to exit..."
+        else:
+            coordinator.trading_paused = "paused"
+            status = "paused"
+            message = "Trading paused"
+    else:
+        coordinator.trading_paused = "off"
+        status = "off"
+        message = "Trading resumed"
+
     import asyncio
     asyncio.create_task(coordinator._save_state())
     return {
         "success": True,
-        "paused": coordinator.trading_paused,
-        "message": "Trading paused" if req.paused else "Trading resumed",
+        "trading_paused": status,
+        "message": message,
     }
+
+
+@router.get("/deploy-check")
+async def deploy_check():
+    """Pre-deploy safety check: returns whether it's safe to restart the bot."""
+    from main import coordinator
+
+    live_position = coordinator.live_trader.has_position
+    orphans = len(coordinator.live_trader.orphaned_positions)
+    pm_busy = coordinator.live_trader.position_manager.is_busy
+    pm_state = coordinator.live_trader.position_manager.state.value
+    is_live = coordinator.trading_mode == "live"
+
+    resting_count = 0
+    try:
+        orders_data = await coordinator.live_trader.client.get_orders(status="resting")
+        resting_orders = orders_data.get("orders", [])
+        resting_count = sum(
+            1 for o in resting_orders
+            if any(o.get("ticker", "").startswith(p) for p in ("KXBTC", "KXETH"))
+        )
+    except Exception:
+        pass
+
+    blockers = []
+    if live_position:
+        pos = coordinator.live_trader.position
+        if pos is not None:
+            blockers.append(f"Open live position: {pos.ticker} ({pos.direction}, {pos.contracts} contracts)")
+        else:
+            blockers.append("Open live position (details unavailable — state changed during check)")
+    if resting_count > 0:
+        blockers.append(f"{resting_count} resting order(s) on Kalshi")
+    if pm_busy:
+        blockers.append(f"PositionManager busy (state: {pm_state})")
+
+    safe = len(blockers) == 0
+
+    return {
+        "safe_to_deploy": safe,
+        "trading_mode": coordinator.trading_mode,
+        "blockers": blockers,
+        "orphans": orphans,
+        "message": "Safe to deploy" if safe else "BLOCKED: " + "; ".join(blockers),
+    }
+
+
+@router.post("/emergency-stop")
+async def emergency_stop():
+    """Kill switch: force-close all positions and halt trading immediately.
+
+    Uses PositionManager's lock to prevent concurrent orders with the
+    tick loop. Retries and orphan conversion handled by PositionManager.
+    """
+    from main import coordinator
+    import asyncio
+
+    coordinator.trading_paused = "paused"
+    results = {"paused": True, "actions": []}
+
+    trader = coordinator.live_trader
+    if trader.has_position:
+        ticker = trader.position.ticker
+        trade = await trader.emergency_close()
+        if trade:
+            coordinator._on_trade_exit(trade, "BTC", "live")
+            results["actions"].append(f"Closed {ticker}: pnl={trade.pnl}")
+        else:
+            results["actions"].append(
+                f"Exit failed for {ticker}, converted to orphan"
+            )
+            coordinator._unregister_position_ticker(ticker)
+
+    paper = coordinator.paper_trader
+    if paper.has_position:
+        trade = paper.exit(paper.position.entry_price, "EMERGENCY_STOP")
+        if trade:
+            coordinator._on_trade_exit(trade, "BTC", "paper")
+            results["actions"].append("Paper position closed")
+
+    asyncio.create_task(coordinator._save_state())
+
+    from notifications import get_notifier
+    asyncio.create_task(get_notifier().unhandled_exception(
+        location="api.emergency_stop",
+        error="Emergency stop triggered via API",
+    ))
+
+    results["success"] = True
+    results["message"] = "Emergency stop executed. Trading halted."
+    return results
+
+
+@router.post("/close-all-exchange-positions")
+async def close_all_exchange_positions():
+    """Query Kalshi for ALL open positions and close them directly on the exchange.
+
+    Uses PositionManager's lock to prevent concurrent orders with the tick loop.
+    Unlike emergency-stop, this reads actual exchange state and closes everything.
+    """
+    from main import coordinator
+    import asyncio
+
+    coordinator.trading_paused = "paused"
+    trader = coordinator.live_trader
+    results = {"paused": True, "actions": [], "positions_found": 0}
+
+    old_ticker = trader.position.ticker if trader.has_position else None
+
+    close_results = await trader.close_all_exchange_positions()
+    results["positions_found"] = len(close_results)
+
+    for cr in close_results:
+        if cr.get("status") == "closed":
+            results["actions"].append(
+                f"Closed {cr['ticker']}: {cr['direction']} x{cr['contracts']}, "
+                f"order={cr.get('order_id')}, filled={cr.get('filled')}"
+            )
+        else:
+            results["actions"].append(f"Failed to close {cr['ticker']}: {cr.get('error')}")
+
+    if old_ticker:
+        coordinator._unregister_position_ticker(old_ticker)
+
+    try:
+        await coordinator.sync_live_bankroll()
+        results["wallet_synced"] = True
+        results["wallet_balance"] = round(coordinator.live_sizer.bankroll, 2)
+    except Exception as e:
+        results["wallet_synced"] = False
+        results["wallet_sync_error"] = str(e)
+
+    asyncio.create_task(coordinator._save_state())
+
+    from notifications import get_notifier
+    asyncio.create_task(get_notifier().unhandled_exception(
+        location="api.close_all_exchange_positions",
+        error=f"Force-closed {len(close_results)} exchange positions",
+    ))
+
+    results["success"] = True
+    results["message"] = f"Closed {len(close_results)} positions directly on Kalshi."
+    return results
 
 
 @router.get("/trades")
@@ -324,14 +595,27 @@ async def stats(mode: str = Query(None)):
         )
         r = await row.fetchone()
 
-    initial = settings.bot.initial_bankroll
     total_pnl = float(r[1])
 
+    wallet_equity = None
+    if active_mode == "live":
+        equity = round(coordinator.live_sizer.bankroll, 4)
+        initial = equity - total_pnl
+        try:
+            balance_data = await coordinator.live_trader.client.get_balance()
+            wallet_equity = round(float(balance_data.get("balance", 0)) / 100, 4)
+        except Exception:
+            pass
+    else:
+        initial = settings.bot.initial_bankroll
+        equity = round(initial + total_pnl, 4)
+
     return {
-        "initial_bankroll": initial,
+        "initial_bankroll": round(initial, 4),
         "total_trades": r[0],
         "total_pnl": total_pnl,
-        "equity": round(initial + total_pnl, 4),
+        "equity": equity,
+        "wallet_equity": wallet_equity,
         "wins": r[2],
         "losses": r[3],
         "win_rate": r[2] / r[0] if r[0] > 0 else 0,
@@ -562,43 +846,51 @@ async def stats_signal_accuracy():
 
 @router.get("/btc-price")
 async def btc_price():
-    """BTC price history from candles table + in-memory aggregator."""
+    """BTC price history: always loads DB history then merges live in-memory candles."""
     from main import coordinator
 
-    candles = coordinator.candle_aggregator.recent(500)
-    items = [
-        {
-            "time": int(c.timestamp),
-            "open": round(c.open, 2),
-            "high": round(c.high, 2),
-            "low": round(c.low, 2),
-            "close": round(c.close, 2),
-            "volume": round(c.volume, 2),
-        }
-        for c in candles
-    ]
+    items: list[dict] = []
+    seen_times: set[int] = set()
 
-    if not items:
-        pool = await get_pool()
-        async with pool.connection() as conn:
-            rows = await conn.execute(
-                """SELECT timestamp, open, high, low, close, volume
-                   FROM candles
-                   WHERE source IN ('live_spot', 'binance')
-                   ORDER BY timestamp DESC
-                   LIMIT 500"""
-            )
-            result = await rows.fetchall()
-            items = [
-                {
-                    "time": int(r[0].timestamp()),
-                    "open": float(r[1]),
-                    "high": float(r[2]),
-                    "low": float(r[3]),
-                    "close": float(r[4]),
-                    "volume": float(r[5]),
-                }
-                for r in reversed(result)
-            ]
+    pool = await get_pool()
+    if pool:
+        try:
+            async with pool.connection() as conn:
+                rows = await conn.execute(
+                    """SELECT timestamp, open, high, low, close, volume
+                       FROM candles
+                       WHERE source IN ('live_spot', 'binance')
+                       ORDER BY timestamp DESC
+                       LIMIT 500"""
+                )
+                result = await rows.fetchall()
+                for r in reversed(result):
+                    t = int(r[0].timestamp())
+                    if t not in seen_times:
+                        seen_times.add(t)
+                        items.append({
+                            "time": t,
+                            "open": float(r[1]),
+                            "high": float(r[2]),
+                            "low": float(r[3]),
+                            "close": float(r[4]),
+                            "volume": float(r[5]),
+                        })
+        except Exception:
+            pass
 
+    for c in coordinator.candle_aggregator.recent(500):
+        t = int(c.timestamp)
+        if t not in seen_times:
+            seen_times.add(t)
+            items.append({
+                "time": t,
+                "open": round(c.open, 2),
+                "high": round(c.high, 2),
+                "low": round(c.low, 2),
+                "close": round(c.close, 2),
+                "volume": round(c.volume, 2),
+            })
+
+    items.sort(key=lambda x: x["time"])
     return {"candles": items}

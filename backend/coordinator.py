@@ -2,6 +2,10 @@
 Coordinator — event loop orchestration.
 Single entry point that wires all subsystems together per the quant-developer skill.
 Strict order of operations: regime -> exits -> entries -> heartbeat.
+
+Paper trading runs continuously regardless of mode. Live trading only runs
+when trading_mode == "live". Both lanes share the same signal generation
+(OBI, ROC, ATR regime) but maintain independent positions, sizers, and breakers.
 """
 from __future__ import annotations
 
@@ -52,16 +56,19 @@ class Coordinator:
         self.live_trader = LiveTrader(self.live_sizer)
 
         self.trading_mode = settings.bot.trading_mode
-        self.trading_paused = False
+        self.trading_paused = "off"  # "off" | "settling" | "paused"
         self.param_overrides: dict = {}
         self._pool = None
         self._tick_count = 0
-        self._last_decision = None
-        self._last_exit_tick = -999
+        self._last_paper_decision = None
+        self._last_live_decision = None
+        self._last_paper_exit_tick = -999
+        self._last_live_exit_tick = -999
         self._last_regime: Optional[str] = None
         self._cb_was_halted = False
         self._recent_exit_times: list[float] = []
         self._rapid_fire_count = 0
+        self._orphan_check_in_flight = False
 
     @property
     def active_trader(self):
@@ -75,8 +82,41 @@ class Coordinator:
     def circuit_breaker(self) -> CircuitBreaker:
         return self.live_breaker if self.trading_mode == "live" else self.paper_breaker
 
+    @property
+    def live_enabled(self) -> bool:
+        return self.trading_mode == "live"
+
+    async def sync_live_bankroll(self, is_initial: bool = False) -> float:
+        """Fetch real Kalshi wallet balance and update live_sizer.
+
+        The Kalshi wallet is the source of truth. Peak bankroll tracks the
+        high-water mark from real trading, but is capped to the wallet on
+        sync so that external losses (orphaned trades, manual withdrawals)
+        don't cause a permanent drawdown halt.
+
+        daily/weekly baselines are only set on initial sync (startup) or
+        when explicitly requested — not on every sync call.
+        """
+        balance_data = await self.live_trader.client.get_balance()
+        wallet = float(balance_data.get("balance", 0)) / 100
+        if wallet > 0:
+            self.live_sizer.bankroll = wallet
+            old_peak = self.live_sizer.peak_bankroll
+            if old_peak == settings.bot.initial_bankroll:
+                self.live_sizer.peak_bankroll = wallet
+            else:
+                self.live_sizer.peak_bankroll = max(wallet, old_peak)
+            if is_initial:
+                self.live_sizer.daily_start_bankroll = wallet
+                self.live_sizer.weekly_start_bankroll = wallet
+            logger.info("coordinator.live_bankroll_synced",
+                        wallet=wallet, peak=self.live_sizer.peak_bankroll)
+        return wallet
+
     async def start(self):
         self._pool = await get_pool()
+        self.live_trader.position_manager.set_db_pool(self._pool)
+        await self.live_trader.position_manager.restore_state()
         await self._restore_state()
         self.data_manager.add_listener(self._on_market_update)
         await self.data_manager.start()
@@ -91,25 +131,44 @@ class Coordinator:
         await close_pool()
         logger.info("coordinator.stopped")
 
+    # ── Main tick pipeline ─────────────────────────────────────────────────
+
     def _on_market_update(self, symbol: str, state) -> None:
-        """
-        Called on every market data update (Kalshi WS or Spot WS tick).
-        Unified callback pipeline — single path from data to execution.
+        """Called on every market data update.
+
+        Paper lane always runs. Live lane only runs when trading_mode == "live".
+        Both lanes share the same features/signals but maintain independent state.
         """
         self._tick_count += 1
 
+        # ── 0. Settlement / expiry guards (both lanes) ─────────────────
+        self._run_settlement_guards(symbol, state, self.paper_trader, "paper")
+        if self.live_enabled:
+            self._run_settlement_guards(symbol, state, self.live_trader, "live")
+
+        # Settling check: only applies to live lane
+        if self.trading_paused == "settling" and not self.live_trader.has_position:
+            self.trading_paused = "paused"
+            logger.info("coordinator.settling_complete", source="tick_safety")
+            asyncio.create_task(ws_manager.broadcast({
+                "type": "settling_complete",
+                "trading_paused": "paused",
+            }))
+            asyncio.create_task(self._save_state())
+
+        # ── Feature gating ─────────────────────────────────────────────
         features = self.feature_engine.update(symbol, state)
         if features is None:
             return
 
-        # 1. Feed candle aggregator with spot ticks
+        # ── 1. Candle aggregator ───────────────────────────────────────
         completed_candle = None
         if state.spot_price:
             completed_candle = self.candle_aggregator.on_tick(
                 time.time(), state.spot_price
             )
 
-        # 2. On candle close: update ATR regime and persist candle
+        # ── 2. ATR regime on candle close ──────────────────────────────
         if completed_candle:
             if self._pool is not None:
                 asyncio.create_task(self._persist_candle(symbol, completed_candle))
@@ -121,9 +180,11 @@ class Coordinator:
                 completed_candle.close,
             )
             new_regime = self.atr_filter.current_regime
-            trader = self.active_trader
-            if trader.has_position:
-                trader.position.candles_held += 1
+
+            if self.paper_trader.has_position:
+                self.paper_trader.position.candles_held += 1
+            if self.live_trader.has_position:
+                self.live_trader.position.candles_held += 1
 
             if self._last_regime is not None and new_regime != old_regime:
                 atr_val = (
@@ -146,61 +207,193 @@ class Coordinator:
                 regime=new_regime,
             )
 
-        # 3. Check exits on every tick (not just candle close)
         regime = self.atr_filter.current_regime
-        trader = self.active_trader
-        if trader.has_position:
-            exit_reason = self._check_exits(state, features, regime)
-            if exit_reason:
-                exit_price = self._get_exit_price(state)
-                if exit_price is not None:
-                    if self.trading_mode == "live":
-                        trade = asyncio.ensure_future(trader.exit(exit_price, exit_reason))
-                        asyncio.create_task(self._handle_live_exit(trade, symbol))
-                    else:
-                        trade = trader.exit(exit_price, exit_reason)
-                        if trade:
-                            self._on_trade_exit(trade, symbol)
 
-        # 4. Evaluate entry signals — cooldown of 100 ticks (~2+ min) after exit
-        #    Skip new entries when trading is manually paused
-        #    Block entries when order book is empty or Kalshi data is stale
-        if not trader.has_position and not self.trading_paused:
-            ticks_since_exit = self._tick_count - self._last_exit_tick
-            book_healthy = self._is_book_healthy(state)
-            if ticks_since_exit > 100 and book_healthy:
-                self._evaluate_entry(symbol, state, features, regime)
+        # ── 3. Paper lane: exits + entries (always runs) ───────────────
+        self._run_paper_lane(symbol, state, features, regime)
 
-        # 5. Broadcast to dashboard
+        # ── 4. Live lane: exits + entries (only when live) ─────────────
+        if self.live_enabled:
+            self._run_live_lane(symbol, state, features, regime)
+
+        # ── 5. Broadcast to dashboard ──────────────────────────────────
         asyncio.create_task(
             ws_manager.broadcast({
                 "type": "market_update",
                 "symbol": symbol,
                 "data": features.to_dict(),
                 "state": _serialize_state(state),
-                "decision": self._serialize_decision(),
+                "decision": self._serialize_decision("paper"),
+                "live_decision": self._serialize_decision("live") if self.live_enabled else None,
             })
         )
 
-        # 6. Persist OB snapshots periodically
+        # ── 6. Periodic tasks ─────────────────────────────────────────
         if self._tick_count % 10 == 0 and self._pool is not None:
             asyncio.create_task(self._persist_snapshot(symbol, state, features))
 
-        # 7. Persist equity snapshot every ~60 ticks and save state every ~300 ticks
+        if self._tick_count % 50 == 0 and self.live_trader.orphaned_positions and not self._orphan_check_in_flight:
+            self._orphan_check_in_flight = True
+            asyncio.create_task(self._check_orphaned_positions())
+
         if self._tick_count % 60 == 0 and self._pool is not None:
-            asyncio.create_task(self._persist_equity())
+            asyncio.create_task(self._persist_equity("paper"))
+            if self.live_enabled:
+                asyncio.create_task(self._persist_equity("live"))
         if self._tick_count % 300 == 0 and self._pool is not None:
             asyncio.create_task(self._save_state())
 
-    def _on_trade_exit(self, trade, symbol: str) -> None:
+        if self._tick_count % 50 == 0 and self.live_enabled and not self.live_trader.position_manager.is_busy:
+            asyncio.create_task(self._periodic_reconciliation())
+
+    # ── Settlement guards ──────────────────────────────────────────────
+
+    def _run_settlement_guards(self, symbol: str, state, trader, mode: str) -> None:
+        """Handle settlement and expiry guard for a given trader lane."""
+        is_live = mode == "live"
+        pm_busy = is_live and self.live_trader.position_manager.is_busy
+
+        if state.resolved and trader.has_position and not pm_busy:
+            pos = trader.position
+            settled_ticker = state.kalshi_ticker
+            if pos and (pos.ticker == settled_ticker or pos.ticker in (settled_ticker or "")):
+                result_str = "yes" if state.resolved_outcome else "no"
+                logger.info("coordinator.contract_settled",
+                            ticker=pos.ticker, result=result_str,
+                            settled_ticker=settled_ticker, mode=mode)
+                if is_live:
+                    asyncio.create_task(self._handle_settlement(
+                        trader, result_str, symbol, mode))
+                else:
+                    trade = trader.handle_settlement(result_str)
+                    if trade:
+                        self._on_trade_exit(trade, symbol, mode)
+                state.resolved = False
+                state.resolved_outcome = None
+
+        if trader.has_position and not pm_busy:
+            pos = trader.position
+            if pos and is_live and state.kalshi_ticker and pos.ticker != state.kalshi_ticker:
+                logger.warning("coordinator.ticker_rolled_exit",
+                               position_ticker=pos.ticker,
+                               active_ticker=state.kalshi_ticker,
+                               mode=mode)
+                exit_price = pos.entry_price
+                asyncio.create_task(self._handle_live_exit(
+                    asyncio.ensure_future(trader.exit(exit_price, "TICKER_ROLLED")),
+                    symbol,
+                ))
+
+            if pos and state.time_remaining_sec is not None and state.time_remaining_sec < 60:
+                exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
+                if is_live:
+                    if not pm_busy:
+                        asyncio.create_task(self._handle_live_exit(
+                            asyncio.ensure_future(trader.exit(exit_price, "EXPIRY_GUARD")),
+                            symbol,
+                        ))
+                else:
+                    trade = trader.exit(exit_price, "EXPIRY_GUARD")
+                    if trade:
+                        self._on_trade_exit(trade, symbol, mode)
+
+    # ── Paper lane ─────────────────────────────────────────────────────
+
+    def _run_paper_lane(self, symbol: str, state, features, regime: str) -> None:
+        trader = self.paper_trader
+        sizer = self.paper_sizer
+        breaker = self.paper_breaker
+
+        if trader.has_position:
+            exit_reason = self._check_exits_for(state, features, regime, trader)
+            if exit_reason:
+                exit_price = self._get_exit_price_for(state, trader)
+                if exit_price is not None:
+                    trade = trader.exit(exit_price, exit_reason)
+                    if trade:
+                        self._on_trade_exit(trade, symbol, "paper")
+
+        near_expiry = state.time_remaining_sec is not None and state.time_remaining_sec < 120
+        if not trader.has_position and not near_expiry:
+            ticks_since_exit = self._tick_count - self._last_paper_exit_tick
+            book_healthy = self._is_book_healthy(state)
+            if ticks_since_exit > 100 and book_healthy:
+                self._evaluate_entry_for(
+                    symbol, state, features, regime,
+                    trader, sizer, breaker, "paper",
+                )
+
+    # ── Live lane ──────────────────────────────────────────────────────
+
+    def _run_live_lane(self, symbol: str, state, features, regime: str) -> None:
+        trader = self.live_trader
+        sizer = self.live_sizer
+        breaker = self.live_breaker
+        pm = trader.position_manager
+
+        if trader.has_position and not pm.is_busy:
+            exit_reason = self._check_exits_for(state, features, regime, trader)
+            if exit_reason:
+                exit_price = self._get_exit_price_for(state, trader)
+                if exit_price is not None:
+                    asyncio.create_task(self._handle_live_exit(
+                        asyncio.ensure_future(trader.exit(exit_price, exit_reason)),
+                        symbol,
+                    ))
+
+        near_expiry = state.time_remaining_sec is not None and state.time_remaining_sec < 120
+        if (pm.can_enter
+                and self.trading_paused == "off"
+                and not near_expiry):
+            ticks_since_exit = self._tick_count - self._last_live_exit_tick
+            book_healthy = self._is_book_healthy(state)
+            if ticks_since_exit > 100 and book_healthy:
+                self._evaluate_entry_for(
+                    symbol, state, features, regime,
+                    trader, sizer, breaker, "live",
+                )
+
+    # ── Trade exit / entry callbacks ───────────────────────────────────
+
+    def _on_trade_exit(self, trade, symbol: str, mode: str = "paper") -> None:
         """Common post-exit logic for both paper and live trades."""
-        self._last_exit_tick = self._tick_count
-        asyncio.create_task(self._persist_trade(trade))
-        asyncio.create_task(self._persist_equity())
+        if mode == "live":
+            self._unregister_position_ticker(trade.ticker)
+            self._last_live_exit_tick = self._tick_count
+        else:
+            self._last_paper_exit_tick = self._tick_count
+
+        if mode == "live" and self.trading_paused == "settling" and not self.live_trader.has_position:
+            self.trading_paused = "paused"
+            logger.info("coordinator.settling_complete")
+            asyncio.create_task(ws_manager.broadcast({
+                "type": "settling_complete",
+                "trading_paused": "paused",
+            }))
+
+        asyncio.create_task(self._persist_and_notify_exit(trade, symbol, mode))
+
+    async def _persist_and_notify_exit(self, trade, symbol: str, mode: str) -> None:
+        """Persist trade first, then notify. Skip Discord if trade was quarantined."""
+        quarantined = await self._persist_trade(trade, mode)
+
+        if mode == "live":
+            try:
+                await self.sync_live_bankroll()
+            except Exception as e:
+                logger.warning("coordinator.post_exit_wallet_sync_failed", error=str(e))
+
+        await self._persist_equity(mode)
         asyncio.create_task(self._save_state())
+
+        if quarantined:
+            return
+
+        sizer = self.live_sizer if mode == "live" else self.paper_sizer
         asyncio.create_task(ws_manager.broadcast({
             "type": "trade_exit",
             "symbol": symbol,
+            "mode": mode,
             "trade": {
                 "ticker": trade.ticker,
                 "direction": trade.direction,
@@ -218,36 +411,193 @@ class Coordinator:
             pnl_pct=trade.pnl_pct,
             exit_reason=trade.exit_reason,
             candles_held=trade.candles_held,
-            bankroll=self.position_sizer.bankroll,
+            bankroll=sizer.bankroll,
+            mode=mode,
         ))
 
+    def _on_trade_entry(self, pos, symbol, state, features, decision, roc_val, mode: str = "paper") -> None:
+        """Common post-entry logic for both paper and live trades."""
+        if mode == "live":
+            self._register_position_ticker(pos.ticker, symbol)
+        asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY"))
+        asyncio.create_task(ws_manager.broadcast({
+            "type": "trade_entry",
+            "symbol": symbol,
+            "mode": mode,
+            "position": {
+                "ticker": pos.ticker,
+                "direction": pos.direction,
+                "contracts": pos.contracts,
+                "entry_price": pos.entry_price,
+                "conviction": pos.conviction,
+            },
+        }))
+        asyncio.create_task(get_notifier().trade_opened(
+            ticker=pos.ticker,
+            direction=pos.direction,
+            contracts=pos.contracts,
+            entry_price=pos.entry_price,
+            conviction=pos.conviction,
+            obi=features.obi,
+            roc=roc_val,
+            mode=mode,
+        ))
+
+    async def _handle_settlement(self, trader, result: str, symbol: str, mode: str = "live") -> None:
+        """Handle exchange settlement of a live position.
+
+        PositionManager.handle_settlement verifies against exchange and
+        handles VERIFY_FAILED properly (converts to orphan instead of
+        trusting internal state).
+        """
+        try:
+            trade = await trader.handle_settlement(result)
+            if trade:
+                self._on_trade_exit(trade, symbol, mode)
+        except Exception as e:
+            logger.error("coordinator.settlement_failed", error=str(e))
+
     async def _handle_live_exit(self, trade_future, symbol: str) -> None:
-        """Await a live trader exit (async) then run common post-exit logic."""
+        """Await a live trader exit (async) then run common post-exit logic.
+
+        PositionManager handles retries, orphan conversion, and locking
+        internally. This wrapper just processes the result.
+        """
         try:
             trade = await trade_future
             if trade:
-                self._on_trade_exit(trade, symbol)
+                self._on_trade_exit(trade, symbol, "live")
+                return
+
+            if not self.live_trader.has_position:
+                return
+
+            MAX_RETRIES = 2
+            for attempt in range(1, MAX_RETRIES + 1):
+                if not self.live_trader.has_position:
+                    return
+                delay = 2 ** attempt
+                logger.warning("coordinator.live_exit_retry",
+                               attempt=attempt, delay=delay)
+                await asyncio.sleep(delay)
+                try:
+                    exit_price = self.live_trader.position.entry_price
+                    trade = await self.live_trader.exit(exit_price, "RETRY")
+                    if trade:
+                        self._on_trade_exit(trade, symbol, "live")
+                        return
+                except Exception as e:
+                    logger.error("coordinator.live_exit_retry_failed",
+                                 attempt=attempt, error=str(e))
+
+            if self.live_trader.has_position:
+                pos = self.live_trader.position
+                logger.error("coordinator.live_exit_abandoned",
+                             ticker=pos.ticker, contracts=pos.contracts)
+                self._unregister_position_ticker(pos.ticker)
+                self.live_trader.adopt_orphan(
+                    ticker=pos.ticker,
+                    direction=pos.direction,
+                    contracts=pos.contracts,
+                    avg_entry_price=pos.entry_price,
+                )
+                self.live_trader.position = None
+                asyncio.create_task(get_notifier().unhandled_exception(
+                    location="coordinator._handle_live_exit",
+                    error=f"Exit failed after retries for {pos.ticker}, converted to orphan",
+                ))
         except Exception as e:
             logger.error("coordinator.live_exit_failed", error=str(e))
 
-    def _evaluate_entry(self, symbol: str, state, features, regime: str) -> None:
-        can_trade, halt_reason = self.circuit_breaker.can_trade()
+    async def _check_orphaned_positions(self) -> None:
+        """Periodically check orphaned positions for break-even exit."""
+        try:
+            closed = await self.live_trader.check_orphans()
+            for info in closed:
+                pnl = info["pnl"]
+                notional = info["contracts"] * info["entry_price"] / 100
+                pnl_pct = pnl / notional if notional > 0 else 0
+                fees = notional * self.live_trader.FEE_RATE
 
-        if not can_trade and not self._cb_was_halted:
-            self._cb_was_halted = True
-            sizer = self.position_sizer
-            asyncio.create_task(get_notifier().circuit_breaker_tripped(
-                reason=halt_reason or "UNKNOWN",
-                daily_loss_pct=sizer.daily_loss,
-                weekly_loss_pct=sizer.weekly_loss,
-                drawdown_pct=sizer.current_drawdown,
-                bankroll=sizer.bankroll,
-            ))
-        elif can_trade and self._cb_was_halted:
-            self._cb_was_halted = False
-            asyncio.create_task(get_notifier().circuit_breaker_cleared(
-                bankroll=self.position_sizer.bankroll,
-            ))
+                logger.info("coordinator.orphan_recovered",
+                            ticker=info["ticker"], pnl=pnl,
+                            reason=info["reason"])
+
+                self.live_sizer.record_trade(pnl)
+
+                if self._pool is not None:
+                    try:
+                        async with self._pool.connection() as conn:
+                            await conn.execute(
+                                """INSERT INTO trades
+                                   (timestamp, ticker, direction, side, contracts, entry_price,
+                                    exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
+                                    regime_at_entry, candles_held, entry_obi, entry_roc,
+                                    closed_at, trading_mode)
+                                   VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)""",
+                                (
+                                    info["ticker"], info["direction"],
+                                    "yes" if info["direction"] == "long" else "no",
+                                    info["contracts"], info["entry_price"],
+                                    info["exit_price"], pnl, round(pnl_pct, 4), round(fees, 4),
+                                    info["reason"], "UNKNOWN", "UNKNOWN", 0,
+                                    0.0, 0.0, "live",
+                                ),
+                            )
+                    except Exception as e:
+                        logger.error("coordinator.orphan_persist_failed", error=str(e))
+
+                asyncio.create_task(get_notifier().trade_closed(
+                    ticker=info["ticker"],
+                    direction=info["direction"],
+                    contracts=info["contracts"],
+                    entry_price=info["entry_price"],
+                    exit_price=info["exit_price"],
+                    pnl=pnl,
+                    pnl_pct=round(pnl_pct, 4),
+                    exit_reason=info["reason"],
+                    candles_held=0,
+                    bankroll=self.live_sizer.bankroll,
+                    mode="live",
+                ))
+
+            remaining = len(self.live_trader.orphaned_positions)
+            if closed:
+                logger.info("coordinator.orphan_check_complete",
+                            closed=len(closed), remaining=remaining)
+                try:
+                    await self.sync_live_bankroll()
+                except Exception as e:
+                    logger.warning("coordinator.orphan_bankroll_sync_failed",
+                                   error=str(e))
+                await self._persist_equity("live")
+        except Exception as e:
+            logger.error("coordinator.orphan_check_failed", error=str(e))
+        finally:
+            self._orphan_check_in_flight = False
+
+    # ── Parameterized entry / exit evaluation ──────────────────────────
+
+    def _evaluate_entry_for(self, symbol: str, state, features, regime: str,
+                            trader, sizer: PositionSizer,
+                            breaker: CircuitBreaker, mode: str) -> None:
+        can_trade, halt_reason = breaker.can_trade()
+
+        if mode == "live":
+            if not can_trade and not self._cb_was_halted:
+                self._cb_was_halted = True
+                asyncio.create_task(get_notifier().circuit_breaker_tripped(
+                    reason=halt_reason or "UNKNOWN",
+                    daily_loss_pct=sizer.daily_loss,
+                    weekly_loss_pct=sizer.weekly_loss,
+                    drawdown_pct=sizer.current_drawdown,
+                    bankroll=sizer.bankroll,
+                ))
+            elif can_trade and self._cb_was_halted:
+                self._cb_was_halted = False
+                asyncio.create_task(get_notifier().circuit_breaker_cleared(
+                    bankroll=sizer.bankroll,
+                ))
 
         obi_history = self.feature_engine.obi_history(symbol)
         total_vol = features.total_bid_vol + features.total_ask_vol
@@ -283,16 +633,19 @@ class Coordinator:
             atr_regime=regime,
             can_trade=can_trade,
         )
-        self._last_decision = decision
+
+        if mode == "paper":
+            self._last_paper_decision = decision
+        else:
+            self._last_live_decision = decision
 
         if decision.should_trade:
             entry_price = self._get_entry_price(state, decision.direction)
             if entry_price is not None and entry_price > 0:
                 ticker = state.kalshi_ticker or symbol
                 roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
-                trader = self.active_trader
 
-                if self.trading_mode == "live":
+                if mode == "live":
                     asyncio.create_task(self._handle_live_entry(
                         trader, ticker, decision, entry_price, regime,
                         features, roc_val, symbol, state,
@@ -308,45 +661,35 @@ class Coordinator:
                         roc=roc_val,
                     )
                     if pos:
-                        self._on_trade_entry(pos, symbol, state, features, decision, roc_val)
+                        self._on_trade_entry(pos, symbol, state, features, decision, roc_val, mode)
                     else:
                         asyncio.create_task(get_notifier().position_sizing_failed(
-                            size_dollars=self.position_sizer.calculate_size(decision.conviction.value),
+                            size_dollars=sizer.calculate_size(decision.conviction.value),
                             price=entry_price,
-                            bankroll=self.position_sizer.bankroll,
+                            bankroll=sizer.bankroll,
                         ))
         elif decision.skip_reason and self._tick_count % 60 == 0:
             asyncio.create_task(self._persist_signal(
                 state, features, decision, decision.skip_reason
             ))
 
-    def _on_trade_entry(self, pos, symbol, state, features, decision, roc_val) -> None:
-        """Common post-entry logic for both paper and live trades."""
-        asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY"))
-        asyncio.create_task(ws_manager.broadcast({
-            "type": "trade_entry",
-            "symbol": symbol,
-            "position": {
-                "ticker": pos.ticker,
-                "direction": pos.direction,
-                "contracts": pos.contracts,
-                "entry_price": pos.entry_price,
-                "conviction": pos.conviction,
-            },
-        }))
-        asyncio.create_task(get_notifier().trade_opened(
-            ticker=pos.ticker,
-            direction=pos.direction,
-            contracts=pos.contracts,
-            entry_price=pos.entry_price,
-            conviction=pos.conviction,
-            obi=features.obi,
-            roc=roc_val,
-        ))
+    def _register_position_ticker(self, ticker: str, symbol: str) -> None:
+        """Tell the WS client to watch lifecycle events for this ticker."""
+        kalshi_ws = self.data_manager._kalshi_ws
+        if kalshi_ws and ticker:
+            kalshi_ws.watched_position_tickers[ticker] = symbol
+
+    def _unregister_position_ticker(self, ticker: str) -> None:
+        kalshi_ws = self.data_manager._kalshi_ws
+        if kalshi_ws and ticker:
+            kalshi_ws.watched_position_tickers.pop(ticker, None)
 
     async def _handle_live_entry(self, trader, ticker, decision, entry_price,
                                   regime, features, roc_val, symbol, state) -> None:
-        """Await a live trader entry (async) then run common post-entry logic."""
+        """Await a live trader entry (async) then run common post-entry logic.
+
+        PositionManager's lock prevents concurrent entries/exits.
+        """
         try:
             pos = await trader.enter(
                 ticker=ticker,
@@ -358,26 +701,26 @@ class Coordinator:
                 roc=roc_val,
             )
             if pos:
-                self._on_trade_entry(pos, symbol, state, features, decision, roc_val)
+                self._on_trade_entry(pos, symbol, state, features, decision, roc_val, "live")
             else:
                 await get_notifier().position_sizing_failed(
-                    size_dollars=self.position_sizer.calculate_size(decision.conviction.value),
+                    size_dollars=self.live_sizer.calculate_size(decision.conviction.value),
                     price=entry_price,
-                    bankroll=self.position_sizer.bankroll,
+                    bankroll=self.live_sizer.bankroll,
                 )
         except Exception as e:
             logger.error("coordinator.live_entry_failed", error=str(e))
 
-    def _check_exits(self, state, features, regime: str) -> Optional[str]:
-        pos = self.active_trader.position
+    def _check_exits_for(self, state, features, regime: str, trader) -> Optional[str]:
+        """Check exit conditions for a specific trader's position."""
+        pos = trader.position
         if pos is None:
             return None
 
-        # Must hold for at least 1 candle before any exit (except volatility spike)
         if pos.candles_held < 1 and regime != "HIGH":
             return None
 
-        current_price = self._get_exit_price(state)
+        current_price = self._get_exit_price_for(state, trader)
         if current_price is None:
             return None
 
@@ -415,17 +758,27 @@ class Coordinator:
         return exit_reason
 
     def _is_book_healthy(self, state) -> bool:
-        """Reject entries when the order book is empty or Kalshi data is stale."""
+        """Reject entries when the order book is empty or data feeds are stale."""
         ob = state.order_book
         if ob.best_yes_bid is None or ob.best_yes_ask is None:
             return False
 
+        now = time.time()
         kalshi_ws = self.data_manager._kalshi_ws
         if kalshi_ws and kalshi_ws.last_message_time is not None:
-            age = time.time() - kalshi_ws.last_message_time
+            age = now - kalshi_ws.last_message_time
             if age > 60:
                 logger.warning("coordinator.kalshi_stale", age_sec=round(age, 1))
                 return False
+
+        spot_ws = self.data_manager._spot_ws
+        if spot_ws and spot_ws.last_message_time is not None:
+            age = now - spot_ws.last_message_time
+            if age > 60:
+                logger.warning("coordinator.spot_stale", age_sec=round(age, 1))
+                return False
+        elif spot_ws and spot_ws.last_message_time is None:
+            return False
 
         return True
 
@@ -436,9 +789,9 @@ class Coordinator:
         else:
             return state.order_book.best_yes_bid
 
-    def _get_exit_price(self, state) -> Optional[float]:
-        """Get exit price based on current position direction."""
-        pos = self.active_trader.position
+    def _get_exit_price_for(self, state, trader) -> Optional[float]:
+        """Get exit price based on a specific trader's position direction."""
+        pos = trader.position
         if pos is None:
             return None
         mid = state.order_book.mid
@@ -448,8 +801,8 @@ class Coordinator:
             return state.order_book.best_yes_bid
         return state.order_book.best_yes_ask
 
-    def _serialize_decision(self) -> Optional[dict]:
-        d = self._last_decision
+    def _serialize_decision(self, mode: str = "paper") -> Optional[dict]:
+        d = self._last_paper_decision if mode == "paper" else self._last_live_decision
         if d is None:
             return None
         return {
@@ -460,6 +813,8 @@ class Coordinator:
             "skip_reason": d.skip_reason,
             "should_trade": d.should_trade,
         }
+
+    # ── Persistence ────────────────────────────────────────────────────
 
     async def _persist_snapshot(self, symbol: str, state, features) -> None:
         try:
@@ -545,7 +900,6 @@ class Coordinator:
                     msg += f"\nChanges: {changes_str}"
                 await notifier.send_heartbeat(msg)
 
-                # Run signal health check alongside tuning
                 try:
                     from monitoring.signal_health import run_signal_health_check
                     alerts = await run_signal_health_check(pool)
@@ -573,68 +927,69 @@ class Coordinator:
             wait_sec = (next_midnight - now_utc).total_seconds()
             await asyncio.sleep(wait_sec)
 
-            try:
-                pool = self._pool
-                if pool is None:
-                    continue
+            for attr_mode in ("paper", "live"):
+                try:
+                    pool = self._pool
+                    if pool is None:
+                        continue
 
-                yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-                date_str = yesterday.isoformat()
+                    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+                    date_str = yesterday.isoformat()
 
-                async with pool.connection() as conn:
-                    rows = await conn.execute(
-                        """SELECT timestamp, direction, pnl, pnl_pct, fees,
-                                  exit_reason, conviction, regime_at_entry,
-                                  candles_held, closed_at
-                           FROM trades
-                           WHERE DATE(timestamp) = %s AND trading_mode = %s
-                           ORDER BY timestamp""",
-                        (date_str, self.trading_mode),
-                    )
-                    result = await rows.fetchall()
+                    async with pool.connection() as conn:
+                        rows = await conn.execute(
+                            """SELECT timestamp, direction, pnl, pnl_pct, fees,
+                                      exit_reason, conviction, regime_at_entry,
+                                      candles_held, closed_at
+                               FROM trades
+                               WHERE DATE(timestamp) = %s AND trading_mode = %s
+                               ORDER BY timestamp""",
+                            (date_str, attr_mode),
+                        )
+                        result = await rows.fetchall()
 
-                trades = []
-                for r in result:
-                    trades.append({
-                        "timestamp": r[0].timestamp() if r[0] else 0,
-                        "direction": r[1],
-                        "pnl": float(r[2]) if r[2] else 0,
-                        "pnl_pct": float(r[3]) if r[3] else 0,
-                        "fees": float(r[4]) if r[4] else 0,
-                        "exit_reason": r[5],
-                        "conviction": r[6],
-                        "regime_at_entry": r[7],
-                        "candles_held": r[8],
-                        "exit_timestamp": r[9].timestamp() if r[9] else 0,
-                    })
+                    trades = []
+                    for r in result:
+                        trades.append({
+                            "timestamp": r[0].timestamp() if r[0] else 0,
+                            "direction": r[1],
+                            "pnl": float(r[2]) if r[2] else 0,
+                            "pnl_pct": float(r[3]) if r[3] else 0,
+                            "fees": float(r[4]) if r[4] else 0,
+                            "exit_reason": r[5],
+                            "conviction": r[6],
+                            "regime_at_entry": r[7],
+                            "candles_held": r[8],
+                            "exit_timestamp": r[9].timestamp() if r[9] else 0,
+                        })
 
-                from backtesting.attribution import run_attribution
-                attr = run_attribution(trades)
+                    from backtesting.attribution import run_attribution
+                    attr = run_attribution(trades)
 
-                async with pool.connection() as conn:
-                    await conn.execute(
-                        """INSERT INTO daily_attribution
-                                (date, total_trades, total_pnl, attribution, trading_mode)
-                           VALUES (%s, %s, %s, %s, %s)
-                           ON CONFLICT (date) DO UPDATE
-                           SET total_trades = EXCLUDED.total_trades,
-                               total_pnl    = EXCLUDED.total_pnl,
-                               attribution  = EXCLUDED.attribution,
-                               trading_mode = EXCLUDED.trading_mode""",
-                        (date_str, attr.get("total_trades", 0),
-                         attr.get("total_pnl_dollars", 0),
-                         json.dumps(attr), self.trading_mode),
-                    )
+                    async with pool.connection() as conn:
+                        await conn.execute(
+                            """INSERT INTO daily_attribution
+                                    (date, total_trades, total_pnl, attribution, trading_mode)
+                               VALUES (%s, %s, %s, %s, %s)
+                               ON CONFLICT (date, trading_mode) DO UPDATE
+                               SET total_trades = EXCLUDED.total_trades,
+                                   total_pnl    = EXCLUDED.total_pnl,
+                                   attribution  = EXCLUDED.attribution""",
+                            (date_str, attr.get("total_trades", 0),
+                             attr.get("total_pnl_dollars", 0),
+                             json.dumps(attr), attr_mode),
+                        )
 
-                if trades:
-                    notifier = get_notifier()
-                    await notifier.daily_attribution_report(date_str, attr)
+                    if trades:
+                        notifier = get_notifier()
+                        await notifier.daily_attribution_report(date_str, attr)
 
-                logger.info("coordinator.daily_attribution_done",
-                            date=date_str, trades=len(trades))
+                    logger.info("coordinator.daily_attribution_done",
+                                date=date_str, mode=attr_mode, trades=len(trades))
 
-            except Exception as e:
-                logger.error("coordinator.daily_attribution_failed", error=str(e))
+                except Exception as e:
+                    logger.error("coordinator.daily_attribution_failed",
+                                 mode=attr_mode, error=str(e))
 
     async def _schedule_weekly_digest(self) -> None:
         """Post a weekly attribution digest to Discord every Sunday at 00:10 UTC."""
@@ -704,7 +1059,6 @@ class Coordinator:
 
                 fee_drag_pct = (total_fees / theoretical_pnl * 100) if theoretical_pnl > 0 else 0
 
-                # Detect flips: check prior week for sessions/regimes that were profitable
                 prior_start = week_start - timedelta(days=7)
                 prior_end = week_start - timedelta(days=1)
                 flipped_sessions: list[str] = []
@@ -769,13 +1123,14 @@ class Coordinator:
         self._rapid_fire_count = 0
         return False
 
-    async def _persist_trade(self, trade) -> None:
+    async def _persist_trade(self, trade, mode: str = "paper") -> bool:
+        """Persist trade to DB. Returns True if the trade was quarantined."""
         try:
             pool = self._pool
             if pool is None:
-                return
+                return False
 
-            mode = self.trading_mode
+            sizer = self.live_sizer if mode == "live" else self.paper_sizer
 
             is_rapid = self._detect_rapid_fire()
             error_reason = None
@@ -785,7 +1140,7 @@ class Coordinator:
                 error_reason = "INSTANT_STOP_LOSS"
 
             if error_reason:
-                self.position_sizer.reverse_trade(trade.pnl)
+                sizer.reverse_trade(trade.pnl)
                 async with pool.connection() as conn:
                     await conn.execute(
                         """INSERT INTO errored_trades
@@ -818,7 +1173,7 @@ class Coordinator:
                     error_reason=error_reason,
                     rapid_count=self._rapid_fire_count,
                 ))
-                return
+                return True
 
             async with pool.connection() as conn:
                 await conn.execute(
@@ -836,9 +1191,11 @@ class Coordinator:
                         0.0, 0.0, mode,
                     ),
                 )
+            return False
         except Exception as e:
             logger.error("coordinator.persist_trade_failed", error=str(e))
             asyncio.create_task(get_notifier().db_error("persist_trade", str(e)))
+            return False
 
     async def _persist_signal(self, state, features, decision, action: str) -> None:
         try:
@@ -867,12 +1224,13 @@ class Coordinator:
             logger.error("coordinator.persist_signal_failed", error=str(e))
             asyncio.create_task(get_notifier().db_error("persist_signal", str(e)))
 
-    async def _persist_equity(self) -> None:
+    async def _persist_equity(self, mode: str = "paper") -> None:
         try:
             pool = self._pool
             if pool is None:
                 return
-            sizer = self.position_sizer
+            sizer = self.live_sizer if mode == "live" else self.paper_sizer
+            trader = self.live_trader if mode == "live" else self.paper_trader
             async with pool.connection() as conn:
                 await conn.execute(
                     """INSERT INTO bankroll_history
@@ -883,8 +1241,8 @@ class Coordinator:
                         sizer.peak_bankroll,
                         round(sizer.current_drawdown * 100, 4),
                         round(sum(sizer.trades_today), 4),
-                        len(self.active_trader.trades),
-                        self.trading_mode,
+                        len(trader.trades),
+                        mode,
                     ),
                 )
         except Exception as e:
@@ -941,7 +1299,6 @@ class Coordinator:
                 return
             import json
 
-            # Restore param_overrides from auto-tuner
             try:
                 async with pool.connection() as conn:
                     po_row = await conn.execute(
@@ -967,12 +1324,21 @@ class Coordinator:
                 if "paper" in state:
                     self._apply_sizer_state(self.paper_sizer, state["paper"])
                     self._apply_sizer_state(self.live_sizer, state["live"])
-                    self.trading_paused = state.get("trading_paused", False)
+                    raw_paused = state.get("trading_paused", "off")
+                    if raw_paused is True:
+                        self.trading_paused = "paused"
+                    elif raw_paused is False:
+                        self.trading_paused = "off"
+                    else:
+                        self.trading_paused = raw_paused
+                    saved_mode = state.get("trading_mode")
+                    if saved_mode in ("paper", "live"):
+                        self.trading_mode = saved_mode
                     logger.info("coordinator.state_restored",
                                 paper_bankroll=self.paper_sizer.bankroll,
-                                live_bankroll=self.live_sizer.bankroll)
+                                live_bankroll=self.live_sizer.bankroll,
+                                trading_mode=self.trading_mode)
                 else:
-                    # Legacy format: single sizer state, apply to paper only
                     self._apply_sizer_state(self.paper_sizer, state)
                     logger.info("coordinator.state_restored_legacy",
                                 bankroll=self.paper_sizer.bankroll)
@@ -997,8 +1363,93 @@ class Coordinator:
                 logger.info("coordinator.state_reconstructed",
                             paper_bankroll=self.paper_sizer.bankroll,
                             live_bankroll=self.live_sizer.bankroll)
+
+            try:
+                await self.sync_live_bankroll(is_initial=True)
+            except Exception as e:
+                logger.warning("coordinator.live_balance_fetch_failed", error=str(e))
+
+            try:
+                await self._cancel_stale_orders()
+            except Exception as e:
+                logger.warning("coordinator.cancel_stale_orders_failed", error=str(e))
+
+            try:
+                await self._reconcile_live_positions()
+            except Exception as e:
+                logger.warning("coordinator.reconcile_failed", error=str(e))
         except Exception as e:
             logger.warning("coordinator.restore_state_failed", error=str(e))
+
+    async def _cancel_stale_orders(self) -> None:
+        """Cancel any resting orders left from a previous session."""
+        try:
+            orders_data = await self.live_trader.client.get_orders(status="resting")
+            orders = orders_data.get("orders", [])
+            if not orders:
+                return
+            for order in orders:
+                ticker = order.get("ticker", "")
+                is_ours = any(ticker.startswith(p) for p in ("KXBTC", "KXETH"))
+                if not is_ours:
+                    continue
+                order_id = order.get("order_id")
+                if order_id:
+                    try:
+                        await self.live_trader.client.cancel_order(order_id)
+                        logger.info("coordinator.stale_order_canceled",
+                                    ticker=ticker, order_id=order_id)
+                    except Exception as e:
+                        logger.warning("coordinator.stale_order_cancel_failed",
+                                       order_id=order_id, error=str(e))
+        except Exception as e:
+            logger.warning("coordinator.stale_orders_fetch_failed", error=str(e))
+
+    async def _reconcile_live_positions(self) -> None:
+        """Delegate reconciliation to PositionManager (handles locking, orphan
+        adoption, ghost detection, and DESYNC state transitions)."""
+        pm = self.live_trader.position_manager
+
+        old_position_ticker = pm.position.ticker if pm.position else None
+
+        await pm.reconcile()
+
+        if old_position_ticker and not pm.has_position:
+            self._unregister_position_ticker(old_position_ticker)
+            asyncio.create_task(get_notifier().unhandled_exception(
+                location="coordinator._reconcile_live_positions",
+                error=f"Ghost position cleared: bot had {old_position_ticker} but exchange shows no position",
+            ))
+            try:
+                await self.sync_live_bankroll()
+            except Exception:
+                pass
+
+        new_orphan_count = len(pm.orphaned_positions)
+        if new_orphan_count > 0 and new_orphan_count != getattr(self, '_last_orphan_count', 0):
+            self._last_orphan_count = new_orphan_count
+            logger.warning("coordinator.orphans_detected",
+                           count=new_orphan_count,
+                           tickers=[o.ticker for o in pm.orphaned_positions])
+            asyncio.create_task(get_notifier().unhandled_exception(
+                location="coordinator._reconcile_live_positions",
+                error=f"Detected {new_orphan_count} orphaned Kalshi positions, monitoring for break-even exit",
+            ))
+        elif new_orphan_count == 0 and getattr(self, '_last_orphan_count', 0) > 0:
+            self._last_orphan_count = 0
+
+    async def _periodic_reconciliation(self) -> None:
+        """Periodic check: detect exchange positions the bot doesn't know about,
+        and sync wallet balance to keep internal bankroll accurate."""
+        try:
+            await self._reconcile_live_positions()
+        except Exception as e:
+            logger.warning("coordinator.periodic_reconcile_failed", error=str(e))
+
+        try:
+            await self.sync_live_bankroll()
+        except Exception as e:
+            logger.warning("coordinator.periodic_wallet_sync_failed", error=str(e))
 
 
 def _serialize_state(state) -> dict:
