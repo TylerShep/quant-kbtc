@@ -1,4 +1,4 @@
-import { useState, useEffect, Component, type ReactNode } from 'react';
+import { useState, useEffect, useRef, Component, type ReactNode } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useStatus } from './hooks/useStatus';
 import { useTrades } from './hooks/useTrades';
@@ -49,6 +49,14 @@ function App() {
   const status = useStatus(5000);
   const tradingMode = status?.trading_mode;
   const [viewMode, setViewMode] = useState<ViewMode>('paper');
+  const userPickedView = useRef(false);
+  const initialSyncDone = useRef(false);
+
+  const handleViewModeChange = (mode: ViewMode) => {
+    userPickedView.current = true;
+    setViewMode(mode);
+  };
+
   const { equity, stats } = useEquity(viewMode);
   const [tradesPage, setTradesPage] = useState(1);
   const { data: tradesData, loading: tradesLoading } = useTrades(tradesPage, 10, viewMode);
@@ -61,9 +69,18 @@ function App() {
   const [chartMode, setChartMode] = useState<ChartMode>('account');
   const [chartTab, setChartTab] = useState<'equity' | 'btc'>('equity');
 
-  // Sync viewMode to tradingMode when it changes (default view follows active mode)
+  // On first status load, set the default view to match the backend trading mode.
+  // After that, only sync when the user hasn't manually picked a tab.
   useEffect(() => {
-    if (tradingMode === 'live' || tradingMode === 'paper') {
+    if (!tradingMode) return;
+    if (!initialSyncDone.current) {
+      initialSyncDone.current = true;
+      if (tradingMode === 'live' || tradingMode === 'paper') {
+        setViewMode(tradingMode as ViewMode);
+      }
+      return;
+    }
+    if (!userPickedView.current && (tradingMode === 'live' || tradingMode === 'paper')) {
       setViewMode(tradingMode as ViewMode);
     }
   }, [tradingMode]);
@@ -80,6 +97,7 @@ function App() {
   }, [lastMessage]);
 
   const initialBankroll = stats?.initial_bankroll ?? 1000;
+  const statsReady = stats !== null && equity !== null;
 
   const allEquityData: PnLPoint[] = equity?.equity?.map((e) => ({
     time: e.time,
@@ -103,7 +121,7 @@ function App() {
     ? allEquityData.filter((p) => p.time >= nowSec - cutoffSec)
     : allEquityData;
 
-  const chartData: PnLPoint[] = [...equityData, livePoint];
+  const chartData: PnLPoint[] = statsReady ? [...equityData, livePoint] : [];
 
   const statusMarket = status?.market_states?.['BTC'];
   const mergedMarket: MarketState | null = marketState ?? (statusMarket ? {
@@ -156,7 +174,7 @@ function App() {
               <div className="flex bg-[var(--bg-tertiary)] rounded p-0.5 mr-3">
                 <button
                   type="button"
-                  onClick={() => setViewMode('paper')}
+                  onClick={() => handleViewModeChange('paper')}
                   className={`px-3 py-1 text-xs rounded transition-colors font-medium ${
                     viewMode === 'paper'
                       ? 'bg-blue-600 text-white'
@@ -167,7 +185,7 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setViewMode('live')}
+                  onClick={() => handleViewModeChange('live')}
                   className={`px-3 py-1 text-xs rounded transition-colors font-medium ${
                     viewMode === 'live'
                       ? 'bg-amber-600 text-white'

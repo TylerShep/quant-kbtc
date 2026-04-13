@@ -12,6 +12,7 @@ interface SidebarProps {
 }
 
 export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = 'off', viewMode = 'paper' }: SidebarProps) {
+  const statsLoading = stats === null;
   const equity = stats?.equity ?? risk?.bankroll ?? 0;
   const drawdown = risk?.drawdown_pct ?? 0;
   const dailyLoss = risk?.daily_loss_pct ?? 0;
@@ -39,8 +40,8 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
             {viewMode === 'live' ? 'LIVE' : 'PAPER'}
           </span>
         </div>
-        <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
-          ${equity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+        <div className={`text-sm font-medium ${statsLoading ? 'animate-pulse' : ''}`} style={{ color: 'var(--text-primary)' }}>
+          {statsLoading ? '...' : `$${equity.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
         </div>
       </div>
 
@@ -71,15 +72,21 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
 
       <div>
         <div className="text-xs text-[var(--text-muted)] mb-1">Cumulative PnL</div>
-        <div
-          className="text-lg font-semibold"
-          style={{ color: totalPnl >= 0 ? 'var(--green)' : 'var(--red)' }}
-        >
-          {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
-        </div>
-        <div className="text-xs text-[var(--text-muted)]">
-          Win Rate: {(winRate * 100).toFixed(1)}%
-        </div>
+        {statsLoading ? (
+          <div className="text-lg font-semibold animate-pulse" style={{ color: 'var(--text-muted)' }}>...</div>
+        ) : (
+          <>
+            <div
+              className="text-lg font-semibold"
+              style={{ color: totalPnl >= 0 ? 'var(--green)' : 'var(--red)' }}
+            >
+              {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+            </div>
+            <div className="text-xs text-[var(--text-muted)]">
+              Win Rate: {(winRate * 100).toFixed(1)}%
+            </div>
+          </>
+        )}
       </div>
 
       <hr className="border-[var(--border)]" />
@@ -87,7 +94,7 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
       <StatBlock label="Drawdown" value={`${drawdown.toFixed(2)}%`} color={drawdown > 10 ? 'var(--red)' : 'var(--text-primary)'} />
       <StatBlock label="Daily Loss" value={`${dailyLoss.toFixed(2)}%`} color={dailyLoss > 4 ? 'var(--red)' : 'var(--text-primary)'} />
       <StatBlock label="Trades Today" value={String(risk?.trades_today ?? 0)} />
-      <StatBlock label="Total Trades" value={String(stats?.total_trades ?? paper?.total_trades ?? 0)} />
+      <StatBlock label="Total Trades" value={statsLoading ? '...' : String(stats?.total_trades ?? paper?.total_trades ?? 0)} loading={statsLoading} />
 
       <div className="mt-auto flex flex-col gap-2">
         <LiveToggle isLive={tradingMode === 'live'} tradingPaused={tradingPaused} />
@@ -278,15 +285,17 @@ function StatBlock({
   label,
   value,
   color,
+  loading,
 }: {
   label: string;
   value: string;
   color?: string;
+  loading?: boolean;
 }) {
   return (
     <div>
       <div className="text-xs text-[var(--text-muted)]">{label}</div>
-      <div className="text-sm font-medium" style={{ color: color ?? 'var(--text-primary)' }}>
+      <div className={`text-sm font-medium ${loading ? 'animate-pulse' : ''}`} style={{ color: color ?? 'var(--text-primary)' }}>
         {value}
       </div>
     </div>

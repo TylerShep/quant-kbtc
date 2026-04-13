@@ -130,11 +130,23 @@ class KalshiRESTClient:
 
 
 class KalshiOrderClient:
-    """Kalshi REST client for order placement and portfolio queries."""
+    """Kalshi REST client for order placement and portfolio queries.
+
+    Uses a persistent httpx.AsyncClient with HTTP/2 to eliminate TLS
+    handshake overhead on every API call (~10-30ms saved per call).
+    Call aclose() on shutdown to release the connection pool cleanly.
+    """
 
     def __init__(self):
         self.auth = KalshiAuth()
         self.base_url = settings.kalshi.base_url
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url, http2=True, timeout=15.0
+        )
+
+    async def aclose(self) -> None:
+        """Close the persistent HTTP client. Call from Coordinator.stop()."""
+        await self._client.aclose()
 
     async def create_order(
         self,
@@ -169,26 +181,29 @@ class KalshiOrderClient:
         if no_price is not None:
             body["no_price"] = no_price
 
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as c:
-            r = await c.post("/portfolio/orders", headers=headers, json=body)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.post(
+            "/portfolio/orders", headers=headers, json=body, timeout=15.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def cancel_order(self, order_id: str) -> dict:
         path = f"/trade-api/v2/portfolio/orders/{order_id}"
         headers = self.auth.get_headers("DELETE", path)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.delete(f"/portfolio/orders/{order_id}", headers=headers)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.delete(
+            f"/portfolio/orders/{order_id}", headers=headers, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def get_order(self, order_id: str) -> dict:
         path = f"/trade-api/v2/portfolio/orders/{order_id}"
         headers = self.auth.get_headers("GET", path)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get(f"/portfolio/orders/{order_id}", headers=headers)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(
+            f"/portfolio/orders/{order_id}", headers=headers, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def get_positions(
         self,
@@ -204,35 +219,40 @@ class KalshiOrderClient:
             params["ticker"] = ticker
         if count_filter is not None:
             params["count_filter"] = count_filter
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get("/portfolio/positions", headers=headers, params=params or None)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(
+            "/portfolio/positions", headers=headers,
+            params=params or None, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def get_balance(self) -> dict:
         path = "/trade-api/v2/portfolio/balance"
         headers = self.auth.get_headers("GET", path)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get("/portfolio/balance", headers=headers)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(
+            "/portfolio/balance", headers=headers, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def get_orders(self, status: str = "resting") -> dict:
         path = "/trade-api/v2/portfolio/orders"
         headers = self.auth.get_headers("GET", path)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get("/portfolio/orders", headers=headers,
-                            params={"status": status, "limit": 100})
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(
+            "/portfolio/orders", headers=headers,
+            params={"status": status, "limit": 100}, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def get_market(self, ticker: str) -> dict:
         path = f"/trade-api/v2/markets/{ticker}"
         headers = self.auth.get_headers("GET", path)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as c:
-            r = await c.get(f"/markets/{ticker}", headers=headers)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(
+            f"/markets/{ticker}", headers=headers, timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json()
 
 
 class KalshiWebSocketClient:

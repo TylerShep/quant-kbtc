@@ -138,6 +138,38 @@ CREATE TABLE IF NOT EXISTS bot_state (
     updated_at      TIMESTAMPTZ     DEFAULT NOW()
 );
 
+-- ML feature snapshots captured at trade entry, labeled at exit
+CREATE TABLE IF NOT EXISTS trade_features (
+    id              BIGSERIAL       PRIMARY KEY,
+    trade_id        BIGINT          NOT NULL,
+    timestamp       TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper',
+    ticker          VARCHAR(60)     NOT NULL,
+    -- Signal features
+    obi             NUMERIC(8,4),
+    roc_3           NUMERIC(10,4),
+    roc_5           NUMERIC(10,4),
+    roc_10          NUMERIC(10,4),
+    -- Volatility / microstructure
+    atr_pct         NUMERIC(10,6),
+    spread_pct      NUMERIC(10,6),
+    bid_depth       NUMERIC(20,2),
+    ask_depth       NUMERIC(20,2),
+    -- Candle context
+    green_candles_3 INTEGER,
+    candle_body_pct NUMERIC(8,4),
+    volume_ratio    NUMERIC(10,4),
+    -- Time context
+    time_remaining_sec INTEGER,
+    hour_of_day     INTEGER,
+    day_of_week     INTEGER,
+    -- Label (filled at exit)
+    label           SMALLINT,
+    pnl             NUMERIC(14,4)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_features_trade ON trade_features (trade_id);
+CREATE INDEX IF NOT EXISTS idx_trade_features_label ON trade_features (label) WHERE label IS NOT NULL;
+
 -- Enable compression on hypertables then add policies
 ALTER TABLE ob_snapshots SET (timescaledb.compress, timescaledb.compress_segmentby = 'ticker');
 SELECT add_compression_policy('ob_snapshots', INTERVAL '7 days', if_not_exists => TRUE);

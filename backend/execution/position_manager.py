@@ -51,6 +51,8 @@ class ManagedPosition:
     entry_roc: float = 0.0
     candles_held: int = 0
     order_id: Optional[str] = None
+    entry_cost_dollars: Optional[float] = None
+    entry_fees_dollars: Optional[float] = None
 
 
 @dataclass
@@ -65,8 +67,8 @@ class OrphanedPosition:
 # Kalshi canonical terminal statuses (API v2 spec 3.13.0)
 TERMINAL_STATUSES = ("executed", "canceled")
 
-FILL_POLL_INTERVAL = 1.0
-FILL_POLL_TIMEOUT = 10.0
+FILL_POLL_INTERVAL = 0.25
+FILL_POLL_TIMEOUT = 15.0
 VERIFY_FAILED = -1
 
 
@@ -85,11 +87,15 @@ class PositionManager:
         self.orphaned_positions: list[OrphanedPosition] = []
         self._db_pool = None
 
-        # Hard trade limit: when set, blocks new entries after N completed
-        # round-trip trades.  Set to 1 for single-trade testing mode.
-        # None = unlimited (normal operation).
+        # Supervised single-trade mode: after each completed live round-trip,
+        # the coordinator auto-pauses for post-trade review. Set to None for
+        # unlimited (normal operation once testing is complete).
         self.live_trade_limit: Optional[int] = 1
         self._completed_live_trades: int = 0
+
+        # Tracks tickers confirmed as settled/finalized to prevent
+        # reconciliation from re-adopting them as orphans (BUG-008).
+        self._settled_tickers: set[str] = set()
 
     # ── Public properties ─────────────────────────────────────────────
 
@@ -173,6 +179,36 @@ class PositionManager:
         return None
 
     @staticmethod
+    def _parse_fill_price_yes_side(order_data: dict) -> Optional[float]:
+        """Always return the Yes-side price in cents from a fill.
+
+        The PnL formula uses Yes-side prices uniformly:
+          long  PnL = +(exit_yes - entry_yes)  (buy Yes low, sell Yes high)
+          short PnL = -(exit_yes - entry_yes)  (sell Yes high, buy Yes low)
+
+        Kalshi order responses include both yes_price_dollars and
+        no_price_dollars. We prefer yes_price_dollars directly; if only
+        no_price_dollars is available we convert via (1 - no_price).
+        """
+        yes_raw = order_data.get("yes_price_dollars") or order_data.get("yes_price")
+        if yes_raw is not None:
+            try:
+                val = float(yes_raw)
+                return val * 100 if val < 1 else val
+            except (ValueError, TypeError):
+                pass
+        no_raw = order_data.get("no_price_dollars") or order_data.get("no_price")
+        if no_raw is not None:
+            try:
+                no_val = float(no_raw)
+                if no_val < 1:
+                    no_val *= 100
+                return 100 - no_val
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    @staticmethod
     def _parse_actual_fees(order_data: dict) -> Optional[float]:
         """Extract actual fees paid from Kalshi order response."""
         taker = order_data.get("taker_fees_dollars")
@@ -180,6 +216,18 @@ class PositionManager:
         if taker is not None or maker is not None:
             try:
                 return float(taker or "0") + float(maker or "0")
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    @staticmethod
+    def _parse_fill_cost(order_data: dict) -> Optional[float]:
+        """Extract taker_fill_cost_dollars -- the actual dollar amount Kalshi
+        charged/credited for this order, independent of Yes/No side."""
+        raw = order_data.get("taker_fill_cost_dollars")
+        if raw is not None:
+            try:
+                return float(raw)
             except (ValueError, TypeError):
                 pass
         return None
@@ -209,20 +257,38 @@ class PositionManager:
     # ── Exchange verification ─────────────────────────────────────────
 
     async def verify_position_on_exchange(self, ticker: str) -> int:
-        """Query Kalshi for actual contract count on this ticker.
-        Returns 0 if no position, VERIFY_FAILED (-1) on API error."""
+        """Query Kalshi for actual signed contract count on this ticker.
+
+        Positive = long, negative = short, 0 = flat.
+        Returns VERIFY_FAILED (-1) on API error.
+        """
         try:
             data = await self.client.get_positions(
                 ticker=ticker, count_filter="position"
             )
             for mp in data.get("market_positions", []):
                 if mp.get("ticker") == ticker:
-                    return abs(int(float(mp.get("position_fp", 0))))
+                    return int(float(mp.get("position_fp", 0)))
             return 0
         except Exception as e:
             logger.error("position_manager.verify_failed",
                          ticker=ticker, error=str(e))
             return VERIFY_FAILED
+
+    async def _check_if_market_settled(self, ticker: str) -> Optional[str]:
+        """Check if a market has settled. Returns 'yes'/'no' if settled, None if still open."""
+        try:
+            market_data = await self.client.get_market(ticker)
+            market = market_data.get("market", {})
+            status = market.get("status", "")
+            if status in ("closed", "settled", "finalized"):
+                result = market.get("result", "")
+                self._settled_tickers.add(ticker)
+                return result or "no"
+        except Exception as e:
+            logger.warning("position_manager.market_settled_check_failed",
+                           ticker=ticker, error=str(e))
+        return None
 
     async def _check_flat_on_exchange(self, ticker: str) -> bool:
         """Return True only if exchange confirms zero position on ticker."""
@@ -230,7 +296,7 @@ class PositionManager:
         if count == VERIFY_FAILED:
             logger.warning("position_manager.pre_entry_verify_failed", ticker=ticker)
             return False
-        if count > 0:
+        if count != 0:
             logger.warning("position_manager.not_flat_on_exchange",
                            ticker=ticker, exchange_contracts=count)
             return False
@@ -327,7 +393,7 @@ class PositionManager:
                                    order_id=order_id)
                 else:
                     exchange_count = await self.verify_position_on_exchange(ticker)
-                    if exchange_count > 0:
+                    if exchange_count != 0 and exchange_count != VERIFY_FAILED:
                         logger.error("position_manager.silent_fill_detected",
                                      ticker=ticker, exchange_contracts=exchange_count)
                         self._transition(PositionState.DESYNC)
@@ -338,6 +404,8 @@ class PositionManager:
             # Poll for fill
             fill_price = price
             filled_contracts = 0
+            entry_cost = None
+            entry_fees = None
             if order_id:
                 order_data = await self._poll_order_fill(order_id)
                 status = order_data.get("status", "")
@@ -352,11 +420,17 @@ class PositionManager:
                 if filled_count > 0:
                     filled_contracts = filled_count
 
-                parsed_price = self._parse_fill_price(order_data, direction)
+                parsed_price = self._parse_fill_price_yes_side(order_data)
                 if parsed_price is not None:
                     fill_price = parsed_price
 
-            # Post-order: mandatory exchange verification
+                entry_cost = self._parse_fill_cost(order_data)
+                entry_fees = self._parse_actual_fees(order_data)
+
+            # Ledger lag: wait before verification so Kalshi's position
+            # endpoint reflects the fill that just occurred (Fix 2).
+            await asyncio.sleep(1.5)
+
             verified = await self.verify_position_on_exchange(ticker)
             if verified == VERIFY_FAILED:
                 if filled_contracts > 0:
@@ -390,6 +464,8 @@ class PositionManager:
                 entry_obi=obi,
                 entry_roc=roc,
                 order_id=order_id,
+                entry_cost_dollars=entry_cost,
+                entry_fees_dollars=entry_fees,
             )
             self._transition(PositionState.OPEN)
 
@@ -404,10 +480,18 @@ class PositionManager:
         """Place an exit order with full exchange verification.
 
         Returns a dict with trade details on success, None on failure.
+        If a 409 Conflict reveals the market settled, delegates to
+        handle_settlement automatically.
         Acquires the position lock.
         """
         async with self._lock:
-            return await self._exit_inner(price, reason)
+            result = await self._exit_inner(price, reason)
+            if result and result.get("_settled"):
+                settled_result = result["_result"]
+                logger.info("position_manager.exit_redirected_to_settlement",
+                            result=settled_result)
+                return await self._handle_settlement_inner(settled_result)
+            return result
 
     async def _exit_inner(self, price: float, reason: str) -> Optional[dict]:
         """Exit logic without acquiring the lock (caller must hold it)."""
@@ -418,8 +502,6 @@ class PositionManager:
         self._transition(PositionState.EXITING)
 
         side = "yes" if pos.direction == "long" else "no"
-        yes_price = int(price) if side == "yes" else None
-        no_price = int(100 - price) if side == "no" else None
         client_order_id = self._generate_client_order_id(pos.ticker, "sell")
 
         exit_order_id = None
@@ -430,16 +512,27 @@ class PositionManager:
                 action="sell",
                 count=pos.contracts,
                 type="market",
-                yes_price=yes_price,
-                no_price=no_price,
                 client_order_id=client_order_id,
+                **({"yes_price": 1} if side == "yes" else {"no_price": 1}),
             )
             exit_order_id = result.get("order", {}).get("order_id")
             logger.info("position_manager.exit_order_placed",
                         ticker=pos.ticker, order_id=exit_order_id)
         except Exception as e:
+            error_str = str(e)
+            is_conflict = "409" in error_str or "Conflict" in error_str
             logger.error("position_manager.exit_order_failed",
-                         error=str(e), ticker=pos.ticker)
+                         error=error_str, ticker=pos.ticker,
+                         is_conflict=is_conflict)
+
+            if is_conflict:
+                settled = await self._check_if_market_settled(pos.ticker)
+                if settled is not None:
+                    logger.info("position_manager.exit_conflict_settled",
+                                ticker=pos.ticker, result=settled)
+                    self._transition(PositionState.OPEN)
+                    return {"_settled": True, "_result": settled}
+
             recovered = await self._recover_order_after_failure(client_order_id)
             if recovered:
                 exit_order_id = recovered.get("order_id")
@@ -452,6 +545,7 @@ class PositionManager:
         exit_price = price
         exited_contracts = 0
         actual_fees = None
+        exit_cost = None
         if exit_order_id:
             order_data = await self._poll_order_fill(exit_order_id)
             status = order_data.get("status", "")
@@ -466,16 +560,19 @@ class PositionManager:
             if filled_count > 0:
                 exited_contracts = filled_count
 
-            exit_side = "short" if pos.direction == "long" else "long"
-            parsed_price = self._parse_fill_price(order_data, exit_side)
+            parsed_price = self._parse_fill_price_yes_side(order_data)
             if parsed_price is not None:
                 exit_price = parsed_price
 
             actual_fees = self._parse_actual_fees(order_data)
+            exit_cost = self._parse_fill_cost(order_data)
 
-        # Post-order: mandatory exchange verification
-        remaining = await self.verify_position_on_exchange(pos.ticker)
-        if remaining == VERIFY_FAILED:
+        # Ledger lag: wait before verification so Kalshi's position
+        # endpoint reflects the fill that just occurred (Fix 2).
+        await asyncio.sleep(1.5)
+
+        remaining_signed = await self.verify_position_on_exchange(pos.ticker)
+        if remaining_signed == VERIFY_FAILED:
             if exited_contracts == 0:
                 logger.error("position_manager.exit_unverifiable",
                              ticker=pos.ticker, order_id=exit_order_id)
@@ -483,20 +580,31 @@ class PositionManager:
                 return None
             logger.warning("position_manager.exit_verify_failed_trusting_poll",
                            ticker=pos.ticker, filled=exited_contracts)
-        elif remaining >= pos.contracts:
-            logger.error("position_manager.phantom_exit_prevented",
-                         ticker=pos.ticker, exchange_position=remaining)
-            self._transition(PositionState.OPEN)
-            return None
         else:
-            verified_exited = pos.contracts - remaining
-            if exited_contracts == 0:
-                exited_contracts = verified_exited
-            elif verified_exited < exited_contracts:
-                logger.warning("position_manager.exit_fill_mismatch",
-                               poll_filled=exited_contracts,
-                               exchange_exited=verified_exited)
-                exited_contracts = verified_exited
+            expected_sign = 1 if pos.direction == "long" else -1
+            remaining_same_side = remaining_signed * expected_sign
+
+            if remaining_same_side < 0:
+                logger.error("position_manager.exit_overshot_to_opposite_side",
+                             ticker=pos.ticker,
+                             exchange_position=remaining_signed,
+                             expected_direction=pos.direction)
+                exited_contracts = pos.contracts
+            elif remaining_same_side >= pos.contracts:
+                logger.error("position_manager.phantom_exit_prevented",
+                             ticker=pos.ticker,
+                             exchange_position=remaining_signed)
+                self._transition(PositionState.OPEN)
+                return None
+            else:
+                verified_exited = pos.contracts - remaining_same_side
+                if exited_contracts == 0:
+                    exited_contracts = verified_exited
+                elif verified_exited < exited_contracts:
+                    logger.warning("position_manager.exit_fill_mismatch",
+                                   poll_filled=exited_contracts,
+                                   exchange_exited=verified_exited)
+                    exited_contracts = verified_exited
 
         if exited_contracts == 0:
             logger.error("position_manager.exit_zero_fill",
@@ -513,17 +621,39 @@ class PositionManager:
             self.adopt_orphan(pos.ticker, pos.direction, remainder, pos.entry_price)
             self._transition(PositionState.PARTIAL_EXIT)
 
-        # Build trade result
-        d = 1 if pos.direction == "long" else -1
-        pnl_per_contract = d * (exit_price - pos.entry_price) / 100
-        gross_pnl = pnl_per_contract * exited_contracts
-        notional = exited_contracts * pos.entry_price / 100
-        if actual_fees is not None:
-            fees = actual_fees
+        # Build trade result -- prefer Kalshi's actual dollar costs over formula.
+        # Each Kalshi binary contract pays out $1.00 max. Both entry and exit
+        # taker_fill_cost_dollars represent money spent (entry=buy cost,
+        # exit=close cost). PnL = max_payout - entry_cost - exit_cost - all_fees.
+        entry_cost = pos.entry_cost_dollars
+        if entry_cost is not None and exit_cost is not None:
+            contracts_value = float(exited_contracts)
+            entry_fees = pos.entry_fees_dollars or 0.0
+            exit_fees = actual_fees or 0.0
+            total_fees = entry_fees + exit_fees
+            net_pnl = contracts_value - entry_cost - exit_cost - total_fees
+            fees = total_fees
+            notional = entry_cost if entry_cost > 0 else 1.0
+            pnl_pct = net_pnl / notional if notional > 0 else 0
+            logger.info("position_manager.pnl_cost_based",
+                        contracts_value=contracts_value,
+                        entry_cost=entry_cost, exit_cost=exit_cost,
+                        entry_fees=entry_fees, exit_fees=exit_fees,
+                        net_pnl=net_pnl)
         else:
-            fees = notional * 0.007
-        net_pnl = gross_pnl - fees
-        pnl_pct = net_pnl / notional if notional > 0 else 0
+            d = 1 if pos.direction == "long" else -1
+            pnl_per_contract = d * (exit_price - pos.entry_price) / 100
+            gross_pnl = pnl_per_contract * exited_contracts
+            notional = exited_contracts * pos.entry_price / 100
+            if actual_fees is not None:
+                fees = actual_fees
+            else:
+                fees = notional * 0.007
+            net_pnl = gross_pnl - fees
+            pnl_pct = net_pnl / notional if notional > 0 else 0
+            logger.warning("position_manager.pnl_formula_fallback",
+                           entry_cost_available=entry_cost is not None,
+                           exit_cost_available=exit_cost is not None)
 
         trade_result = {
             "ticker": pos.ticker,
@@ -563,79 +693,99 @@ class PositionManager:
     async def handle_settlement(self, result: str) -> Optional[dict]:
         """Handle contract settlement. Acquires lock, verifies with exchange."""
         async with self._lock:
-            if self.position is None:
-                return None
+            return await self._handle_settlement_inner(result)
 
-            pos = self.position
-            settled_price = 100 if result == "yes" else 0
+    async def _handle_settlement_inner(self, result: str) -> Optional[dict]:
+        """Settlement logic without lock (caller must hold it)."""
+        if self.position is None:
+            return None
 
+        pos = self.position
+        settled_price = 100 if result == "yes" else 0
+
+        settled_contracts = pos.contracts
+
+        def _calc_settlement_pnl(contracts: int) -> tuple:
+            """Compute settlement PnL. At settlement there is no exit cost --
+            Kalshi either pays $1/contract (win) or $0 (loss). If we have the
+            original entry_cost_dollars we use it directly; otherwise fall back
+            to the price-based formula."""
+            entry_cost = pos.entry_cost_dollars
+            if entry_cost is not None:
+                won = (pos.direction == "long" and result == "yes") or \
+                      (pos.direction == "short" and result == "no")
+                payout = float(contracts) if won else 0.0
+                entry_fees = pos.entry_fees_dollars or 0.0
+                net = payout - entry_cost - entry_fees
+                notional = entry_cost if entry_cost > 0 else 1.0
+                pct = net / notional if notional > 0 else 0
+                return net, pct, entry_fees
             d = 1 if pos.direction == "long" else -1
-            pnl_per_contract = d * (settled_price - pos.entry_price) / 100
-            gross_pnl = pnl_per_contract * pos.contracts
-            notional = pos.contracts * pos.entry_price / 100
-            fees = notional * 0.007
-            net_pnl = gross_pnl - fees
-            pnl_pct = net_pnl / notional if notional > 0 else 0
+            pnl_per = d * (settled_price - pos.entry_price) / 100
+            gross = pnl_per * contracts
+            notional = contracts * pos.entry_price / 100
+            f = notional * 0.007
+            net = gross - f
+            pct = net / notional if notional > 0 else 0
+            return net, pct, f
 
-            trade_result = {
-                "ticker": pos.ticker,
-                "direction": pos.direction,
-                "contracts": pos.contracts,
-                "entry_price": pos.entry_price,
-                "exit_price": settled_price,
-                "pnl": round(net_pnl, 4),
-                "pnl_pct": round(pnl_pct, 4),
-                "fees": round(fees, 4),
-                "exit_reason": "CONTRACT_SETTLED",
-                "conviction": pos.conviction,
-                "regime_at_entry": pos.regime_at_entry,
-                "candles_held": pos.candles_held,
-                "entry_time": pos.entry_time,
-                "exit_time": datetime.now(timezone.utc).isoformat(),
-                "entry_order_id": pos.order_id,
-                "exit_order_id": None,
-                "entry_obi": pos.entry_obi,
-                "entry_roc": pos.entry_roc,
-            }
+        net_pnl, pnl_pct, fees = _calc_settlement_pnl(settled_contracts)
 
-            # Verify position is actually gone on exchange
-            remaining = await self.verify_position_on_exchange(pos.ticker)
-            if remaining == VERIFY_FAILED:
-                logger.error("position_manager.settlement_verify_failed",
-                             ticker=pos.ticker)
-                self.adopt_orphan(pos.ticker, pos.direction,
-                                  pos.contracts, pos.entry_price)
-                self.position = None
-                self._transition(PositionState.FLAT)
-                return None
+        trade_result = {
+            "ticker": pos.ticker,
+            "direction": pos.direction,
+            "contracts": settled_contracts,
+            "entry_price": pos.entry_price,
+            "exit_price": settled_price,
+            "pnl": round(net_pnl, 4),
+            "pnl_pct": round(pnl_pct, 4),
+            "fees": round(fees, 4),
+            "exit_reason": "CONTRACT_SETTLED",
+            "conviction": pos.conviction,
+            "regime_at_entry": pos.regime_at_entry,
+            "candles_held": pos.candles_held,
+            "entry_time": pos.entry_time,
+            "exit_time": datetime.now(timezone.utc).isoformat(),
+            "entry_order_id": pos.order_id,
+            "exit_order_id": None,
+            "entry_obi": pos.entry_obi,
+            "entry_roc": pos.entry_roc,
+        }
 
-            if remaining > 0:
-                logger.error("position_manager.settlement_position_still_open",
-                             ticker=pos.ticker, remaining=remaining)
-                self.adopt_orphan(pos.ticker, pos.direction,
-                                  remaining, pos.entry_price)
-                if remaining >= pos.contracts:
-                    self.position = None
-                    self._transition(PositionState.FLAT)
-                    return None
-                trade_result["contracts"] = pos.contracts - remaining
-                settled_contracts = pos.contracts - remaining
-                gross_pnl = pnl_per_contract * settled_contracts
-                notional = settled_contracts * pos.entry_price / 100
-                fees = notional * 0.007
-                net_pnl = gross_pnl - fees
-                pnl_pct = net_pnl / notional if notional > 0 else 0
-                trade_result["pnl"] = round(net_pnl, 4)
-                trade_result["pnl_pct"] = round(pnl_pct, 4)
-                trade_result["fees"] = round(fees, 4)
-
+        remaining = await self.verify_position_on_exchange(pos.ticker)
+        if remaining == VERIFY_FAILED:
+            self.adopt_orphan(pos.ticker, pos.direction,
+                              pos.contracts, pos.entry_price)
             self.position = None
             self._transition(PositionState.FLAT)
             self._completed_live_trades += 1
-            logger.info("position_manager.settlement_trade_counted",
-                         completed_trades=self._completed_live_trades,
-                         trade_limit=self.live_trade_limit)
+            trade_result["exit_reason"] = "CONTRACT_SETTLED_VERIFY_FAILED"
             return trade_result
+
+        remaining_abs = abs(remaining) if remaining != 0 else 0
+        if remaining_abs > 0:
+            logger.error("position_manager.settlement_position_still_open",
+                         ticker=pos.ticker, remaining=remaining)
+            self.adopt_orphan(pos.ticker, pos.direction,
+                              remaining_abs, pos.entry_price)
+            if remaining_abs >= pos.contracts:
+                self.position = None
+                self._transition(PositionState.FLAT)
+                return None
+            settled_contracts = pos.contracts - remaining_abs
+            trade_result["contracts"] = settled_contracts
+            net_pnl, pnl_pct, fees = _calc_settlement_pnl(settled_contracts)
+            trade_result["pnl"] = round(net_pnl, 4)
+            trade_result["pnl_pct"] = round(pnl_pct, 4)
+            trade_result["fees"] = round(fees, 4)
+
+        self.position = None
+        self._transition(PositionState.FLAT)
+        self._completed_live_trades += 1
+        logger.info("position_manager.settlement_trade_counted",
+                     completed_trades=self._completed_live_trades,
+                     trade_limit=self.live_trade_limit)
+        return trade_result
 
     # ── ORPHAN MANAGEMENT ─────────────────────────────────────────────
 
@@ -677,7 +827,7 @@ class PositionManager:
                 market = market_data.get("market", {})
                 status = market.get("status", "")
 
-                if status in ("closed", "settled"):
+                if status in ("closed", "settled", "finalized"):
                     result = market.get("result", "")
                     settled_price = 100 if result == "yes" else 0
                     d = 1 if orphan.direction == "long" else -1
@@ -693,6 +843,7 @@ class PositionManager:
                         "pnl": round(gross - fees, 4),
                         "reason": "ORPHAN_SETTLED",
                     })
+                    self._settled_tickers.add(orphan.ticker)
                     continue
 
                 if orphan.direction == "long":
@@ -718,27 +869,36 @@ class PositionManager:
                         order_id = result.get("order", {}).get("order_id")
                         filled = 0
                         actual_price = bid
+                        orphan_exit_cost = None
+                        orphan_fees = None
                         if order_id:
                             order_data = await self._poll_order_fill(order_id)
                             filled = self._parse_fill_count(order_data)
-                            exit_side = "short" if orphan.direction == "long" else "long"
-                            parsed = self._parse_fill_price(order_data, exit_side)
+                            parsed = self._parse_fill_price_yes_side(order_data)
                             if parsed is not None:
                                 actual_price = parsed
+                            orphan_exit_cost = self._parse_fill_cost(order_data)
+                            orphan_fees = self._parse_actual_fees(order_data)
 
                         if filled == 0:
                             remaining = await self.verify_position_on_exchange(
                                 orphan.ticker
                             )
-                            if remaining == VERIFY_FAILED or remaining >= orphan.contracts:
+                            remaining_abs = abs(remaining) if remaining != VERIFY_FAILED else 0
+                            if remaining == VERIFY_FAILED or remaining_abs >= orphan.contracts:
                                 remaining_list.append(orphan)
                                 continue
-                            filled = orphan.contracts - remaining
+                            filled = orphan.contracts - remaining_abs
 
-                        d = 1 if orphan.direction == "long" else -1
-                        pnl_per = d * (actual_price - orphan.avg_entry_price) / 100
-                        gross = pnl_per * filled
-                        fees = (filled * orphan.avg_entry_price / 100) * 0.007
+                        if orphan_exit_cost is not None:
+                            entry_est = orphan.contracts * orphan.avg_entry_price / 100
+                            gross = orphan_exit_cost - entry_est
+                            fees = orphan_fees if orphan_fees is not None else 0.0
+                        else:
+                            d = 1 if orphan.direction == "long" else -1
+                            pnl_per = d * (actual_price - orphan.avg_entry_price) / 100
+                            gross = pnl_per * filled
+                            fees = (filled * orphan.avg_entry_price / 100) * 0.007
                         closed.append({
                             "ticker": orphan.ticker,
                             "direction": orphan.direction,
@@ -813,19 +973,29 @@ class PositionManager:
 
             if ticker == tracked_ticker:
                 if self.position and contracts != self.position.contracts:
-                    diff = contracts - self.position.contracts
                     logger.warning("position_manager.reconcile_count_mismatch",
                                    ticker=ticker,
                                    bot=self.position.contracts,
                                    exchange=contracts)
-                    if diff > 0:
-                        self.adopt_orphan(ticker, direction, diff, avg_entry_cents)
-                    else:
-                        self.position.contracts = contracts
+                    self.position.contracts = contracts
                 continue
 
             already = any(o.ticker == ticker for o in self.orphaned_positions)
             if not already:
+                if ticker in self._settled_tickers:
+                    logger.debug("position_manager.reconcile_skip_settled", ticker=ticker)
+                    continue
+                try:
+                    market_data = await self.client.get_market(ticker)
+                    market_status = market_data.get("market", {}).get("status", "")
+                    if market_status in ("closed", "settled", "finalized"):
+                        logger.info("position_manager.reconcile_skip_settled_market",
+                                    ticker=ticker, status=market_status)
+                        self._settled_tickers.add(ticker)
+                        continue
+                except Exception as e:
+                    logger.warning("position_manager.reconcile_market_check_failed",
+                                   ticker=ticker, error=str(e))
                 self.adopt_orphan(ticker, direction, contracts, avg_entry_cents)
 
         if tracked_ticker and tracked_ticker not in exchange_tickers:
@@ -877,57 +1047,49 @@ class PositionManager:
             return None
 
     async def close_all_exchange_positions(self) -> list[dict]:
-        """Query exchange for ALL positions and close them. Acquires lock."""
+        """Query exchange for ALL positions and close them. Acquires lock.
+
+        Fix 4: Orphans are cleared per-ticker only when fill is confirmed,
+        not blanket-cleared at the end.
+        """
         async with self._lock:
             results = []
             try:
                 positions_data = await self.client.get_positions(count_filter="position")
-                market_positions = positions_data.get("market_positions", [])
             except Exception as e:
                 logger.error("position_manager.close_all_fetch_failed", error=str(e))
                 return results
-
-            for mp in market_positions:
+            for mp in positions_data.get("market_positions", []):
                 raw_position = float(mp.get("position_fp", 0))
                 contracts = abs(int(raw_position))
                 if contracts == 0:
                     continue
-
                 ticker = mp.get("ticker", "")
                 direction = "long" if raw_position > 0 else "short"
                 side = "yes" if direction == "long" else "no"
                 client_order_id = self._generate_client_order_id(ticker, "close-all")
-
                 try:
-                    sell_price_kwargs = {}
-                    if side == "yes":
-                        sell_price_kwargs["yes_price"] = 1
-                    else:
-                        sell_price_kwargs["no_price"] = 1
-
                     result = await self.client.create_order(
-                        ticker=ticker, side=side, action="sell",
-                        count=contracts, type="market",
-                        client_order_id=client_order_id,
-                        **sell_price_kwargs,
+                        ticker=ticker, side=side, action="sell", count=contracts,
+                        type="market", client_order_id=client_order_id,
+                        **({"yes_price": 1} if side == "yes" else {"no_price": 1}),
                     )
                     order_id = result.get("order", {}).get("order_id")
                     filled = 0
                     if order_id:
-                        order_data = await self._poll_order_fill(order_id)
-                        filled = self._parse_fill_count(order_data)
-                    results.append({
-                        "ticker": ticker, "direction": direction,
-                        "contracts": contracts, "filled": filled,
-                        "order_id": order_id, "status": "closed",
-                    })
+                        od = await self._poll_order_fill(order_id)
+                        filled = self._parse_fill_count(od)
+                    results.append({"ticker": ticker, "direction": direction,
+                                    "contracts": contracts, "filled": filled,
+                                    "order_id": order_id,
+                                    "status": "closed" if filled > 0 else "unfilled"})
+                    if filled > 0:
+                        self.orphaned_positions = [
+                            o for o in self.orphaned_positions if o.ticker != ticker
+                        ]
                 except Exception as e:
-                    results.append({
-                        "ticker": ticker, "error": str(e), "status": "failed",
-                    })
-
+                    results.append({"ticker": ticker, "error": str(e), "status": "failed"})
             self.position = None
-            self.orphaned_positions.clear()
             self._transition(PositionState.FLAT)
             return results
 
@@ -965,17 +1127,17 @@ class PositionManager:
         if restored_limit is not None:
             self.live_trade_limit = restored_limit
 
-    def reset_trade_counter(self) -> None:
-        """Reset the completed trade counter (e.g. after user review)."""
-        self._completed_live_trades = 0
-        logger.info("position_manager.trade_counter_reset",
-                     trade_limit=self.live_trade_limit)
-        asyncio.ensure_future(self._persist_state())
-
         logger.info("position_manager.restored",
                      state=self.state.value,
                      has_position=self.has_position,
                      orphans=len(self.orphaned_positions))
+
+    def reset_trade_counter(self) -> None:
+        """Reset the completed trade counter (e.g. after operator review)."""
+        self._completed_live_trades = 0
+        logger.info("position_manager.trade_counter_reset",
+                     trade_limit=self.live_trade_limit)
+        asyncio.ensure_future(self._persist_state())
 
     async def _persist_state(self) -> None:
         if self._db_pool is None:

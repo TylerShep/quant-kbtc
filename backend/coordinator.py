@@ -32,6 +32,7 @@ from execution.live_trader import LiveTrader
 from api.ws import ws_manager
 from database import get_pool, close_pool
 from notifications import get_notifier
+from ml.feature_capture import extract_features, save_features, label_trade
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +70,14 @@ class Coordinator:
         self._recent_exit_times: list[float] = []
         self._rapid_fire_count = 0
         self._orphan_check_in_flight = False
+
+        # Fix 1: Duplicate entry guard — prevents concurrent live entry tasks
+        self._live_entry_in_flight = False
+        self._live_exit_in_flight = False
+
+        # ML feature snapshots: keyed by ticker, captured at entry, consumed at exit
+        self._pending_features: dict[str, dict] = {}
+
 
     @property
     def active_trader(self):
@@ -128,6 +137,10 @@ class Coordinator:
     async def stop(self):
         await self._save_state()
         await self.data_manager.stop()
+        try:
+            await self.live_trader.client.aclose()
+        except Exception:
+            pass
         await close_pool()
         logger.info("coordinator.stopped")
 
@@ -273,24 +286,16 @@ class Coordinator:
 
         if trader.has_position and not pm_busy:
             pos = trader.position
-            if pos and is_live and state.kalshi_ticker and pos.ticker != state.kalshi_ticker:
-                logger.warning("coordinator.ticker_rolled_exit",
-                               position_ticker=pos.ticker,
-                               active_ticker=state.kalshi_ticker,
-                               mode=mode)
-                exit_price = pos.entry_price
-                asyncio.create_task(self._handle_live_exit(
-                    asyncio.ensure_future(trader.exit(exit_price, "TICKER_ROLLED")),
-                    symbol,
-                ))
-
             if pos and state.time_remaining_sec is not None and state.time_remaining_sec < 60:
                 exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
                 if is_live:
-                    if not pm_busy:
+                    if not pm_busy and not self._live_exit_in_flight:
+                        self._live_exit_in_flight = True
                         asyncio.create_task(self._handle_live_exit(
                             asyncio.ensure_future(trader.exit(exit_price, "EXPIRY_GUARD")),
                             symbol,
+                            original_reason="EXPIRY_GUARD",
+                            exit_price=exit_price,
                         ))
                 else:
                     trade = trader.exit(exit_price, "EXPIRY_GUARD")
@@ -331,20 +336,24 @@ class Coordinator:
         breaker = self.live_breaker
         pm = trader.position_manager
 
-        if trader.has_position and not pm.is_busy:
+        if trader.has_position and not pm.is_busy and not self._live_exit_in_flight:
             exit_reason = self._check_exits_for(state, features, regime, trader)
             if exit_reason:
                 exit_price = self._get_exit_price_for(state, trader)
                 if exit_price is not None:
+                    self._live_exit_in_flight = True
                     asyncio.create_task(self._handle_live_exit(
                         asyncio.ensure_future(trader.exit(exit_price, exit_reason)),
                         symbol,
+                        original_reason=exit_reason,
+                        exit_price=exit_price,
                     ))
 
         near_expiry = state.time_remaining_sec is not None and state.time_remaining_sec < 120
         if (pm.can_enter
                 and self.trading_paused == "off"
-                and not near_expiry):
+                and not near_expiry
+                and not self._live_entry_in_flight):
             ticks_since_exit = self._tick_count - self._last_live_exit_tick
             book_healthy = self._is_book_healthy(state)
             if ticks_since_exit > 100 and book_healthy:
@@ -360,22 +369,30 @@ class Coordinator:
         if mode == "live":
             self._unregister_position_ticker(trade.ticker)
             self._last_live_exit_tick = self._tick_count
+
+            # Supervised single-trade mode: auto-pause after every live trade
+            # so the operator can review before the next one is allowed.
+            self.trading_paused = "paused"
+            logger.info("coordinator.supervised_auto_pause",
+                        ticker=trade.ticker, exit_reason=trade.exit_reason,
+                        pnl=trade.pnl)
+            asyncio.create_task(ws_manager.broadcast({
+                "type": "supervised_pause",
+                "trading_paused": "paused",
+                "reason": "Post-trade review required",
+                "trade_ticker": trade.ticker,
+            }))
         else:
             self._last_paper_exit_tick = self._tick_count
-
-        if mode == "live" and self.trading_paused == "settling" and not self.live_trader.has_position:
-            self.trading_paused = "paused"
-            logger.info("coordinator.settling_complete")
-            asyncio.create_task(ws_manager.broadcast({
-                "type": "settling_complete",
-                "trading_paused": "paused",
-            }))
 
         asyncio.create_task(self._persist_and_notify_exit(trade, symbol, mode))
 
     async def _persist_and_notify_exit(self, trade, symbol: str, mode: str) -> None:
         """Persist trade first, then notify. Skip Discord if trade was quarantined."""
-        quarantined = await self._persist_trade(trade, mode)
+        quarantined, trade_id = await self._persist_trade(trade, mode)
+
+        if trade_id is not None:
+            await self._save_and_label_features(trade, trade_id, mode)
 
         if mode == "live":
             try:
@@ -387,6 +404,9 @@ class Coordinator:
         asyncio.create_task(self._save_state())
 
         if quarantined:
+            if mode == "live":
+                asyncio.create_task(self._send_post_trade_report(
+                    trade, symbol, quarantined=True))
             return
 
         sizer = self.live_sizer if mode == "live" else self.paper_sizer
@@ -414,6 +434,192 @@ class Coordinator:
             bankroll=sizer.bankroll,
             mode=mode,
         ))
+
+        if mode == "live":
+            asyncio.create_task(self._send_post_trade_report(
+                trade, symbol, quarantined=False))
+
+    async def _save_and_label_features(self, trade, trade_id: int, mode: str) -> None:
+        """Save pending features snapshot and label with trade outcome."""
+        try:
+            ticker = trade.ticker
+            feat = self._pending_features.pop(ticker, None)
+            if feat is None:
+                return
+            pool = self._pool
+            if pool is None:
+                return
+            await save_features(
+                pool,
+                trade_id=trade_id,
+                trading_mode=mode,
+                ticker=ticker,
+                feature_dict=feat,
+            )
+            await label_trade(pool, trade_id, trade.pnl)
+        except Exception as e:
+            logger.warning("coordinator.ml_feature_save_failed", error=str(e))
+
+    async def _send_post_trade_report(self, trade, symbol: str,
+                                       quarantined: bool = False) -> None:
+        """Generate and send a structured post-trade review to Discord.
+
+        This fires after every live trade exit in supervised single-trade mode.
+        It surfaces anomalies, exchange state, and a clear call-to-action.
+        """
+        pm = self.live_trader.position_manager
+        anomalies = self._check_trade_anomalies(trade, pm)
+        health = "CLEAN" if not anomalies else "ANOMALIES DETECTED"
+
+        duration_str = "N/A"
+        try:
+            from datetime import datetime
+            if hasattr(trade, "entry_time") and hasattr(trade, "exit_time"):
+                et = trade.entry_time
+                xt = trade.exit_time
+                if isinstance(et, str):
+                    et = datetime.fromisoformat(et)
+                if isinstance(xt, str):
+                    xt = datetime.fromisoformat(xt)
+                delta = xt - et
+                mins = int(delta.total_seconds() // 60)
+                secs = int(delta.total_seconds() % 60)
+                duration_str = f"{mins}m {secs}s"
+        except Exception:
+            pass
+
+        anomaly_text = "\n".join(f"- {a}" for a in anomalies) if anomalies else "None"
+        pnl_icon = "\u2705" if trade.pnl >= 0 else "\u274c"
+        quarantine_badge = " [QUARANTINED]" if quarantined else ""
+
+        notifier = get_notifier()
+        embed = {
+            "title": f"\U0001f50d [LIVE] Post-Trade Review{quarantine_badge} \u2014 {trade.ticker}",
+            "color": 0xED4245 if anomalies else 0x57F287,
+            "fields": [
+                {"name": "Result", "value": f"{pnl_icon} {'+'if trade.pnl >= 0 else ''}${trade.pnl:.4f} ({trade.pnl_pct:+.2%})", "inline": True},
+                {"name": "Direction", "value": trade.direction.upper(), "inline": True},
+                {"name": "Contracts", "value": str(trade.contracts), "inline": True},
+                {"name": "Entry / Exit", "value": f"{trade.entry_price}\u00a2 \u2192 {trade.exit_price}\u00a2", "inline": True},
+                {"name": "Fees", "value": f"${trade.fees:.4f}", "inline": True},
+                {"name": "Duration", "value": duration_str, "inline": True},
+                {"name": "Exit Reason", "value": trade.exit_reason, "inline": True},
+                {"name": "Candles Held", "value": str(trade.candles_held), "inline": True},
+                {"name": "Conviction", "value": trade.conviction, "inline": True},
+                {"name": "Health", "value": health, "inline": False},
+                {"name": "Anomalies", "value": anomaly_text[:1000], "inline": False},
+                {"name": "PM State", "value": pm.state.value, "inline": True},
+                {"name": "Orphans", "value": str(len(pm.orphaned_positions)), "inline": True},
+                {"name": "Bankroll", "value": f"${self.live_sizer.bankroll:.2f}", "inline": True},
+            ],
+            "footer": {"text": "KBTC Bot \u00b7 PAUSED \u2014 Resume trading from dashboard after review"},
+        }
+        await notifier._post(notifier._live_trades_url or notifier._trades_url, embed)
+
+        if anomalies:
+            logger.warning("coordinator.post_trade_anomalies",
+                           ticker=trade.ticker, anomalies=anomalies)
+            self._append_trade_anomaly_to_bug_log(trade, anomalies)
+
+    def _check_trade_anomalies(self, trade, pm) -> list[str]:
+        """Identify anomalies in a completed live trade for the post-trade report."""
+        anomalies = []
+
+        if pm.state != pm.state.FLAT:
+            anomalies.append(f"PM state is {pm.state.value}, expected FLAT")
+
+        if pm.has_orphans:
+            tickers = [o.ticker for o in pm.orphaned_positions]
+            anomalies.append(f"Orphaned positions exist: {', '.join(tickers)}")
+
+        suspicious_exits = (
+            "DESYNC", "EMERGENCY_STOP", "RETRY",
+            "CONTRACT_SETTLED_VERIFY_FAILED",
+        )
+        if trade.exit_reason in suspicious_exits:
+            anomalies.append(f"Suspicious exit reason: {trade.exit_reason}")
+
+        if hasattr(trade, "entry_order_id") and trade.entry_order_id is None:
+            anomalies.append("Missing entry_order_id (order may not have been confirmed)")
+
+        if hasattr(trade, "exit_order_id") and trade.exit_order_id is None:
+            if trade.exit_reason not in ("CONTRACT_SETTLED", "CONTRACT_SETTLED_VERIFY_FAILED"):
+                anomalies.append("Missing exit_order_id (exit may not have been confirmed)")
+
+        if trade.contracts == 0:
+            anomalies.append("Zero contracts in trade result")
+
+        if trade.pnl_pct < -0.10:
+            anomalies.append(f"Large loss: {trade.pnl_pct:.2%}")
+
+        return anomalies
+
+    def _append_trade_anomaly_to_bug_log(self, trade, anomalies: list[str]) -> None:
+        """Log a live trade anomaly to the database and (optionally) to the
+        local known-bugs.mdc file if it exists on the filesystem."""
+        from datetime import datetime, timezone
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        anomaly_text = "; ".join(anomalies)
+
+        if self._pool is not None:
+            async def _persist():
+                try:
+                    async with self._pool.connection() as conn:
+                        await conn.execute(
+                            """INSERT INTO errored_trades
+                               (timestamp, ticker, direction, side, contracts, entry_price,
+                                exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
+                                regime_at_entry, candles_held, entry_obi, entry_roc,
+                                closed_at, error_reason, flagged_at, trading_mode)
+                               VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s)""",
+                            (
+                                trade.ticker, trade.direction,
+                                "yes" if trade.direction == "long" else "no",
+                                trade.contracts, trade.entry_price, trade.exit_price,
+                                trade.pnl, trade.pnl_pct, trade.fees, trade.exit_reason,
+                                trade.conviction, getattr(trade, "regime_at_entry", "UNKNOWN"),
+                                trade.candles_held,
+                                getattr(trade, "entry_obi", 0.0) or 0.0,
+                                getattr(trade, "entry_roc", 0.0) or 0.0,
+                                f"TRADE_ANOMALY: {anomaly_text}"[:200],
+                                "live",
+                            ),
+                        )
+                    logger.info("coordinator.anomaly_persisted_to_db",
+                                ticker=trade.ticker, anomalies=anomaly_text)
+                except Exception as e:
+                    logger.error("coordinator.anomaly_db_persist_failed", error=str(e))
+            asyncio.create_task(_persist())
+
+        import os
+        bug_log = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".cursor", "rules", "known-bugs.mdc",
+        )
+        if os.path.exists(bug_log):
+            try:
+                with open(bug_log, "r") as f:
+                    existing = f.read()
+                count = existing.count("## BUG-") + existing.count("## TRADE-ANOMALY-")
+                entry_id = count + 1
+                anomaly_lines = "\n".join(f"  - {a}" for a in anomalies)
+                entry = (
+                    f"\n## TRADE-ANOMALY-{entry_id:03d}: {trade.ticker}\n"
+                    f"- **Date:** {ts}\n"
+                    f"- **Ticker:** {trade.ticker}\n"
+                    f"- **Direction:** {trade.direction}\n"
+                    f"- **PnL:** ${trade.pnl:+.4f} ({trade.pnl_pct:+.2%})\n"
+                    f"- **Exit reason:** {trade.exit_reason}\n"
+                    f"- **Anomalies:**\n{anomaly_lines}\n"
+                    f"- **Status:** UNDER REVIEW\n"
+                )
+                with open(bug_log, "a") as f:
+                    f.write(entry)
+                logger.info("coordinator.anomaly_logged_to_file",
+                            entry_id=f"TRADE-ANOMALY-{entry_id:03d}")
+            except Exception as e:
+                logger.warning("coordinator.anomaly_file_write_failed", error=str(e))
 
     def _on_trade_entry(self, pos, symbol, state, features, decision, roc_val, mode: str = "paper") -> None:
         """Common post-entry logic for both paper and live trades."""
@@ -443,6 +649,17 @@ class Coordinator:
             mode=mode,
         ))
 
+        try:
+            feat = extract_features(
+                features=features,
+                candle_aggregator=self.candle_aggregator,
+                atr_filter=self.atr_filter,
+                state=state,
+            )
+            self._pending_features[pos.ticker] = feat
+        except Exception as e:
+            logger.warning("coordinator.feature_capture_failed", error=str(e))
+
     async def _handle_settlement(self, trader, result: str, symbol: str, mode: str = "live") -> None:
         """Handle exchange settlement of a live position.
 
@@ -457,11 +674,18 @@ class Coordinator:
         except Exception as e:
             logger.error("coordinator.settlement_failed", error=str(e))
 
-    async def _handle_live_exit(self, trade_future, symbol: str) -> None:
+    async def _handle_live_exit(
+        self,
+        trade_future,
+        symbol: str,
+        original_reason: str = "UNKNOWN",
+        exit_price: Optional[float] = None,
+    ) -> None:
         """Await a live trader exit (async) then run common post-exit logic.
 
         PositionManager handles retries, orphan conversion, and locking
-        internally. This wrapper just processes the result.
+        internally. This wrapper just processes the result. On retries,
+        the original exit reason and price are preserved.
         """
         try:
             trade = await trade_future
@@ -472,17 +696,19 @@ class Coordinator:
             if not self.live_trader.has_position:
                 return
 
+            retry_price = exit_price or self.live_trader.position.entry_price
+
             MAX_RETRIES = 2
             for attempt in range(1, MAX_RETRIES + 1):
                 if not self.live_trader.has_position:
                     return
                 delay = 2 ** attempt
                 logger.warning("coordinator.live_exit_retry",
-                               attempt=attempt, delay=delay)
+                               attempt=attempt, delay=delay,
+                               reason=original_reason)
                 await asyncio.sleep(delay)
                 try:
-                    exit_price = self.live_trader.position.entry_price
-                    trade = await self.live_trader.exit(exit_price, "RETRY")
+                    trade = await self.live_trader.exit(retry_price, original_reason)
                     if trade:
                         self._on_trade_exit(trade, symbol, "live")
                         return
@@ -508,6 +734,8 @@ class Coordinator:
                 ))
         except Exception as e:
             logger.error("coordinator.live_exit_failed", error=str(e))
+        finally:
+            self._live_exit_in_flight = False
 
     async def _check_orphaned_positions(self) -> None:
         """Periodically check orphaned positions for break-even exit."""
@@ -646,6 +874,7 @@ class Coordinator:
                 roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
 
                 if mode == "live":
+                    self._live_entry_in_flight = True
                     asyncio.create_task(self._handle_live_entry(
                         trader, ticker, decision, entry_price, regime,
                         features, roc_val, symbol, state,
@@ -710,6 +939,8 @@ class Coordinator:
                 )
         except Exception as e:
             logger.error("coordinator.live_entry_failed", error=str(e))
+        finally:
+            self._live_entry_in_flight = False
 
     def _check_exits_for(self, state, features, regime: str, trader) -> Optional[str]:
         """Check exit conditions for a specific trader's position."""
@@ -717,7 +948,7 @@ class Coordinator:
         if pos is None:
             return None
 
-        if pos.candles_held < 1 and regime != "HIGH":
+        if pos.candles_held < 2 and regime != "HIGH":
             return None
 
         current_price = self._get_exit_price_for(state, trader)
@@ -1123,12 +1354,12 @@ class Coordinator:
         self._rapid_fire_count = 0
         return False
 
-    async def _persist_trade(self, trade, mode: str = "paper") -> bool:
-        """Persist trade to DB. Returns True if the trade was quarantined."""
+    async def _persist_trade(self, trade, mode: str = "paper") -> tuple[bool, Optional[int]]:
+        """Persist trade to DB. Returns (quarantined, trade_id)."""
         try:
             pool = self._pool
             if pool is None:
-                return False
+                return False, None
 
             sizer = self.live_sizer if mode == "live" else self.paper_sizer
 
@@ -1155,7 +1386,9 @@ class Coordinator:
                             trade.contracts, trade.entry_price, trade.exit_price,
                             trade.pnl, trade.pnl_pct, trade.fees, trade.exit_reason,
                             trade.conviction, trade.regime_at_entry, trade.candles_held,
-                            0.0, 0.0, error_reason, mode,
+                            getattr(trade, "entry_obi", 0.0) or 0.0,
+                            getattr(trade, "entry_roc", 0.0) or 0.0,
+                            error_reason, mode,
                         ),
                     )
                 logger.warning(
@@ -1173,29 +1406,34 @@ class Coordinator:
                     error_reason=error_reason,
                     rapid_count=self._rapid_fire_count,
                 ))
-                return True
+                return True, None
 
             async with pool.connection() as conn:
-                await conn.execute(
+                row = await conn.execute(
                     """INSERT INTO trades
                        (timestamp, ticker, direction, side, contracts, entry_price,
                         exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                         regime_at_entry, candles_held, entry_obi, entry_roc, closed_at, trading_mode)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)""",
+                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                       RETURNING id""",
                     (
                         trade.ticker, trade.direction,
                         "yes" if trade.direction == "long" else "no",
                         trade.contracts, trade.entry_price, trade.exit_price,
                         trade.pnl, trade.pnl_pct, trade.fees, trade.exit_reason,
                         trade.conviction, trade.regime_at_entry, trade.candles_held,
-                        0.0, 0.0, mode,
+                        getattr(trade, "entry_obi", 0.0) or 0.0,
+                        getattr(trade, "entry_roc", 0.0) or 0.0,
+                        mode,
                     ),
                 )
-            return False
+                result = await row.fetchone()
+                trade_id = result[0] if result else None
+            return False, trade_id
         except Exception as e:
             logger.error("coordinator.persist_trade_failed", error=str(e))
             asyncio.create_task(get_notifier().db_error("persist_trade", str(e)))
-            return False
+            return False, None
 
     async def _persist_signal(self, state, features, decision, action: str) -> None:
         try:

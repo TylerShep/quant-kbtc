@@ -275,6 +275,11 @@ async def set_trading_pause(req: TradingPauseRequest):
         status = "off"
         message = "Trading resumed"
 
+        pm = coordinator.live_trader.position_manager
+        if pm.live_trade_limit is not None:
+            pm.reset_trade_counter()
+            message = f"Trading resumed (trade counter reset, limit={pm.live_trade_limit})"
+
     import asyncio
     asyncio.create_task(coordinator._save_state())
     return {

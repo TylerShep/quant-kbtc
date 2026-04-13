@@ -2,7 +2,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 uvloop==0.21.0
 websockets==14.1
-httpx==0.28.0
+httpx[http2]==0.28.0
 sortedcontainers==2.4.0
 structlog==24.4.0
 cryptography==44.0.0

@@ -39,6 +39,8 @@ class LiveTrade:
     exit_time: datetime
     entry_order_id: Optional[str] = None
     exit_order_id: Optional[str] = None
+    entry_obi: float = 0.0
+    entry_roc: float = 0.0
 
 
 class LiveTrader:
@@ -193,6 +195,8 @@ class LiveTrader:
             exit_time=exit_time,
             entry_order_id=result.get("entry_order_id"),
             exit_order_id=result.get("exit_order_id"),
+            entry_obi=result.get("entry_obi", 0.0),
+            entry_roc=result.get("entry_roc", 0.0),
         )
 
     def get_state(self) -> dict:

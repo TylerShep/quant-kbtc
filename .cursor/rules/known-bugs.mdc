@@ -1,0 +1,166 @@
+---
+description: Running log of bugs encountered in the Kalshi trading bot, their root causes, and fixes applied. Reference this when debugging similar issues or before deploying changes that touch related code paths.
+alwaysApply: false
+---
+
+# Known Bugs & Incident Log
+
+Running record of production bugs encountered, root causes, and fixes. Consult before modifying related code.
+
+---
+
+## BUG-001: Duplicate live entry orders (Fix 1)
+- **Date:** 2026-04-10
+- **Symptom:** Multiple live entry tasks spawned concurrently for the same signal tick
+- **Root cause:** `_evaluate_entry_for()` created a new `asyncio.create_task` on every tick while a prior entry was still in-flight (awaiting limit fill polling)
+- **Fix:** Added `_live_entry_in_flight` bool guard in coordinator; set `True` before task, cleared in `finally` block of `_handle_live_entry`
+- **Files:** `coordinator.py`
+
+## BUG-002: Phantom exit accepted as real (Fix 2)
+- **Date:** 2026-04-10
+- **Symptom:** Bot believed an exit filled but Kalshi still showed the position open
+- **Root cause:** `verify_position_on_exchange()` called immediately after exit order, before Kalshi's ledger updated
+- **Fix:** Added `await asyncio.sleep(1.5)` before verification in both `enter()` and `exit()` methods
+- **Files:** `position_manager.py`
+
+## BUG-003: Settlement verification failure lost bankroll tracking (Fix 3)
+- **Date:** 2026-04-10
+- **Symptom:** When `verify_position_on_exchange` returned `VERIFY_FAILED` during settlement, `handle_settlement()` returned `None`, so `sizer.record_trade()` was never called
+- **Root cause:** VERIFY_FAILED path returned None instead of the trade result
+- **Fix:** Return `trade_result` with `exit_reason='CONTRACT_SETTLED_VERIFY_FAILED'` so bankroll updates even when verification fails
+- **Files:** `position_manager.py`
+
+## BUG-004: close_all_exchange_positions blanket-cleared orphans (Fix 4)
+- **Date:** 2026-04-10
+- **Symptom:** Calling `close_all` wiped the entire orphan list even if some positions failed to close
+- **Root cause:** Orphans were cleared unconditionally at the end of the method
+- **Fix:** Orphans are now cleared per-ticker only when `filled > 0` is confirmed
+- **Files:** `position_manager.py`
+
+## BUG-005: live_trade_limit defaulted to 1 (Fix 5)
+- **Date:** 2026-04-10
+- **Symptom:** Bot stopped trading after a single live round-trip
+- **Root cause:** `live_trade_limit` defaulted to `1` instead of `None`
+- **Fix:** Changed default to `None` (unlimited)
+- **Files:** `position_manager.py`
+
+## BUG-006: HTTP connection churn / no persistent client (Fix 6)
+- **Date:** 2026-04-10
+- **Symptom:** High latency on Kalshi API calls, TCP connection overhead on every request
+- **Root cause:** Each API method created a new `httpx.AsyncClient` per call
+- **Fix:** Single persistent `httpx.AsyncClient(http2=True)` stored as `self._client`, with `aclose()` on shutdown
+- **Files:** `kalshi_ws.py`, `requirements.txt`
+
+## BUG-007: Slow exit fill polling (Fix 7)
+- **Date:** 2026-04-10
+- **Symptom:** Exit fills took 1-2 extra seconds to detect
+- **Root cause:** `FILL_POLL_INTERVAL` was 1.0 second
+- **Fix:** Reduced to 0.25 seconds
+- **Files:** `position_manager.py`
+
+## BUG-008: Orphan infinite re-adoption loop
+- **Date:** 2026-04-12
+- **Symptom:** 16 duplicate `ORPHAN_SETTLED` trade records for the same ticker, position manager stuck in OPEN state with a phantom orphan
+- **Root cause:** Two concurrent periodic tasks raced:
+  1. `_check_orphans_inner()` detected settlement, removed orphan from list, returned "closed" record -> DB insert
+  2. `_periodic_reconciliation()` -> `reconcile()` queried Kalshi positions API, which still returned the settled contract. Since orphan was just removed from list, `adopt_orphan()` re-added it.
+  This looped every ~7 seconds, creating a new DB record each cycle.
+- **Fix (a):** Added `_settled_tickers: set[str]` to PositionManager. When `_check_orphans_inner()` confirms settlement, the ticker is added to the set. `_reconcile_inner()` skips tickers in this set.
+- **Fix (b):** `_reconcile_inner()` now calls `get_market()` to check market status before adopting unknown tickers. If status is `closed`/`settled`/`finalized`, the ticker is added to `_settled_tickers` and skipped.
+- **Fix (c):** Added `"finalized"` to the status check list in `_check_orphans_inner()` (Kalshi uses this status for fully settled markets).
+- **Files:** `position_manager.py`
+
+## BUG-009: Ticker-rolled exit infinite retry loop
+- **Date:** 2026-04-12
+- **Symptom:** When a position's ticker rolled and exit orders kept getting `phantom_exit_prevented`, the bot retried on every tick with no limit, spamming Kalshi with sell orders
+- **Root cause:** `_run_settlement_guards()` fires the ticker-roll exit on every tick where `pos.ticker != state.kalshi_ticker`. If the exit returns None (phantom_exit_prevented reverts to OPEN), the next tick immediately tries again. No retry counter, no backoff, no max attempts.
+- **Fix:** Added `_ticker_roll_exit_attempts` counter, `_ticker_roll_max_attempts` (5), and `_ticker_roll_exit_in_flight` guard. After max attempts, position is converted to orphan. Uses exponential backoff between attempts. Counter resets on successful exit.
+- **Files:** `coordinator.py`
+
+## BUG-010: entry_obi and entry_roc hardcoded to 0.0 in _persist_trade
+- **Date:** 2026-04-13
+- **Symptom:** All trade records in the DB showed `entry_obi = 0.0` and `entry_roc = 0.0` even though the signal log had real OBI/ROC values
+- **Root cause:** `_persist_trade()` in coordinator.py used hardcoded `0.0, 0.0` for the `entry_obi` and `entry_roc` SQL parameters instead of reading from the trade dataclass. Same bug existed in the errored_trades INSERT path.
+- **Fix:** Replaced `0.0, 0.0` with `getattr(trade, "entry_obi", 0.0) or 0.0` and `getattr(trade, "entry_roc", 0.0) or 0.0` in both the normal trades and errored_trades INSERT statements.
+- **Files:** `coordinator.py`
+
+## BUG-011: Anomaly bug log file path fails inside Docker container
+- **Date:** 2026-04-13
+- **Symptom:** `coordinator.anomaly_log_write_failed` error: `[Errno 2] No such file or directory: '/.cursor/rules/known-bugs.mdc'`
+- **Root cause:** Path resolution `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` resolves to `/app/..` = `/` inside the Docker container. The `.cursor/rules/` directory only exists on the host filesystem, not in the container.
+- **Fix:** Changed anomaly logging to persist to the `errored_trades` DB table as primary storage (with `error_reason` = "TRADE_ANOMALY: ..."). File-based logging retained as best-effort fallback only when the file exists on the filesystem (dev environment).
+- **Files:** `coordinator.py`
+
+## BUG-012: Ticker-roll exits cause guaranteed fee bleed on every live trade
+- **Date:** 2026-04-13
+- **Symptom:** All 4 live trades exited via `TICKER_ROLLED` after 20 seconds to 2 minutes. Every trade lost money (fees only, same entry/exit price). The bot never held a position long enough for the OBI signal to play out.
+- **Root cause:** `_run_settlement_guards()` compared `pos.ticker` to `state.kalshi_ticker` on every tick. When BTC spot moved ~$100, `get_active_contract()` resolved a different nearest-to-spot strike contract, causing `state.kalshi_ticker` to change. The bot treated this as an emergency exit condition, but the old contract was still perfectly valid and tradeable — only the "closest to spot" designation changed.
+- **Fix:** Removed the ticker-mismatch exit branch from `_run_settlement_guards()` entirely. Positions now hold until a real exit signal fires (OBI flip, expiry guard at <60s, or contract settlement). Removed `_handle_ticker_roll_exit()` method and all related state variables (`_ticker_roll_exit_attempts`, `_ticker_roll_max_attempts`, `_ticker_roll_exit_in_flight`). Removed `TICKER_ROLLED` from the suspicious exit reasons list in `_check_trade_anomalies()`.
+- **Files:** `coordinator.py`
+
+## BUG-013: Signal decay exits on first candle hold, preventing any trade from profiting
+- **Date:** 2026-04-13
+- **Symptom:** Trade 405 entered short with OBI 0.3449 (just below 0.35 threshold). The very first candle close (~1 second later) incremented `candles_held` from 0 to 1, unlocking `_check_exits_for`. By then OBI had drifted above `neutral_exit_short` (0.45), triggering SIGNAL_DECAY. The position was closed after ~1 second with only fee losses.
+- **Root cause:** The `candles_held < 1` guard in `_check_exits_for` only blocked exit checks for the period before the first candle close. With a 5-minute candle interval, a position entered mid-candle could have its first candle close within seconds. The 0.10 gap between entry threshold (0.35) and neutral exit threshold (0.45) is too narrow for OBI noise within a single candle.
+- **Fix:** Increased the `candles_held` guard from `< 1` to `< 2` in `_check_exits_for`. Positions now hold for at least 2 completed candle periods (~10 minutes) before signal-based exits are evaluated. The `HIGH` regime bypass is preserved for genuine volatility spikes.
+- **Files:** `coordinator.py`
+
+## BUG-014: Exit reason overwritten with "RETRY" on phantom_exit_prevented retries
+- **Date:** 2026-04-13
+- **Symptom:** Trade 405 recorded `exit_reason = "RETRY"` in the database, but the actual trigger was SIGNAL_DECAY. The original reason was lost because `_handle_live_exit` used hardcoded `"RETRY"` on retry attempts after `phantom_exit_prevented`.
+- **Root cause:** `_handle_live_exit` did not accept or propagate the original exit reason. On retries it called `trader.exit(exit_price, "RETRY")`, overwriting whatever reason originally triggered the exit. It also fell back to `pos.entry_price` for the retry price instead of the exit price calculated at trigger time.
+- **Fix:** Added `original_reason` and `exit_price` parameters to `_handle_live_exit`. Both call sites (strategy exit in `_run_live_lane` and expiry guard in `_run_settlement_guards`) now pass these through. Retries use the original reason and price. Also increased `FILL_POLL_TIMEOUT` from 10.0 to 15.0 seconds to reduce phantom exit frequency.
+- **Files:** `coordinator.py`, `position_manager.py`
+
+## BUG-015: Reconciliation orphan accumulation on tracked ticker
+- **Date:** 2026-04-13
+- **Symptom:** Trade 412 recorded 5,705 short contracts with $4,588 PnL on ticker B71750 — a position that never existed. Orphan count inflated from 3 to 5,705 over ~22 minutes. Three phantom ORPHAN_SETTLED trades (412, 413, 414) were recorded, completely corrupting stats (initial_bankroll showed -$4,526, total_pnl $4,584).
+- **Root cause:** `_reconcile_inner()` saw a count mismatch on the tracked ticker (bot=3, exchange=6) and called `adopt_orphan(ticker, direction, diff=3)`. But `adopt_orphan()` adds to a separate orphan tracker without updating `self.position.contracts`. Next reconciliation cycle, the bot still saw bot=3 vs exchange=6, so it added 3 more orphan contracts. This repeated every ~300ms for 22 minutes. BUG-008's deduplication fix only protected non-tracked tickers.
+- **Fix:** Removed the `adopt_orphan` call from the tracked-ticker mismatch branch. Instead, when exchange shows a different count than the bot for the tracked ticker, `self.position.contracts` is updated to match the exchange (exchange is source of truth). This is a one-time correction, not an additive accumulation.
+- **Data cleanup:** Moved trades 408, 412, 413, 414 to `errored_trades`. Purged 12,284 corrupted `bankroll_history` rows. Reset PM state from OPEN to FLAT.
+- **Files:** `position_manager.py`
+
+## BUG-016: PnL formula mixes Yes-side and No-side prices
+- **Date:** 2026-04-13
+- **Symptom:** Trade 410 (short B72250) recorded PnL of +$9.41, but the Kalshi wallet only changed by -$0.02 ($58.14→$58.12). The internal PnL formula produced wildly incorrect values.
+- **Root cause:** `_parse_fill_price(order_data, direction)` read the price for the position's side: for shorts it read `no_price_dollars`, for longs `yes_price_dollars`. At entry (short), `no_price_dollars=0.91` → `entry_price=91`. At exit, `exit_side="long"` caused it to read `yes_price_dollars=0.12` → `exit_price=12`. The formula `d * (exit - entry) = -1 * (12 - 91) = +79c/contract` mixed No-side entry with Yes-side exit, producing wrong results.
+- **Fix:** Replaced `_parse_fill_price(order_data, direction)` with `_parse_fill_price_yes_side(order_data)` which always returns the Yes-side price. It prefers `yes_price_dollars` directly; if only `no_price_dollars` is available, it converts via `100 - no_price`. All entry, exit, and orphan recovery paths now use this method. The PnL formula `d * (exit_yes - entry_yes)` is algebraically correct when both prices are on the same side.
+- **Files:** `position_manager.py`
+
+## BUG-017: 409 Conflict exit retry storm on settled contracts
+- **Date:** 2026-04-13
+- **Symptom:** After entering B71750, the bot tried to exit at contract expiry (16:00 UTC). Every exit attempt returned `409 Conflict` from Kalshi. The bot retried ~15+ times in rapid succession (OPEN→EXITING→OPEN→EXITING) before finally abandoning with 1 contract. Multiple concurrent retry tasks stacked up.
+- **Root cause:** `_exit_inner` caught 409 errors in the generic `except Exception` block and treated them identically to transient network errors — reverting to OPEN and allowing retries. But 409 Conflict from Kalshi means the market is closed/settled and no orders can be placed. The contract had settled but the bot kept hammering the API with sell orders that could never succeed.
+- **Fix:** Added 409 Conflict detection in `_exit_inner`. When a 409 is detected, the bot calls `_check_if_market_settled(ticker)` to query the market status. If the market is settled/closed/finalized, the exit is automatically redirected to `_handle_settlement_inner()` which processes it as a settlement (correct PnL at settlement price). Extracted settlement logic into `_handle_settlement_inner()` so it can be called from both `handle_settlement()` (with lock) and `exit()` (already holding lock). Added `_check_if_market_settled()` helper that queries `get_market()` and returns the result ("yes"/"no") if settled, None if still open.
+- **Files:** `position_manager.py`
+
+## BUG-018: Phantom exit retry storm creates runaway short positions (CRITICAL)
+- **Date:** 2026-04-13
+- **Symptom:** Bot entered 6 long contracts on B72150 at 19c. STOP_LOSS triggered exit. The first exit order executed (sold 6 Yes) but `verify_position_on_exchange` still showed 6 contracts (see BUG-019). `phantom_exit_prevented` fired, reverting PM to OPEN. On the next tick (~0.25s), `_run_live_lane` saw `has_position=True` and `pm.is_busy=False`, spawning a second `_handle_live_exit` task. Meanwhile the first task was also retrying. Both placed sell orders. Each sell created more short contracts. By the end: 12 exit orders placed, 317 retry attempts, net position: -66 contracts. Wallet crashed from $56.86 to $3.10 ($53.76 in short escrow).
+- **Root cause (1):** No exit-in-flight guard. Unlike entries (which had `_live_entry_in_flight`), exits had no guard to prevent concurrent exit tasks. When `phantom_exit_prevented` reverted PM state to OPEN, `_run_live_lane` immediately spawned new exit tasks on every tick, creating O(n) concurrent retry cascades.
+- **Root cause (2):** See BUG-019 — `verify_position_on_exchange` used `abs()` so the sign flip from long to short was invisible.
+- **Fix:** Added `_live_exit_in_flight` bool guard (mirrors `_live_entry_in_flight` pattern). Set True before spawning exit task, cleared in `finally` block of `_handle_live_exit`. Applied to both strategy exit path in `_run_live_lane` and expiry guard path in `_run_settlement_guards`.
+- **Financial impact:** Wallet crashed $56.86 → $3.10. Market settled No (BTC left range), so shorts won. Wallet recovered to $69.10 at settlement. Net gain ~$12.24 by luck.
+- **Files:** `coordinator.py`
+
+## BUG-019: verify_position_on_exchange returns abs() — sign-blind verification
+- **Date:** 2026-04-13
+- **Symptom:** After selling 6 long contracts (going flat), the next sell created -6 (short). `verify_position_on_exchange` returned `abs(-6) = 6`. The check `remaining >= pos.contracts` → `6 >= 6` → True → `phantom_exit_prevented`. The bot concluded the exit hadn't worked when in fact it had — the position had simply flipped to the opposite side.
+- **Root cause:** `verify_position_on_exchange` applied `abs()` to `position_fp`, discarding the sign. This made it impossible to distinguish "6 long contracts still open" from "6 short contracts accidentally created."
+- **Fix:** Removed `abs()` from `verify_position_on_exchange` — it now returns signed values (positive=long, negative=short, 0=flat). Updated `_exit_inner` verification logic to use `remaining_same_side = remaining_signed * expected_sign`. If `remaining_same_side < 0`, the exit overshot to the opposite side (treated as full exit + error log). If `remaining_same_side >= pos.contracts`, true phantom (no exit happened). Updated all callers (`_check_flat_on_exchange`, entry silent fill detection, settlement verification, orphan check) to handle signed values.
+- **Files:** `position_manager.py`
+
+## BUG-020: Exit orders use calculated price as limit, causing resting orders instead of market fills
+- **Date:** 2026-04-13
+- **Symptom:** Bot entered 16 long contracts on B72350 at 16c. TAKE_PROFIT triggered exit at calculated price 19c. Exit order was placed with `type="market"` + `yes_price=19`, but Kalshi treated this as a limit ("sell at no worse than 19c"). The order sat resting because the Yes bid was below 19c. After 15s poll timeout, fill_count was 0, but by the time verification ran the order had filled. This repeated 3 times (thanks to BUG-018 fix limiting to 2 retries), creating 48 additional short contracts. `close_all_exchange_positions` correctly used `yes_price=1` for true market sells, but the normal exit path did not.
+- **Root cause:** `_exit_inner` set `yes_price = int(price)` where `price` was the coordinator's calculated exit price (take-profit target). On Kalshi, any price passed with a market order acts as a price floor. If the book bid is below this price, the order rests instead of filling immediately. The 15s poll timeout expired before the resting order matched.
+- **Fix:** Changed exit order to use `yes_price=1` (for Yes-side sells) or `no_price=1` (for No-side sells) — matching the proven `close_all_exchange_positions` pattern. This guarantees immediate fill at best available price. The calculated exit price is still used for PnL tracking from the actual fill data returned by Kalshi.
+- **Files:** `position_manager.py`
+
+## BUG-021: PnL formula produces incorrect results for No-side (short) trades
+- **Date:** 2026-04-13
+- **Symptom:** Trade 424 (12 short contracts on B72150, entry 11c Yes / 89c No, exit 99c Yes / 1c No) recorded PnL of -$10.71 in the DB, but actual wallet change was only -$1.68. The formula `d * (exit_yes - entry_yes) / 100 * contracts` overcounted losses by 6x for No-side trades because it treats Yes-side price deltas as direct dollar P&L, ignoring Kalshi's collateral mechanics.
+- **Root cause:** Kalshi binary options have asymmetric cost structures. When you buy No at 89c, you spend $0.89/contract. When you sell No, Kalshi internally converts this to a Yes-side buy. The `taker_fill_cost_dollars` on the exit order represents the cost of closing (buying the opposite side), not the proceeds of selling. The old formula `d * (exit_yes - entry_yes) / 100 * contracts` does not model Kalshi's actual settlement mechanics — each contract has a $1.00 max payout, and both entry and exit `taker_fill_cost_dollars` represent money spent.
+- **Fix:** Replaced the price-based PnL formula with Kalshi's actual reported costs: `PnL = contracts * $1.00 - entry_cost - exit_cost - (entry_fees + exit_fees)`. Added `entry_cost_dollars` and `entry_fees_dollars` fields to `ManagedPosition` dataclass, captured from entry order's `taker_fill_cost_dollars` and `taker_fees_dollars`. Added `_parse_fill_cost()` static method. Falls back to old formula when cost data unavailable (e.g. restored from old state). Same pattern applied to settlement PnL and orphan recovery PnL.
+- **Verification:** Trade 424 numbers: 12.00 - 10.68 - 2.76 - (0.09 + 0.15) = -$1.68 ✓ (matches wallet)
+- **Files:** `position_manager.py`

@@ -11,6 +11,7 @@ from typing import List, Optional
 import structlog
 
 from risk.position_sizer import PositionSizer
+from risk.fee_engine import FeeEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -54,6 +55,7 @@ class PaperTrader:
         self.sizer = sizer
         self.position: Optional[PaperPosition] = None
         self.trades: List[PaperTrade] = []
+        self._fee_engine = FeeEngine()
 
     @property
     def has_position(self) -> bool:
@@ -109,7 +111,13 @@ class PaperTrader:
         pnl_per_contract = d * (price - pos.entry_price) / 100
         gross_pnl = pnl_per_contract * pos.contracts
         notional = pos.contracts * pos.entry_price / 100
-        fees = notional * self.FEE_RATE
+        fees = self._fee_engine.compute_round_trip_fee(
+            contracts=pos.contracts,
+            entry_price_cents=pos.entry_price,
+            exit_price_cents=price,
+            entry_type="taker",
+            exit_type="taker",
+        )
         net_pnl = gross_pnl - fees
         pnl_pct = net_pnl / notional if notional > 0 else 0
 

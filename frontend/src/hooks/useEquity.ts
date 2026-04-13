@@ -1,9 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import type { EquityResponse, CumulativeStats } from '../types';
 
 export function useEquity(mode: string = 'paper') {
   const [equity, setEquity] = useState<EquityResponse | null>(null);
   const [stats, setStats] = useState<CumulativeStats | null>(null);
+  const prevMode = useRef(mode);
 
   const fetchAll = useCallback(async () => {
     const modeParam = `?mode=${mode}`;
@@ -18,10 +19,15 @@ export function useEquity(mode: string = 'paper') {
   }, [mode]);
 
   useEffect(() => {
+    if (prevMode.current !== mode) {
+      setEquity(null);
+      setStats(null);
+      prevMode.current = mode;
+    }
     fetchAll();
-    const id = setInterval(fetchAll, 30000);
+    const id = setInterval(fetchAll, 15000);
     return () => clearInterval(id);
-  }, [fetchAll]);
+  }, [fetchAll, mode]);
 
   return { equity, stats, refetch: fetchAll };
 }
