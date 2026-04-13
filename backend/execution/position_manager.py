@@ -50,6 +50,8 @@ class ManagedPosition:
     entry_obi: float = 0.0
     entry_roc: float = 0.0
     candles_held: int = 0
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
     order_id: Optional[str] = None
     entry_cost_dollars: Optional[float] = None
     entry_fees_dollars: Optional[float] = None
@@ -674,6 +676,8 @@ class PositionManager:
             "exit_order_id": exit_order_id,
             "entry_obi": pos.entry_obi,
             "entry_roc": pos.entry_roc,
+            "max_favorable_excursion": pos.max_favorable_excursion,
+            "max_adverse_excursion": pos.max_adverse_excursion,
         }
 
         self.position = None
@@ -750,6 +754,8 @@ class PositionManager:
             "exit_order_id": None,
             "entry_obi": pos.entry_obi,
             "entry_roc": pos.entry_roc,
+            "max_favorable_excursion": pos.max_favorable_excursion,
+            "max_adverse_excursion": pos.max_adverse_excursion,
         }
 
         remaining = await self.verify_position_on_exchange(pos.ticker)

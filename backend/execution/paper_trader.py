@@ -28,6 +28,8 @@ class PaperPosition:
     entry_obi: float = 0.0
     entry_roc: float = 0.0
     candles_held: int = 0
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
 
 
 @dataclass
@@ -46,6 +48,8 @@ class PaperTrade:
     candles_held: int
     entry_time: datetime
     exit_time: datetime
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
 
 
 class PaperTrader:
@@ -136,6 +140,8 @@ class PaperTrader:
             candles_held=pos.candles_held,
             entry_time=pos.entry_time,
             exit_time=datetime.now(timezone.utc),
+            max_favorable_excursion=pos.max_favorable_excursion,
+            max_adverse_excursion=pos.max_adverse_excursion,
         )
 
         self.sizer.record_trade(net_pnl)

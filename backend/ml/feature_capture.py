@@ -134,8 +134,14 @@ async def save_features(
         return None
 
 
-async def label_trade(db_pool, trade_id: int, pnl: float) -> None:
-    """Update the feature row with outcome label after exit."""
+async def label_trade(
+    db_pool,
+    trade_id: int,
+    pnl: float,
+    mfe: float = 0.0,
+    mae: float = 0.0,
+) -> None:
+    """Update the feature row with outcome label, PnL, MFE, and MAE at exit."""
     try:
         if pnl > 0.001:
             label = 1
@@ -146,8 +152,12 @@ async def label_trade(db_pool, trade_id: int, pnl: float) -> None:
 
         async with db_pool.connection() as conn:
             await conn.execute(
-                "UPDATE trade_features SET label = %s, pnl = %s WHERE trade_id = %s",
-                (label, round(pnl, 4), trade_id),
+                """UPDATE trade_features
+                   SET label = %s, pnl = %s,
+                       max_favorable_excursion = %s,
+                       max_adverse_excursion = %s
+                   WHERE trade_id = %s""",
+                (label, round(pnl, 4), round(mfe, 4), round(mae, 4), trade_id),
             )
     except Exception as e:
         logger.warning("ml.label_trade_failed", trade_id=trade_id, error=str(e))

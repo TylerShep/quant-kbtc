@@ -507,6 +507,23 @@ class DiscordNotifier:
         }
         await self._post(self._attribution_url, embed)
 
+    async def ml_data_ready(self, row_count: int, sample_win_rate: float) -> None:
+        embed = {
+            "title": "\U0001f9e0 ML Training Data Ready",
+            "description": (
+                f"**{row_count}** labeled paper trades with full feature coverage "
+                f"(including MFE/MAE). Time to train the XGBoost entry gate model."
+            ),
+            "color": COLOR_PURPLE,
+            "fields": [
+                {"name": "Labeled Rows", "value": str(row_count), "inline": True},
+                {"name": "Win Rate", "value": f"{sample_win_rate:.1%}", "inline": True},
+                {"name": "Next Step", "value": "Run `python scripts/train_xgb.py`", "inline": False},
+            ],
+            "footer": self._footer(),
+        }
+        await self._post(self._attribution_url, embed)
+
     async def weekly_digest(
         self,
         week_start: str,

@@ -144,6 +144,49 @@ Parameter overrides can be viewed and cleared from the dashboard or via the API 
 
 Attribution breaks down PnL by conviction level, trading session (Asia/London/US), ATR regime, exit reason, and fee drag. Visible in the dashboard's **PnL Attribution** panel.
 
+## ML/AI Training Pipeline
+
+The bot passively collects 14 entry-time features at trade entry, labels outcomes at exit, and enriches each trade with MFE (max favorable excursion) and MAE (max adverse excursion) during the trade. This data feeds an XGBoost entry filter that learns to gate bad entries and size good ones more aggressively.
+
+### Master Timeline
+
+| Phase | Status | Data Required | Deliverables |
+|-------|--------|---------------|--------------|
+| **Phase 0** | Active | None (runs immediately) | MFE/MAE columns added to `trade_features`; tracked on every tick while a position is open; flushed to DB at exit |
+| **Phase 1** | Accumulating | 500+ labeled paper trades | Paper bot runs 24/7 with circuit breakers disabled; Discord alert fires at 500 trades; checkpoint analysis at 300 |
+| **Phase 2** | Pending | Phase 1 complete | Export `trade_features`, train XGBoost with 5-fold stratified CV, tune threshold for OOS precision >= 0.58, serialize to `ml/models/xgb_entry_v1.pkl` |
+| **Phase 3** | Pending | Phase 2 complete | `ml/inference.py` loads model at startup; `ml_gate()` called after resolver fires; `p_win` feeds conviction override in position sizer |
+| **Phase 4** | Pending | Phase 3 complete | Shadow mode on paper for 1 week; compare gate vs baseline win rate; promote to live if >= 5pp improvement confirmed |
+
+### Features Captured (`trade_features` table)
+
+| Category | Features |
+|----------|----------|
+| Signal | `obi`, `roc_3`, `roc_5`, `roc_10` |
+| Volatility / Microstructure | `atr_pct`, `spread_pct`, `bid_depth`, `ask_depth` |
+| Candle Context | `green_candles_3`, `candle_body_pct`, `volume_ratio` |
+| Time Context | `time_remaining_sec`, `hour_of_day`, `day_of_week` |
+| Trade Quality (exit-time) | `max_favorable_excursion`, `max_adverse_excursion` |
+| Label | `label` (-1/0/+1), `pnl` |
+
+### Design Principles
+
+- **Fail-open**: If the model file is missing or inference throws, `ml_gate()` returns `(True, 0.5)` -- the trade proceeds as if the gate was not present
+- **No feature leakage**: Only entry-time features are passed to `ml_gate()` during live inference; MFE/MAE improve label quality during training but are not available at entry
+- **Paper-first**: The ML gate is validated on paper trading before promotion to live
+
+### Training (Manual)
+
+```bash
+# Export labeled data from the remote DB
+ssh botuser@64.23.133.157 "docker exec kbtc-db psql -U kalshi -d kbtc \
+  -c \"COPY (SELECT * FROM trade_features WHERE label IS NOT NULL) TO STDOUT CSV HEADER\"" \
+  > trade_features_export.csv
+
+# Train the model
+python scripts/train_xgb.py --csv trade_features_export.csv
+```
+
 ## Dashboard
 
 The dashboard is a single-page React app at the server's root URL.
@@ -192,6 +235,7 @@ PostgreSQL with TimescaleDB. Key tables:
 | `signal_log` | Every signal evaluation (OBI/ROC/regime/decision) |
 | `daily_attribution` | Daily PnL attribution snapshots |
 | `param_recommendations` | Auto-tuner recommendations |
+| `trade_features` | ML feature snapshots at entry, labeled at exit with MFE/MAE |
 | `bot_state` | Key-value store for runtime state (bankroll, param overrides) |
 
 ## Tests

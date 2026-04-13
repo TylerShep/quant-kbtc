@@ -165,7 +165,10 @@ CREATE TABLE IF NOT EXISTS trade_features (
     day_of_week     INTEGER,
     -- Label (filled at exit)
     label           SMALLINT,
-    pnl             NUMERIC(14,4)
+    pnl             NUMERIC(14,4),
+    -- MFE/MAE (tracked during trade, flushed at exit)
+    max_favorable_excursion NUMERIC(8,4),
+    max_adverse_excursion   NUMERIC(8,4)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_features_trade ON trade_features (trade_id);
 CREATE INDEX IF NOT EXISTS idx_trade_features_label ON trade_features (label) WHERE label IS NOT NULL;

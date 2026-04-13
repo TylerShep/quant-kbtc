@@ -50,7 +50,7 @@ class Coordinator:
         self.paper_sizer = PositionSizer(settings.bot.initial_bankroll)
         self.live_sizer = PositionSizer(settings.bot.initial_bankroll)
 
-        self.paper_breaker = CircuitBreaker(self.paper_sizer)
+        self.paper_breaker = CircuitBreaker(self.paper_sizer, never_halt=True)
         self.live_breaker = CircuitBreaker(self.live_sizer)
 
         self.paper_trader = PaperTrader(self.paper_sizer)
@@ -77,6 +77,9 @@ class Coordinator:
 
         # ML feature snapshots: keyed by ticker, captured at entry, consumed at exit
         self._pending_features: dict[str, dict] = {}
+
+        # One-time alert: fires when 500+ fully-labeled paper trades exist
+        self._ml_data_ready_sent: bool = False
 
 
     @property
@@ -132,6 +135,7 @@ class Coordinator:
         asyncio.create_task(self._schedule_tuning())
         asyncio.create_task(self._schedule_daily_attribution())
         asyncio.create_task(self._schedule_weekly_digest())
+        asyncio.create_task(self._schedule_paper_sizer_resets())
         logger.info("coordinator.started")
 
     async def stop(self):
@@ -394,6 +398,9 @@ class Coordinator:
         if trade_id is not None:
             await self._save_and_label_features(trade, trade_id, mode)
 
+        if mode == "paper" and not self._ml_data_ready_sent:
+            asyncio.create_task(self._check_ml_data_threshold())
+
         if mode == "live":
             try:
                 await self.sync_live_bankroll()
@@ -456,9 +463,44 @@ class Coordinator:
                 ticker=ticker,
                 feature_dict=feat,
             )
-            await label_trade(pool, trade_id, trade.pnl)
+            mfe = getattr(trade, "max_favorable_excursion", 0.0)
+            mae = getattr(trade, "max_adverse_excursion", 0.0)
+            await label_trade(pool, trade_id, trade.pnl, mfe=mfe, mae=mae)
         except Exception as e:
             logger.warning("coordinator.ml_feature_save_failed", error=str(e))
+
+    async def _check_ml_data_threshold(self) -> None:
+        """One-time check: fire a Discord alert when 500+ fully-labeled paper trades exist."""
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with pool.connection() as conn:
+                row = await conn.execute(
+                    """SELECT COUNT(*) FROM trade_features
+                       WHERE trading_mode = 'paper'
+                         AND label IS NOT NULL
+                         AND max_favorable_excursion IS NOT NULL
+                         AND max_adverse_excursion IS NOT NULL"""
+                )
+                count = (await row.fetchone())[0]
+
+            if count >= 500:
+                self._ml_data_ready_sent = True
+                await self._save_state()
+
+                async with pool.connection() as conn:
+                    row = await conn.execute(
+                        """SELECT AVG(CASE WHEN label = 1 THEN 1.0 ELSE 0.0 END)
+                           FROM trade_features
+                           WHERE trading_mode = 'paper' AND label IS NOT NULL"""
+                    )
+                    win_rate = float((await row.fetchone())[0] or 0.5)
+
+                await get_notifier().ml_data_ready(count, win_rate)
+                logger.info("coordinator.ml_data_ready_sent", rows=count, win_rate=win_rate)
+        except Exception as e:
+            logger.warning("coordinator.ml_data_threshold_check_failed", error=str(e))
 
     async def _send_post_trade_report(self, trade, symbol: str,
                                        quarantined: bool = False) -> None:
@@ -960,6 +1002,9 @@ class Coordinator:
         notional = pos.contracts * pos.entry_price / 100
         pnl_pct = (pnl_per_contract * pos.contracts) / notional if notional > 0 else 0
 
+        pos.max_favorable_excursion = max(pos.max_favorable_excursion, pnl_pct)
+        pos.max_adverse_excursion = min(pos.max_adverse_excursion, pnl_pct)
+
         exit_reason = check_obi_exit(
             direction=pos.direction,
             current_obi=features.obi,
@@ -1343,6 +1388,30 @@ class Coordinator:
             except Exception as e:
                 logger.error("coordinator.weekly_digest_failed", error=str(e))
 
+    async def _schedule_paper_sizer_resets(self) -> None:
+        """Reset paper sizer daily/weekly baselines automatically.
+
+        Daily reset at UTC midnight keeps paper risk metrics fresh on
+        the dashboard. Weekly reset on Mondays. This runs regardless of
+        the never_halt flag so the dashboard numbers stay meaningful.
+        """
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            next_midnight = (now_utc + timedelta(days=1)).replace(
+                hour=0, minute=0, second=5, microsecond=0
+            )
+            wait_sec = (next_midnight - now_utc).total_seconds()
+            await asyncio.sleep(wait_sec)
+
+            self.paper_sizer.reset_daily()
+            logger.info("coordinator.paper_sizer_daily_reset",
+                        bankroll=self.paper_sizer.bankroll)
+
+            if datetime.now(timezone.utc).weekday() == 0:  # Monday
+                self.paper_sizer.reset_weekly()
+                logger.info("coordinator.paper_sizer_weekly_reset",
+                            bankroll=self.paper_sizer.bankroll)
+
     def _detect_rapid_fire(self) -> bool:
         """Returns True if we're in a rapid-fire loop (3+ exits in 60s)."""
         now = time.time()
@@ -1363,12 +1432,13 @@ class Coordinator:
 
             sizer = self.live_sizer if mode == "live" else self.paper_sizer
 
-            is_rapid = self._detect_rapid_fire()
             error_reason = None
-            if is_rapid:
-                error_reason = "RAPID_FIRE_LOOP"
-            elif trade.candles_held == 0 and trade.exit_reason == "STOP_LOSS":
-                error_reason = "INSTANT_STOP_LOSS"
+            if mode == "live":
+                is_rapid = self._detect_rapid_fire()
+                if is_rapid:
+                    error_reason = "RAPID_FIRE_LOOP"
+                elif trade.candles_held == 0 and trade.exit_reason == "STOP_LOSS":
+                    error_reason = "INSTANT_STOP_LOSS"
 
             if error_reason:
                 sizer.reverse_trade(trade.pnl)
@@ -1507,6 +1577,7 @@ class Coordinator:
                 "live": _sizer_dict(self.live_sizer),
                 "trading_mode": self.trading_mode,
                 "trading_paused": self.trading_paused,
+                "ml_data_ready_sent": self._ml_data_ready_sent,
             }
             async with pool.connection() as conn:
                 await conn.execute(
@@ -1572,6 +1643,7 @@ class Coordinator:
                     saved_mode = state.get("trading_mode")
                     if saved_mode in ("paper", "live"):
                         self.trading_mode = saved_mode
+                    self._ml_data_ready_sent = state.get("ml_data_ready_sent", False)
                     logger.info("coordinator.state_restored",
                                 paper_bankroll=self.paper_sizer.bankroll,
                                 live_bankroll=self.live_sizer.bankroll,

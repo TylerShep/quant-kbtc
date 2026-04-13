@@ -11,10 +11,14 @@ from risk.position_sizer import PositionSizer
 
 
 class CircuitBreaker:
-    def __init__(self, sizer: PositionSizer):
+    def __init__(self, sizer: PositionSizer, never_halt: bool = False):
         self.sizer = sizer
+        self.never_halt = never_halt
 
     def can_trade(self) -> Tuple[bool, Optional[str]]:
+        if self.never_halt:
+            return True, None
+
         cfg = settings.risk
 
         if self.sizer.daily_loss >= cfg.daily_loss_limit_pct:
