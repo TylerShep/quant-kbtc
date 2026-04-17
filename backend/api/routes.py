@@ -4,11 +4,47 @@ REST API routes — health, status, trade history, equity history.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from database import get_pool
+
+
+class _TTLCache:
+    """Simple in-memory TTL cache keyed by (endpoint, mode)."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str, ttl: float) -> Any | None:
+        entry = self._data.get(key)
+        if entry and (time.monotonic() - entry[0]) < ttl:
+            return entry[1]
+        return None
+
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = (time.monotonic(), value)
+
+    def invalidate(self, prefix: str = "") -> None:
+        if not prefix:
+            self._data.clear()
+        else:
+            self._data = {k: v for k, v in self._data.items() if not k.startswith(prefix)}
+
+
+_cache = _TTLCache()
+
+_EQUITY_TTL = 10.0
+_STATS_TTL = 10.0
+_TRADES_TTL = 5.0
+_DAILY_TTL = 15.0
+_REGIME_TTL = 15.0
+_ATTR_TTL = 30.0
+
+MECHANICAL_EXIT_REASONS = ("ORPHAN_SETTLED", "TICKER_ROLLED", "RETRY")
+_MECHANICAL_FILTER = "AND exit_reason NOT IN ('ORPHAN_SETTLED', 'TICKER_ROLLED', 'RETRY')"
 
 
 class TradingModeRequest(BaseModel):
@@ -440,10 +476,15 @@ async def trades(
 ):
     """Paginated trade history from the database (survives restarts)."""
     from main import coordinator
-    pool = await get_pool()
-    offset = (page - 1) * per_page
     active_mode = mode or coordinator.trading_mode
+    offset = (page - 1) * per_page
 
+    cache_key = f"trades:{active_mode}:{page}:{per_page}"
+    cached = _cache.get(cache_key, _TRADES_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         row = await conn.execute(
             "SELECT COUNT(*) FROM trades WHERE trading_mode = %s", (active_mode,)
@@ -481,26 +522,34 @@ async def trades(
             "closed_at": r[13].isoformat() if r[13] else None,
         })
 
-    return {
+    result = {
         "trades": items,
         "total": total,
         "page": page,
         "per_page": per_page,
         "total_pages": max(1, (total + per_page - 1) // per_page),
     }
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/errored-trades")
 async def errored_trades(
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=100),
+    mode: str = Query(None),
 ):
     """Paginated errored/quarantined trade history."""
+    from main import coordinator
     pool = await get_pool()
     offset = (page - 1) * per_page
+    active_mode = mode or coordinator.trading_mode
 
     async with pool.connection() as conn:
-        row = await conn.execute("SELECT COUNT(*) FROM errored_trades")
+        row = await conn.execute(
+            "SELECT COUNT(*) FROM errored_trades WHERE trading_mode = %s",
+            (active_mode,),
+        )
         total = (await row.fetchone())[0]
 
         rows = await conn.execute(
@@ -508,9 +557,10 @@ async def errored_trades(
                       exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                       regime_at_entry, candles_held, closed_at, error_reason, flagged_at
                FROM errored_trades
+               WHERE trading_mode = %s
                ORDER BY timestamp DESC
                LIMIT %s OFFSET %s""",
-            (per_page, offset),
+            (active_mode, per_page, offset),
         )
         results = await rows.fetchall()
 
@@ -548,9 +598,14 @@ async def errored_trades(
 async def equity(mode: str = Query(None)):
     """Equity curve data from bankroll_history (survives restarts)."""
     from main import coordinator
-    pool = await get_pool()
     active_mode = mode or coordinator.trading_mode
 
+    cache_key = f"equity:{active_mode}"
+    cached = _cache.get(cache_key, _EQUITY_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         rows = await conn.execute(
             """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
@@ -572,7 +627,9 @@ async def equity(mode: str = Query(None)):
             "trade_count": r[5] or 0,
         })
 
-    return {"equity": items, "mode": active_mode}
+    result = {"equity": items, "mode": active_mode}
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/stats")
@@ -581,12 +638,17 @@ async def stats(mode: str = Query(None)):
     from config import settings
     from main import coordinator
 
-    pool = await get_pool()
     active_mode = mode or coordinator.trading_mode
 
+    cache_key = f"stats:{active_mode}"
+    cached = _cache.get(cache_key, _STATS_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         row = await conn.execute(
-            """SELECT
+            f"""SELECT
                  COUNT(*) as total_trades,
                  COALESCE(SUM(pnl), 0) as total_pnl,
                  COUNT(*) FILTER (WHERE pnl >= 0) as wins,
@@ -595,7 +657,7 @@ async def stats(mode: str = Query(None)):
                  COALESCE(MIN(pnl), 0) as worst_trade,
                  COALESCE(AVG(pnl), 0) as avg_pnl
                FROM trades
-               WHERE trading_mode = %s""",
+               WHERE trading_mode = %s {_MECHANICAL_FILTER}""",
             (active_mode,),
         )
         r = await row.fetchone()
@@ -615,7 +677,7 @@ async def stats(mode: str = Query(None)):
         initial = settings.bot.initial_bankroll
         equity = round(initial + total_pnl, 4)
 
-    return {
+    result = {
         "initial_bankroll": round(initial, 4),
         "total_trades": r[0],
         "total_pnl": total_pnl,
@@ -629,15 +691,22 @@ async def stats(mode: str = Query(None)):
         "avg_pnl": float(r[6]),
         "mode": active_mode,
     }
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/attribution")
 async def attribution(mode: str = Query(None)):
     """Performance attribution — decompose PnL by signal, regime, session, execution."""
     from main import coordinator
-    pool = await get_pool()
     active_mode = mode or coordinator.trading_mode
 
+    cache_key = f"attr:{active_mode}"
+    cached = _cache.get(cache_key, _ATTR_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         rows = await conn.execute(
             """SELECT timestamp, ticker, direction, contracts, entry_price,
@@ -670,7 +739,9 @@ async def attribution(mode: str = Query(None)):
         })
 
     from backtesting.attribution import run_attribution
-    return {"attribution": run_attribution(trades), "mode": active_mode}
+    result = {"attribution": run_attribution(trades), "mode": active_mode}
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/param-overrides")
@@ -751,25 +822,30 @@ async def backtest_tuning():
 async def stats_daily(mode: str = Query(None)):
     """Per-day PnL breakdown from trades table."""
     from main import coordinator
-    pool = await get_pool()
     active_mode = mode or coordinator.trading_mode
 
+    cache_key = f"daily:{active_mode}"
+    cached = _cache.get(cache_key, _DAILY_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         rows = await conn.execute(
-            """SELECT DATE(timestamp) as day,
+            f"""SELECT DATE(timestamp) as day,
                       COUNT(*) as trades,
                       COALESCE(SUM(pnl), 0) as pnl,
                       COUNT(*) FILTER (WHERE pnl >= 0) as wins,
                       COUNT(*) FILTER (WHERE pnl < 0) as losses
                FROM trades
-               WHERE trading_mode = %s
+               WHERE trading_mode = %s {_MECHANICAL_FILTER}
                GROUP BY DATE(timestamp)
                ORDER BY day ASC""",
             (active_mode,),
         )
         result = await rows.fetchall()
 
-    return {
+    result = {
         "daily": [
             {
                 "date": r[0].isoformat() if r[0] else None,
@@ -782,30 +858,37 @@ async def stats_daily(mode: str = Query(None)):
             for r in result
         ]
     }
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/stats/by-regime")
 async def stats_by_regime(mode: str = Query(None)):
     """Win rate and PnL by ATR regime."""
     from main import coordinator
-    pool = await get_pool()
     active_mode = mode or coordinator.trading_mode
 
+    cache_key = f"regime:{active_mode}"
+    cached = _cache.get(cache_key, _REGIME_TTL)
+    if cached is not None:
+        return cached
+
+    pool = await get_pool()
     async with pool.connection() as conn:
         rows = await conn.execute(
-            """SELECT regime_at_entry,
+            f"""SELECT regime_at_entry,
                       COUNT(*) as trades,
                       COALESCE(SUM(pnl), 0) as pnl,
                       COUNT(*) FILTER (WHERE pnl >= 0) as wins
                FROM trades
-               WHERE trading_mode = %s
+               WHERE trading_mode = %s {_MECHANICAL_FILTER}
                GROUP BY regime_at_entry
                ORDER BY trades DESC""",
             (active_mode,),
         )
         result = await rows.fetchall()
 
-    return {
+    result = {
         "regimes": [
             {
                 "regime": r[0],
@@ -817,6 +900,8 @@ async def stats_by_regime(mode: str = Query(None)):
             for r in result
         ]
     }
+    _cache.set(cache_key, result)
+    return result
 
 
 @router.get("/stats/signal-accuracy")
@@ -899,3 +984,63 @@ async def btc_price():
 
     items.sort(key=lambda x: x["time"])
     return {"candles": items}
+
+
+@router.get("/historical-sync/status")
+async def historical_sync_status():
+    """Row counts, newest timestamps, sync lag, and TFI cache summary."""
+    from main import coordinator
+    from config import settings
+    from datetime import datetime, timezone
+
+    cfg = settings.historical_sync
+    pool = await get_pool()
+
+    async def _table_stats(table: str, ts_col: str) -> dict:
+        async with pool.connection() as conn:
+            row = await conn.execute(
+                f"SELECT COUNT(*), MAX({ts_col}) FROM {table}"
+            )
+            count, newest = await row.fetchone()
+        lag = None
+        newest_iso = None
+        if newest is not None:
+            if newest.tzinfo is None:
+                newest = newest.replace(tzinfo=timezone.utc)
+            newest_iso = newest.isoformat()
+            lag = int((datetime.now(timezone.utc) - newest).total_seconds())
+        return {
+            "table": table,
+            "row_count": count or 0,
+            "newest": newest_iso,
+            "sync_lag_sec": lag,
+        }
+
+    settlements = await _table_stats("kalshi_markets", "close_time")
+    settlements["sync_interval_sec"] = cfg.settlement_interval_sec
+
+    trades = await _table_stats("kalshi_trades", "created_time")
+    trades["sync_interval_sec"] = cfg.trades_interval_sec
+
+    ob = await _table_stats("ob_snapshots", "timestamp")
+    ob["sync_interval_sec"] = cfg.predexon_interval_sec
+
+    tfi_summary = {"tickers_cached": 0, "sample_ticker": None, "sample_tfi": None}
+    hs = getattr(coordinator, "historical_sync", None)
+    if hs and hasattr(hs, "_tfi_cache") and hs._tfi_cache:
+        cache = hs._tfi_cache
+        tfi_summary["tickers_cached"] = len(cache)
+        sample_ticker = next(iter(cache))
+        tfi_summary["sample_ticker"] = sample_ticker
+        tfi_val = hs.get_tfi(sample_ticker)
+        tfi_summary["sample_tfi"] = round(tfi_val, 4) if tfi_val is not None else None
+
+    return {
+        "enabled": cfg.enabled,
+        "pipelines": {
+            "settlements": settlements,
+            "trades": trades,
+            "ob_snapshots": ob,
+        },
+        "tfi_cache": tfi_summary,
+    }

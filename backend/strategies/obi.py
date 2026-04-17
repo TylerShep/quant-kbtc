@@ -75,20 +75,28 @@ def check_obi_exit(
     stop_loss = ov.get("stop_loss_pct", risk.stop_loss_pct)
     profit_mult = ov.get("profit_target_mult", risk.profit_target_mult)
 
+    if direction == "short":
+        short_mult = ov.get("short_stop_loss_mult", risk.short_stop_loss_mult)
+        stop_loss *= short_mult
+
     if pnl_pct <= -stop_loss:
         return "STOP_LOSS"
 
     if pnl_pct >= stop_loss * profit_mult:
         return "TAKE_PROFIT"
 
+    min_hold = ov.get("min_candles_before_early_exit", risk.min_candles_before_early_exit)
+    early_exit_ok = candles_held >= min_hold or pnl_pct < 0
+
     neutral_long = ov.get("neutral_exit_long", cfg.neutral_exit_long)
     neutral_short = ov.get("neutral_exit_short", cfg.neutral_exit_short)
 
-    if direction == "long" and current_obi < neutral_long:
-        return "SIGNAL_DECAY"
+    if early_exit_ok:
+        if direction == "long" and current_obi < neutral_long:
+            return "SIGNAL_DECAY"
 
-    if direction == "short" and current_obi > neutral_short:
-        return "SIGNAL_DECAY"
+        if direction == "short" and current_obi > neutral_short:
+            return "SIGNAL_DECAY"
 
     if atr_regime == "HIGH":
         return "VOLATILITY_SPIKE"

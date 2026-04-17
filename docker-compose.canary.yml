@@ -1,0 +1,64 @@
+services:
+  canary-db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: kbtc-db-canary
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${CANARY_POSTGRES_DB:-kbtc_canary}
+      POSTGRES_USER: ${CANARY_POSTGRES_USER:-kalshi}
+      POSTGRES_PASSWORD: ${CANARY_POSTGRES_PASSWORD:-kalshi_canary_secret}
+    ports:
+      - "5434:5432"
+    volumes:
+      - canary-postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
+    command: postgres -c shared_buffers=128MB -c work_mem=4MB -c effective_cache_size=256MB
+    mem_limit: 384m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CANARY_POSTGRES_USER:-kalshi} -d ${CANARY_POSTGRES_DB:-kbtc_canary}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - kbtc-canary-net
+
+  canary-bot:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kbtc-bot-canary
+    restart: unless-stopped
+    depends_on:
+      canary-db:
+        condition: service_healthy
+    env_file:
+      - .env.canary
+    environment:
+      DATABASE_URL: postgresql://kalshi:kalshi_canary_secret@canary-db:5432/kbtc_canary
+      BOT_ENV: production
+      LOG_LEVEL: INFO
+    ports:
+      - "8100:8000"
+    volumes:
+      - ./backend:/app
+      - canary-data:/mnt/data
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --loop uvloop --workers 1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    mem_limit: 512m
+    memswap_limit: 768m
+    cpus: 0.5
+    networks:
+      - kbtc-canary-net
+
+volumes:
+  canary-postgres-data:
+  canary-data:
+
+networks:
+  kbtc-canary-net:
+    driver: bridge

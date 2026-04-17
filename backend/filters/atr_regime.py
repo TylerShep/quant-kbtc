@@ -67,6 +67,19 @@ class ATRRegimeFilter:
     def strategy_allowed(self, strategy_name: str) -> bool:
         return REGIME_STRATEGY_MAP[self.current_regime].get(strategy_name, False)
 
+    def warmup(self, candles: list[tuple[float, float, float]]) -> int:
+        """Pre-seed from historical (high, low, close) tuples.
+
+        Call once at startup before the tick loop begins so that
+        atr_pct_history and regime are populated from minute one.
+        Returns the number of candles consumed.
+        """
+        consumed = 0
+        for high, low, close in candles:
+            self.update(high, low, close)
+            consumed += 1
+        return consumed
+
     def get_state(self) -> dict:
         return {
             "regime": self.current_regime,

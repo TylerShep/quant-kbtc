@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS ob_snapshots (
 );
 SELECT create_hypertable('ob_snapshots', 'timestamp', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_ob_ticker ON ob_snapshots (ticker, timestamp DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ob_snapshots_ticker_ts ON ob_snapshots (ticker, timestamp);
 
 -- Strategy signal log
 CREATE TABLE IF NOT EXISTS signal_log (
@@ -168,10 +169,44 @@ CREATE TABLE IF NOT EXISTS trade_features (
     pnl             NUMERIC(14,4),
     -- MFE/MAE (tracked during trade, flushed at exit)
     max_favorable_excursion NUMERIC(8,4),
-    max_adverse_excursion   NUMERIC(8,4)
+    max_adverse_excursion   NUMERIC(8,4),
+    -- Trade flow imbalance (taker aggression volumes at entry)
+    taker_buy_vol   NUMERIC(20,2),
+    taker_sell_vol  NUMERIC(20,2)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_features_trade ON trade_features (trade_id);
 CREATE INDEX IF NOT EXISTS idx_trade_features_label ON trade_features (label) WHERE label IS NOT NULL;
+
+-- Settled KXBTC contract outcomes (settlement price, result, volume)
+CREATE TABLE IF NOT EXISTS kalshi_markets (
+    ticker           VARCHAR(60)    NOT NULL,
+    event_ticker     VARCHAR(60),
+    open_time        TIMESTAMPTZ,
+    close_time       TIMESTAMPTZ    NOT NULL,
+    result           VARCHAR(4),
+    expiration_value NUMERIC(14,2),
+    last_price       NUMERIC(6,4),
+    volume           NUMERIC(20,2),
+    open_interest    NUMERIC(20,2),
+    source           VARCHAR(20)    NOT NULL DEFAULT 'historical',
+    fetched_at       TIMESTAMPTZ    DEFAULT NOW(),
+    PRIMARY KEY (ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_kalshi_markets_close ON kalshi_markets (close_time DESC);
+
+-- Public matched trades for KXBTC (taker_side for trade flow imbalance)
+CREATE TABLE IF NOT EXISTS kalshi_trades (
+    trade_id         VARCHAR(80)    NOT NULL,
+    ticker           VARCHAR(60)    NOT NULL,
+    count_fp         NUMERIC(14,2),
+    yes_price        NUMERIC(6,4),
+    taker_side       VARCHAR(4),
+    created_time     TIMESTAMPTZ    NOT NULL,
+    PRIMARY KEY (trade_id, created_time)
+);
+SELECT create_hypertable('kalshi_trades', 'created_time',
+    chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_kalshi_trades_ticker ON kalshi_trades (ticker, created_time DESC);
 
 -- Enable compression on hypertables then add policies
 ALTER TABLE ob_snapshots SET (timescaledb.compress, timescaledb.compress_segmentby = 'ticker');

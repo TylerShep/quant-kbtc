@@ -7,7 +7,7 @@ set -euo pipefail
 
 PROJECT_DIR="/home/botuser/kbtc"
 FORCE=false
-REMOTE="botuser@64.23.133.157"
+REMOTE="botuser@167.71.247.154"
 
 for arg in "$@"; do
   case "$arg" in
@@ -15,6 +15,22 @@ for arg in "$@"; do
     *@*)     REMOTE="$arg" ;;
   esac
 done
+
+# ── Ensure swap exists on remote (idempotent, needs root) ────────────────
+REMOTE_HOST="${REMOTE#*@}"
+echo "=== Checking swap on remote ==="
+ssh "root@${REMOTE_HOST}" "if [ ! -f /swapfile ]; then
+    echo '  Creating 2G swap...'
+    fallocate -l 2G /swapfile &&
+    chmod 600 /swapfile &&
+    mkswap /swapfile &&
+    swapon /swapfile &&
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo '  Swap created and enabled.'
+else
+    swapon /swapfile 2>/dev/null || true
+    echo '  Swap already configured.'
+fi"
 
 # ── Pre-deploy safety check ──────────────────────────────────────────────
 echo "=== Pre-deploy safety check ==="

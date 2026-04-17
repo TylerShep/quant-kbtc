@@ -23,7 +23,7 @@ from data.candle_aggregator import CandleAggregator
 from features.engine import FeatureEngine
 from strategies.obi import evaluate_obi, check_obi_exit, Direction
 from strategies.roc import evaluate_roc, calculate_roc, check_roc_exit
-from strategies.resolver import SignalConflictResolver
+from strategies.resolver import SignalConflictResolver, Conviction
 from filters.atr_regime import ATRRegimeFilter
 from risk.position_sizer import PositionSizer
 from risk.circuit_breaker import CircuitBreaker
@@ -32,7 +32,10 @@ from execution.live_trader import LiveTrader
 from api.ws import ws_manager
 from database import get_pool, close_pool
 from notifications import get_notifier
+from filters.price_guard import PriceGuard
+from filters.trend_guard import TrendGuard
 from ml.feature_capture import extract_features, save_features, label_trade
+from data.historical_sync import HistoricalSync
 
 logger = structlog.get_logger(__name__)
 
@@ -45,6 +48,8 @@ class Coordinator:
         self.candle_aggregator = CandleAggregator()
         self.feature_engine = FeatureEngine()
         self.atr_filter = ATRRegimeFilter()
+        self.price_guard = PriceGuard()
+        self.trend_guard = TrendGuard()
         self.resolver = SignalConflictResolver()
 
         self.paper_sizer = PositionSizer(settings.bot.initial_bankroll)
@@ -80,6 +85,8 @@ class Coordinator:
 
         # One-time alert: fires when 500+ fully-labeled paper trades exist
         self._ml_data_ready_sent: bool = False
+
+        self.historical_sync = HistoricalSync()
 
 
     @property
@@ -130,12 +137,14 @@ class Coordinator:
         self.live_trader.position_manager.set_db_pool(self._pool)
         await self.live_trader.position_manager.restore_state()
         await self._restore_state()
+        await self._warmup_atr()
         self.data_manager.add_listener(self._on_market_update)
         await self.data_manager.start()
         asyncio.create_task(self._schedule_tuning())
         asyncio.create_task(self._schedule_daily_attribution())
         asyncio.create_task(self._schedule_weekly_digest())
         asyncio.create_task(self._schedule_paper_sizer_resets())
+        await self.historical_sync.start(self._pool)
         logger.info("coordinator.started")
 
     async def stop(self):
@@ -249,7 +258,13 @@ class Coordinator:
         if self._tick_count % 10 == 0 and self._pool is not None:
             asyncio.create_task(self._persist_snapshot(symbol, state, features))
 
-        if self._tick_count % 50 == 0 and self.live_trader.orphaned_positions and not self._orphan_check_in_flight:
+        high_risk_window = (
+            regime == "HIGH"
+            or (state.time_remaining_sec is not None and state.time_remaining_sec < 300)
+        )
+        reconcile_interval = 15 if high_risk_window else 50
+
+        if self._tick_count % reconcile_interval == 0 and self.live_trader.orphaned_positions and not self._orphan_check_in_flight:
             self._orphan_check_in_flight = True
             asyncio.create_task(self._check_orphaned_positions())
 
@@ -260,7 +275,7 @@ class Coordinator:
         if self._tick_count % 300 == 0 and self._pool is not None:
             asyncio.create_task(self._save_state())
 
-        if self._tick_count % 50 == 0 and self.live_enabled and not self.live_trader.position_manager.is_busy:
+        if self._tick_count % reconcile_interval == 0 and self.live_enabled and not self.live_trader.position_manager.is_busy:
             asyncio.create_task(self._periodic_reconciliation())
 
     # ── Settlement guards ──────────────────────────────────────────────
@@ -290,6 +305,31 @@ class Coordinator:
 
         if trader.has_position and not pm_busy:
             pos = trader.position
+            guard_sec = settings.risk.short_settlement_guard_sec
+            if (pos and pos.direction == "short"
+                    and state.time_remaining_sec is not None
+                    and state.time_remaining_sec < guard_sec
+                    and state.time_remaining_sec >= 60):
+                current_price = self._get_exit_price_for(state, trader)
+                if current_price is not None and current_price > pos.entry_price:
+                    logger.info("coordinator.short_settlement_guard",
+                                ticker=pos.ticker, entry=pos.entry_price,
+                                current=current_price, remaining_sec=state.time_remaining_sec,
+                                mode=mode)
+                    if is_live:
+                        if not self._live_exit_in_flight:
+                            self._live_exit_in_flight = True
+                            asyncio.create_task(self._handle_live_exit(
+                                asyncio.ensure_future(trader.exit(current_price, "SHORT_SETTLEMENT_GUARD")),
+                                symbol,
+                                original_reason="SHORT_SETTLEMENT_GUARD",
+                                exit_price=current_price,
+                            ))
+                    else:
+                        trade = trader.exit(current_price, "SHORT_SETTLEMENT_GUARD")
+                        if trade:
+                            self._on_trade_exit(trade, symbol, mode)
+
             if pos and state.time_remaining_sec is not None and state.time_remaining_sec < 60:
                 exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
                 if is_live:
@@ -667,7 +707,8 @@ class Coordinator:
         """Common post-entry logic for both paper and live trades."""
         if mode == "live":
             self._register_position_ticker(pos.ticker, symbol)
-        asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY"))
+        asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY",
+                                                    roc_value=roc_val))
         asyncio.create_task(ws_manager.broadcast({
             "type": "trade_entry",
             "symbol": symbol,
@@ -697,6 +738,7 @@ class Coordinator:
                 candle_aggregator=self.candle_aggregator,
                 atr_filter=self.atr_filter,
                 state=state,
+                historical_sync=self.historical_sync,
             )
             self._pending_features[pos.ticker] = feat
         except Exception as e:
@@ -779,6 +821,30 @@ class Coordinator:
         finally:
             self._live_exit_in_flight = False
 
+    async def _is_duplicate_orphan_trade(self, ticker: str, reason: str) -> bool:
+        """Check if a trade for this ticker was already recorded in the last 5 minutes."""
+        if self._pool is None:
+            return False
+        try:
+            async with self._pool.connection() as conn:
+                row = await conn.execute(
+                    """SELECT id FROM trades
+                       WHERE ticker = %s AND trading_mode = 'live'
+                       AND timestamp >= NOW() - INTERVAL '5 minutes'
+                       LIMIT 1""",
+                    (ticker,),
+                )
+                result = await row.fetchone()
+                if result:
+                    logger.warning("coordinator.orphan_duplicate_skipped",
+                                   ticker=ticker, reason=reason,
+                                   existing_trade_id=result[0])
+                    return True
+        except Exception as e:
+            logger.warning("coordinator.orphan_dedup_check_failed",
+                           ticker=ticker, error=str(e))
+        return False
+
     async def _check_orphaned_positions(self) -> None:
         """Periodically check orphaned positions for break-even exit."""
         try:
@@ -792,6 +858,9 @@ class Coordinator:
                 logger.info("coordinator.orphan_recovered",
                             ticker=info["ticker"], pnl=pnl,
                             reason=info["reason"])
+
+                if await self._is_duplicate_orphan_trade(info["ticker"], info["reason"]):
+                    continue
 
                 self.live_sizer.record_trade(pnl)
 
@@ -888,6 +957,11 @@ class Coordinator:
         ]
         closes = [c.close for c in self.candle_aggregator.recent(10)]
 
+        current_atr_pct = (
+            self.atr_filter.atr_pct_history[-1]
+            if self.atr_filter.atr_pct_history else None
+        )
+
         roc_dir = evaluate_roc(
             closes=closes,
             candles=candle_list,
@@ -895,6 +969,7 @@ class Coordinator:
             obi_direction=obi_dir,
             has_position=False,
             overrides=overrides,
+            atr_pct=current_atr_pct,
         )
 
         decision = self.resolver.resolve(
@@ -904,16 +979,57 @@ class Coordinator:
             can_trade=can_trade,
         )
 
+        # TFI conviction gating — downgrade when trade flow disagrees with OBI
+        hs_cfg = settings.historical_sync
+        if (hs_cfg.tfi_conviction_enabled
+                and decision.should_trade
+                and decision.obi_dir != Direction.NEUTRAL):
+            ticker = getattr(state, "kalshi_ticker", None) or symbol
+            tfi = self.historical_sync.get_tfi(ticker) if self.historical_sync else None
+            if tfi is not None:
+                thresh = hs_cfg.tfi_disagree_threshold
+                disagrees = (
+                    (decision.obi_dir == Direction.LONG and tfi < 0.5 - thresh)
+                    or (decision.obi_dir == Direction.SHORT and tfi > 0.5 + thresh)
+                )
+                if disagrees:
+                    old_conv = decision.conviction
+                    new_conv = Conviction.downgrade(old_conv)
+                    decision = decision.with_conviction(
+                        new_conv,
+                        skip_reason="TFI_DISAGREE" if new_conv == Conviction.NONE else None,
+                    )
+                    logger.info("coordinator.tfi_downgrade",
+                                ticker=ticker, tfi=round(tfi, 4),
+                                obi_dir=decision.obi_dir.value,
+                                old_conviction=old_conv.value,
+                                new_conviction=new_conv.value,
+                                mode=mode)
+
         if mode == "paper":
             self._last_paper_decision = decision
         else:
             self._last_live_decision = decision
 
+        roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
+
+        self.trend_guard.apply_short_trend_filter(decision, closes, mode)
+
         if decision.should_trade:
             entry_price = self._get_entry_price(state, decision.direction)
             if entry_price is not None and entry_price > 0:
+                allowed, guard_reason = self.price_guard.is_allowed(
+                    entry_price, decision.direction.value,
+                    regime, state.time_remaining_sec,
+                )
+                if not allowed:
+                    if self._tick_count % 60 == 0:
+                        logger.info("coordinator.price_guard_rejected",
+                                    price=entry_price, direction=decision.direction.value,
+                                    reason=guard_reason, mode=mode)
+                    return
+
                 ticker = state.kalshi_ticker or symbol
-                roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
 
                 if mode == "live":
                     self._live_entry_in_flight = True
@@ -935,13 +1051,14 @@ class Coordinator:
                         self._on_trade_entry(pos, symbol, state, features, decision, roc_val, mode)
                     else:
                         asyncio.create_task(get_notifier().position_sizing_failed(
-                            size_dollars=sizer.calculate_size(decision.conviction.value),
+                            size_dollars=sizer.calculate_size(decision.conviction.value, decision.direction.value),
                             price=entry_price,
                             bankroll=sizer.bankroll,
                         ))
         elif decision.skip_reason and self._tick_count % 60 == 0:
             asyncio.create_task(self._persist_signal(
-                state, features, decision, decision.skip_reason
+                state, features, decision, decision.skip_reason,
+                roc_value=roc_val,
             ))
 
     def _register_position_ticker(self, ticker: str, symbol: str) -> None:
@@ -975,7 +1092,7 @@ class Coordinator:
                 self._on_trade_entry(pos, symbol, state, features, decision, roc_val, "live")
             else:
                 await get_notifier().position_sizing_failed(
-                    size_dollars=self.live_sizer.calculate_size(decision.conviction.value),
+                    size_dollars=self.live_sizer.calculate_size(decision.conviction.value, decision.direction.value),
                     price=entry_price,
                     bankroll=self.live_sizer.bankroll,
                 )
@@ -1412,6 +1529,33 @@ class Coordinator:
                 logger.info("coordinator.paper_sizer_weekly_reset",
                             bankroll=self.paper_sizer.bankroll)
 
+    async def _warmup_atr(self) -> None:
+        """Pre-seed ATR filter from historical candles so regime and atr_pct
+        are available immediately on startup instead of waiting 3.5 hours."""
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with pool.connection() as conn:
+                rows = await conn.execute(
+                    """SELECT high, low, close FROM candles
+                       ORDER BY timestamp DESC LIMIT 50"""
+                )
+                result = await rows.fetchall()
+            if not result:
+                logger.info("coordinator.atr_warmup_skipped", reason="no_candles")
+                return
+            candles = [(float(r[0]), float(r[1]), float(r[2]))
+                       for r in reversed(result)]
+            consumed = self.atr_filter.warmup(candles)
+            state = self.atr_filter.get_state()
+            logger.info("coordinator.atr_warmup_complete",
+                        candles_consumed=consumed,
+                        regime=state["regime"],
+                        atr_pct=state["atr_pct"])
+        except Exception as e:
+            logger.warning("coordinator.atr_warmup_failed", error=str(e))
+
     def _detect_rapid_fire(self) -> bool:
         """Returns True if we're in a rapid-fire loop (3+ exits in 60s)."""
         now = time.time()
@@ -1505,7 +1649,8 @@ class Coordinator:
             asyncio.create_task(get_notifier().db_error("persist_trade", str(e)))
             return False, None
 
-    async def _persist_signal(self, state, features, decision, action: str) -> None:
+    async def _persist_signal(self, state, features, decision, action: str,
+                              roc_value: float = None) -> None:
         try:
             pool = self._pool
             if pool is None:
@@ -1513,13 +1658,15 @@ class Coordinator:
             async with pool.connection() as conn:
                 await conn.execute(
                     """INSERT INTO signal_log
-                       (timestamp, ticker, obi_value, obi_direction, roc_direction,
-                        atr_regime, decision, conviction, skip_reason, size_mult)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       (timestamp, ticker, obi_value, obi_direction, roc_value,
+                        roc_direction, atr_regime, decision, conviction,
+                        skip_reason, size_mult)
+                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         state.kalshi_ticker or state.symbol,
                         features.obi,
                         decision.obi_dir.value,
+                        roc_value,
                         decision.roc_dir.value,
                         self.atr_filter.current_regime,
                         action,
@@ -1738,12 +1885,22 @@ class Coordinator:
         new_orphan_count = len(pm.orphaned_positions)
         if new_orphan_count > 0 and new_orphan_count != getattr(self, '_last_orphan_count', 0):
             self._last_orphan_count = new_orphan_count
+            orphan_details = []
+            total_exposure = 0.0
+            for o in pm.orphaned_positions:
+                exposure = o.contracts * o.avg_entry_price / 100
+                total_exposure += exposure
+                orphan_details.append(f"{o.ticker} ({o.direction}, {o.contracts}x @ {o.avg_entry_price}c = ${exposure:.2f})")
             logger.warning("coordinator.orphans_detected",
                            count=new_orphan_count,
-                           tickers=[o.ticker for o in pm.orphaned_positions])
+                           tickers=[o.ticker for o in pm.orphaned_positions],
+                           total_exposure=round(total_exposure, 2))
             asyncio.create_task(get_notifier().unhandled_exception(
                 location="coordinator._reconcile_live_positions",
-                error=f"Detected {new_orphan_count} orphaned Kalshi positions, monitoring for break-even exit",
+                error=(
+                    f"Detected {new_orphan_count} orphaned positions "
+                    f"(${total_exposure:.2f} exposure): {'; '.join(orphan_details)}"
+                ),
             ))
         elif new_orphan_count == 0 and getattr(self, '_last_orphan_count', 0) > 0:
             self._last_orphan_count = 0

@@ -16,7 +16,7 @@ class PositionSizer:
         self.trades_today: list[float] = []
         self.trades_this_week: list[float] = []
 
-    def calculate_size(self, conviction: str) -> float:
+    def calculate_size(self, conviction: str, direction: str = "long") -> float:
         """Returns dollar amount to risk on this trade."""
         cfg = settings.risk
         base_risk = self.bankroll * cfg.risk_per_trade_pct
@@ -27,6 +27,9 @@ class PositionSizer:
             "LOW": cfg.low_conviction_mult,
         }
         adjusted = base_risk * multipliers.get(conviction, 1.0)
+
+        if direction == "short":
+            adjusted *= cfg.short_size_mult
 
         if self.current_drawdown > 0.10:
             adjusted *= cfg.drawdown_reduction_mult

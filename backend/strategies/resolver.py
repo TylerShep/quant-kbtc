@@ -17,6 +17,16 @@ class Conviction(str, Enum):
     LOW = "LOW"
     NONE = "NONE"
 
+    @staticmethod
+    def downgrade(level: "Conviction") -> "Conviction":
+        _ladder = {
+            Conviction.HIGH: Conviction.NORMAL,
+            Conviction.NORMAL: Conviction.LOW,
+            Conviction.LOW: Conviction.NONE,
+            Conviction.NONE: Conviction.NONE,
+        }
+        return _ladder[level]
+
 
 COORDINATION_TABLE: dict[tuple[Direction, Direction], tuple[Optional[Direction], Conviction]] = {
     (Direction.LONG, Direction.LONG): (Direction.LONG, Conviction.HIGH),
@@ -52,7 +62,21 @@ class TradeDecision:
 
     @property
     def should_trade(self) -> bool:
-        return self.direction is not None and self.conviction != Conviction.NONE
+        return (
+            self.direction is not None
+            and self.conviction not in (Conviction.NONE, Conviction.LOW)
+        )
+
+    def with_conviction(self, new_conviction: Conviction, skip_reason: Optional[str] = None) -> "TradeDecision":
+        """Return a copy with conviction changed. Clears direction if NONE."""
+        new_dir = self.direction if new_conviction != Conviction.NONE else None
+        return TradeDecision(
+            direction=new_dir,
+            conviction=new_conviction,
+            obi_dir=self.obi_dir,
+            roc_dir=self.roc_dir,
+            skip_reason=skip_reason or self.skip_reason,
+        )
 
 
 class SignalConflictResolver:

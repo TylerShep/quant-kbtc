@@ -3,7 +3,7 @@ Offline XGBoost training script for the ML entry gate.
 
 Usage:
     # Export data from DB first:
-    #   ssh botuser@64.23.133.157 "docker exec kbtc-db psql -U kalshi -d kbtc \
+    #   ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc \
     #     -c \"COPY (SELECT * FROM trade_features WHERE label IS NOT NULL) TO STDOUT CSV HEADER\"" \
     #     > trade_features_export.csv
     #

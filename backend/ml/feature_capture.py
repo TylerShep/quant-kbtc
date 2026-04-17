@@ -22,6 +22,7 @@ def extract_features(
     atr_filter,
     state,
     roc_lookback: int = 3,
+    historical_sync=None,
 ) -> dict:
     """Build a feature dict from current market state.
 
@@ -69,8 +70,15 @@ def extract_features(
 
     now = datetime.now(timezone.utc)
 
+    tfi = None
+    taker_buy_vol = None
+    taker_sell_vol = None
+    if historical_sync and hasattr(state, "kalshi_ticker") and state.kalshi_ticker:
+        tfi = historical_sync.get_tfi(state.kalshi_ticker)
+        taker_buy_vol, taker_sell_vol = historical_sync.get_tfi_volumes(state.kalshi_ticker)
+
     return {
-        "obi": round(features.obi, 4) if features.obi is not None else None,
+        "obi": round(getattr(features, "obi_raw", features.obi), 4) if features.obi is not None else None,
         "roc_3": round(roc_3, 4) if roc_3 is not None else None,
         "roc_5": round(roc_5, 4) if roc_5 is not None else None,
         "roc_10": round(roc_10, 4) if roc_10 is not None else None,
@@ -84,6 +92,9 @@ def extract_features(
         "time_remaining_sec": state.time_remaining_sec,
         "hour_of_day": now.hour,
         "day_of_week": now.weekday(),
+        "tfi": round(tfi, 4) if tfi is not None else None,
+        "taker_buy_vol": taker_buy_vol,
+        "taker_sell_vol": taker_sell_vol,
     }
 
 
@@ -103,6 +114,7 @@ async def save_features(
             "atr_pct", "spread_pct", "bid_depth", "ask_depth",
             "green_candles_3", "candle_body_pct", "volume_ratio",
             "time_remaining_sec", "hour_of_day", "day_of_week",
+            "taker_buy_vol", "taker_sell_vol",
         ]
         vals = [
             trade_id, trading_mode, ticker,
@@ -120,6 +132,8 @@ async def save_features(
             feature_dict.get("time_remaining_sec"),
             feature_dict.get("hour_of_day"),
             feature_dict.get("day_of_week"),
+            feature_dict.get("taker_buy_vol"),
+            feature_dict.get("taker_sell_vol"),
         ]
         placeholders = ", ".join(f"%s" for _ in cols)
         col_str = ", ".join(cols)

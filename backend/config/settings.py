@@ -83,7 +83,9 @@ class OBIConfig:
     depth_levels: int = field(default_factory=lambda: _env_int("OBI_DEPTH_LEVELS", 10))
     long_threshold: float = field(default_factory=lambda: _env_float("OBI_LONG_THRESHOLD", 0.65))
     short_threshold: float = field(default_factory=lambda: _env_float("OBI_SHORT_THRESHOLD", 0.35))
-    consecutive_readings: int = field(default_factory=lambda: _env_int("OBI_CONSECUTIVE_READINGS", 2))
+    consecutive_readings: int = field(default_factory=lambda: _env_int("OBI_CONSECUTIVE_READINGS", 3))
+    smooth_window_sec: float = field(default_factory=lambda: _env_float("OBI_SMOOTH_WINDOW_SEC", 5.0))
+    smooth_min_samples: int = field(default_factory=lambda: _env_int("OBI_SMOOTH_MIN_SAMPLES", 3))
     refresh_seconds: int = field(default_factory=lambda: _env_int("OBI_REFRESH_SECONDS", 30))
     min_book_volume: int = field(default_factory=lambda: _env_int("MIN_BOOK_VOLUME", 1000))
     neutral_exit_long: float = field(default_factory=lambda: _env_float("OBI_NEUTRAL_EXIT_LONG", 0.55))
@@ -102,6 +104,9 @@ class ROCConfig:
     momentum_stall_ratio: float = field(default_factory=lambda: _env_float("ROC_MOMENTUM_STALL_RATIO", 0.5))
     blowoff_single_candle: float = field(default_factory=lambda: _env_float("ROC_BLOWOFF_CANDLE", 1.5))
     max_candles_in_trade: int = field(default_factory=lambda: _env_int("ROC_MAX_CANDLES", 2))
+    threshold_atr_mult: float = field(default_factory=lambda: _env_float("ROC_THRESHOLD_ATR_MULT", 1.2))
+    threshold_floor: float = field(default_factory=lambda: _env_float("ROC_THRESHOLD_FLOOR", 0.10))
+    threshold_cap: float = field(default_factory=lambda: _env_float("ROC_THRESHOLD_CAP", 1.0))
 
 
 @dataclass(frozen=True)
@@ -127,6 +132,17 @@ class RiskConfig:
     normal_conviction_mult: float = field(default_factory=lambda: _env_float("NORMAL_CONVICTION_MULT", 1.0))
     low_conviction_mult: float = field(default_factory=lambda: _env_float("LOW_CONVICTION_MULT", 0.65))
     drawdown_reduction_mult: float = field(default_factory=lambda: _env_float("DRAWDOWN_REDUCTION_MULT", 0.5))
+    max_live_contracts: int = field(default_factory=lambda: _env_int("MAX_LIVE_CONTRACTS", 50))
+    min_short_entry_price: float = field(default_factory=lambda: _env_float("MIN_SHORT_ENTRY_PRICE", 25.0))
+    short_min_entry_price: float = field(default_factory=lambda: _env_float("SHORT_MIN_ENTRY_PRICE", 25.0))
+    long_max_entry_price: float = field(default_factory=lambda: _env_float("LONG_MAX_ENTRY_PRICE", 60.0))
+    short_size_mult: float = field(default_factory=lambda: _env_float("SHORT_SIZE_MULT", 0.7))
+    short_settlement_guard_sec: int = field(default_factory=lambda: _env_int("SHORT_SETTLEMENT_GUARD_SEC", 300))
+    short_stop_loss_mult: float = field(default_factory=lambda: _env_float("SHORT_STOP_LOSS_MULT", 1.5))
+    short_trend_lookback_candles: int = field(default_factory=lambda: _env_int("SHORT_TREND_LOOKBACK_CANDLES", 4))
+    short_trend_soften_rise_pct: float = field(default_factory=lambda: _env_float("SHORT_TREND_SOFTEN_RISE_PCT", 0.20))
+    short_trend_block_rise_pct: float = field(default_factory=lambda: _env_float("SHORT_TREND_BLOCK_RISE_PCT", 0.35))
+    min_candles_before_early_exit: int = field(default_factory=lambda: _env_int("MIN_CANDLES_BEFORE_EARLY_EXIT", 2))
 
 
 @dataclass(frozen=True)
@@ -159,6 +175,34 @@ class BotConfig:
 
 
 @dataclass(frozen=True)
+class HistoricalSyncConfig:
+    enabled: bool = field(
+        default_factory=lambda: _env_bool("HISTORICAL_SYNC_ENABLED", True))
+    predexon_api_key: str = field(
+        default_factory=lambda: _env("PREDEXON_API_KEY", ""))
+    predexon_base_url: str = field(
+        default_factory=lambda: _env("PREDEXON_BASE_URL", "https://api.predexon.com/v2"))
+    predexon_bootstrap_days: int = field(
+        default_factory=lambda: _env_int("PREDEXON_BOOTSTRAP_DAYS", 90))
+    predexon_interval_sec: int = field(
+        default_factory=lambda: _env_int("PREDEXON_BOOTSTRAP_INTERVAL_SEC", 600))
+    settlement_sync_days: int = field(
+        default_factory=lambda: _env_int("KALSHI_SETTLEMENT_SYNC_DAYS", 90))
+    settlement_interval_sec: int = field(
+        default_factory=lambda: _env_int("KALSHI_SETTLEMENT_SYNC_INTERVAL_SEC", 3600))
+    trades_sync_days: int = field(
+        default_factory=lambda: _env_int("KALSHI_TRADES_SYNC_DAYS", 30))
+    trades_interval_sec: int = field(
+        default_factory=lambda: _env_int("KALSHI_TRADES_SYNC_INTERVAL_SEC", 300))
+    tfi_window_minutes: int = field(
+        default_factory=lambda: _env_int("TFI_WINDOW_MINUTES", 15))
+    tfi_disagree_threshold: float = field(
+        default_factory=lambda: _env_float("TFI_DISAGREE_THRESHOLD", 0.1))
+    tfi_conviction_enabled: bool = field(
+        default_factory=lambda: _env_bool("TFI_CONVICTION_ENABLED", True))
+
+
+@dataclass(frozen=True)
 class Settings:
     kalshi: KalshiConfig = field(default_factory=KalshiConfig)
     spot: SpotConfig = field(default_factory=SpotConfig)
@@ -168,6 +212,7 @@ class Settings:
     atr: ATRConfig = field(default_factory=ATRConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     bot: BotConfig = field(default_factory=BotConfig)
+    historical_sync: HistoricalSyncConfig = field(default_factory=HistoricalSyncConfig)
 
 
 settings = Settings()

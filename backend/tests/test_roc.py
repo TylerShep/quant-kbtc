@@ -87,7 +87,7 @@ def test_check_roc_exit_momentum_stall():
             entry_roc=2.0,
             current_roc=0.5,
             latest_candle={"open": 100.0, "close": 100.5},
-            candles_held=0,
+            candles_held=2,
         )
         == "MOMENTUM_STALL"
     )
@@ -101,7 +101,7 @@ def test_check_roc_exit_candle_reversal_long():
             entry_roc=1.0,
             current_roc=1.0,
             latest_candle={"open": 100.0, "close": 99.0},
-            candles_held=0,
+            candles_held=2,
         )
         == "CANDLE_REVERSAL"
     )
@@ -115,9 +115,39 @@ def test_check_roc_exit_candle_reversal_short():
             entry_roc=-1.0,
             current_roc=-1.0,
             latest_candle={"open": 100.0, "close": 101.0},
+            candles_held=2,
+        )
+        == "CANDLE_REVERSAL"
+    )
+
+
+def test_check_roc_exit_candle_reversal_early_when_losing():
+    """Early exit still fires on candle 0 when trade is already losing."""
+    assert (
+        check_roc_exit(
+            "long",
+            pnl_pct=-0.005,
+            entry_roc=1.0,
+            current_roc=1.0,
+            latest_candle={"open": 100.0, "close": 99.0},
             candles_held=0,
         )
         == "CANDLE_REVERSAL"
+    )
+
+
+def test_check_roc_exit_candle_reversal_suppressed_when_profitable():
+    """Early exit is suppressed on candle 0 when trade is flat/profitable."""
+    assert (
+        check_roc_exit(
+            "long",
+            pnl_pct=0.001,
+            entry_roc=1.0,
+            current_roc=1.0,
+            latest_candle={"open": 100.0, "close": 99.0},
+            candles_held=0,
+        )
+        is None
     )
 
 

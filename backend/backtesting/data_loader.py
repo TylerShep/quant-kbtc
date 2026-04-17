@@ -78,26 +78,44 @@ async def load_candles_db(pool, symbol: str = "BTCUSDT", source: str = "binance"
 
 
 async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
-                                limit: int = 100000) -> dict[float, dict]:
-    """Load OB snapshots keyed by timestamp for backtest lookup."""
-    query = "SELECT timestamp, bids, asks, obi, total_bid_vol, total_ask_vol FROM ob_snapshots"
-    params: list = []
-    if ticker:
-        query += " WHERE ticker = %s"
-        params.append(ticker)
-    query += " ORDER BY timestamp ASC LIMIT %s"
-    params.append(limit)
+                                limit: int = 100000,
+                                candle_interval: int = 900) -> dict[float, dict]:
+    """Load OB snapshots aggregated to candle boundaries for backtest lookup.
+
+    Raw OB snapshots have sub-second timestamps that won't match candle
+    timestamps.  This aggregates in SQL using DISTINCT ON to grab the
+    last snapshot per 15-min bucket, so we transfer only one row per
+    candle instead of millions.
+    """
+    where_clause = "WHERE ticker = %s" if ticker else ""
+    params: list = [ticker] if ticker else []
+
+    query = f"""
+        SELECT DISTINCT ON (bucket)
+            EXTRACT(EPOCH FROM
+                date_trunc('hour', timestamp)
+                + INTERVAL '1 second' * (
+                    FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * 15 * 60
+                )
+            ) AS bucket,
+            obi,
+            total_bid_vol,
+            total_ask_vol
+        FROM ob_snapshots
+        {where_clause}
+        ORDER BY bucket, timestamp DESC
+    """
 
     async with pool.connection() as conn:
         rows = await conn.execute(query, params)
         result = await rows.fetchall()
         return {
-            r[0].timestamp(): {
-                "bids": r[1],
-                "asks": r[2],
-                "obi": float(r[3]) if r[3] else 0.5,
-                "total_bid_vol": float(r[4]) if r[4] else 0,
-                "total_ask_vol": float(r[5]) if r[5] else 0,
+            float(r[0]): {
+                "bids": [],
+                "asks": [],
+                "obi": float(r[1]) if r[1] else 0.5,
+                "total_bid_vol": float(r[2]) if r[2] else 0,
+                "total_ask_vol": float(r[3]) if r[3] else 0,
             }
             for r in result
         }
@@ -125,6 +143,68 @@ def validate_candles(candles: list[dict]) -> dict:
         else 0,
         "sufficient": n >= RECOMMENDED_CANDLES,
     }
+
+
+async def load_kalshi_markets_db(
+    pool,
+    series: str = "KXBTC",
+    limit: int = 5000,
+) -> dict[str, dict]:
+    """Load settled market metadata keyed by ticker.
+    Used by backtester to get settlement price for exit accuracy.
+    """
+    async with pool.connection() as conn:
+        rows = await conn.execute(
+            """SELECT ticker, close_time, result, expiration_value,
+                      last_price, volume
+               FROM kalshi_markets
+               WHERE ticker LIKE %s
+               ORDER BY close_time ASC
+               LIMIT %s""",
+            (f"{series}%", limit)
+        )
+        result = await rows.fetchall()
+        return {
+            r[0]: {
+                "close_time": r[1].timestamp() if r[1] else None,
+                "result": r[2],
+                "expiration_value": float(r[3]) if r[3] else None,
+                "last_price": float(r[4]) if r[4] else None,
+                "volume": float(r[5]) if r[5] else None,
+            }
+            for r in result
+        }
+
+
+async def load_tfi_history_db(
+    pool,
+    ticker: Optional[str] = None,
+    window_minutes: int = 15,
+    limit: int = 100000,
+) -> dict[float, float]:
+    """Load pre-computed rolling TFI keyed by timestamp (seconds).
+    Used by backtester to inject TFI as a second OBI feature.
+    """
+    query = """
+        SELECT
+            EXTRACT(EPOCH FROM
+                date_trunc('minute', created_time)
+            ) AS ts,
+            SUM(CASE WHEN taker_side = 'yes' THEN count_fp ELSE 0 END)
+                / NULLIF(SUM(count_fp), 0) AS tfi
+        FROM kalshi_trades
+    """
+    params: list = []
+    if ticker:
+        query += " WHERE ticker = %s"
+        params.append(ticker)
+    query += " GROUP BY 1 ORDER BY 1 ASC LIMIT %s"
+    params.append(limit)
+
+    async with pool.connection() as conn:
+        rows = await conn.execute(query, params)
+        result = await rows.fetchall()
+        return {float(r[0]): float(r[1]) for r in result if r[1] is not None}
 
 
 async def export_ob_to_csv(pool, output_path: str | Path, limit: int = 100000) -> int:

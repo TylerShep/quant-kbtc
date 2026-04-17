@@ -14,6 +14,7 @@ import { StatsPanel } from './components/StatsPanel';
 import { BacktestPanel } from './components/BacktestPanel';
 import { AttributionPanel } from './components/AttributionPanel';
 import { BtcPriceChart } from './components/BtcPriceChart';
+import { HistoricalsTab } from './components/HistoricalsTab';
 import { useDiagnostics } from './hooks/useDiagnostics';
 import type { PnLPoint, Features, MarketState } from './types';
 import './index.css';
@@ -61,13 +62,13 @@ function App() {
   const [tradesPage, setTradesPage] = useState(1);
   const { data: tradesData, loading: tradesLoading } = useTrades(tradesPage, 10, viewMode);
   const [erroredPage, setErroredPage] = useState(1);
-  const { data: erroredData, loading: erroredLoading } = useErroredTrades(erroredPage);
+  const { data: erroredData, loading: erroredLoading } = useErroredTrades(erroredPage, 10, viewMode);
   const diagnostics = useDiagnostics(10000);
   const [features, setFeatures] = useState<Features | null>(null);
   const [marketState, setMarketState] = useState<MarketState | null>(null);
   const [timeRange, setTimeRange] = useState<'24H' | '1W' | '1M' | 'All'>('All');
   const [chartMode, setChartMode] = useState<ChartMode>('account');
-  const [chartTab, setChartTab] = useState<'equity' | 'btc'>('equity');
+  const [chartTab, setChartTab] = useState<'equity' | 'btc' | 'historicals'>('equity');
 
   // On first status load, set the default view to match the backend trading mode.
   // After that, only sync when the user hasn't manually picked a tab.
@@ -85,9 +86,9 @@ function App() {
     }
   }, [tradingMode]);
 
-  // Reset trades page when switching viewMode
   useEffect(() => {
     setTradesPage(1);
+    setErroredPage(1);
   }, [viewMode]);
 
   useEffect(() => {
@@ -217,6 +218,17 @@ function App() {
               >
                 BTC Price
               </button>
+              <button
+                type="button"
+                onClick={() => setChartTab('historicals')}
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  chartTab === 'historicals'
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+                }`}
+              >
+                Historicals
+              </button>
               {tradingMode === 'live' && viewMode === 'paper' && (
                 <span className="ml-auto text-[10px] text-amber-400/70 flex items-center gap-1">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
@@ -227,8 +239,10 @@ function App() {
             <div className="flex-1 min-h-0 p-3">
               {chartTab === 'equity' ? (
                 <PnLChart data={chartData} mode={chartMode} />
-              ) : (
+              ) : chartTab === 'btc' ? (
                 <BtcPriceChart />
+              ) : (
+                <HistoricalsTab />
               )}
             </div>
             <SignalPanel

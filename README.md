@@ -179,7 +179,7 @@ The bot passively collects 14 entry-time features at trade entry, labels outcome
 
 ```bash
 # Export labeled data from the remote DB
-ssh botuser@64.23.133.157 "docker exec kbtc-db psql -U kalshi -d kbtc \
+ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc \
   -c \"COPY (SELECT * FROM trade_features WHERE label IS NOT NULL) TO STDOUT CSV HEADER\"" \
   > trade_features_export.csv
 
@@ -238,13 +238,65 @@ PostgreSQL with TimescaleDB. Key tables:
 | `trade_features` | ML feature snapshots at entry, labeled at exit with MFE/MAE |
 | `bot_state` | Key-value store for runtime state (bankroll, param overrides) |
 
+## Orphan Safety Validation
+
+The bot includes a two-layer validation system to ensure orphan/phantom position handling works correctly before live trading resumes after any position management changes.
+
+### Layer 1: Incident Replay Suite (offline)
+
+Deterministic tests that replay exact Kalshi API response sequences from real production incidents. Each test asserts that the current code handles the scenario correctly.
+
+```bash
+cd backend && python3 -m pytest tests/replay/ -v
+```
+
+Covers:
+- **Settlement verify failure** (Trade 451/454) — no orphan created when verify exhausts retries
+- **Phantom accumulation** (BUG-015) — 70+ reconciliation cycles do not inflate contract count
+- **Restart persistence** — `_settled_tickers` survives snapshot/restore cycle
+- **Exit cooldown race** — recently-exited ticker skipped for 90s during reconciliation
+- **Orphan-to-trade dedup** — duplicate trade within 5min window is skipped
+- **Full lifecycle** — enter → settle → restart → reconcile = 0 orphans
+
+### Layer 2: Demo Live-Path Canary (72-hour runtime)
+
+An isolated canary stack running the exact same live code path against Kalshi's demo API with a small bankroll. Validates that no orphans, desyncs, or duplicates occur under real market conditions.
+
+```bash
+# Launch canary stack on the droplet
+bash scripts/canary_up.sh
+
+# Check health
+bash scripts/canary_status.sh
+
+# After 72h, run the validation report
+bash scripts/canary_report.sh
+
+# Tear down
+bash scripts/canary_down.sh        # preserve data
+bash scripts/canary_down.sh --wipe  # full reset
+```
+
+The canary runs on ports 8100 (API) and 5434 (DB), fully isolated from production.
+
+### Promotion Workflow
+
+1. Run replay suite → all tests must pass
+2. Deploy canary → `bash scripts/canary_up.sh`
+3. Wait 72 hours
+4. Run canary report → `bash scripts/canary_report.sh`
+5. If all gates pass → safe to unpause live trading
+6. Tear down canary → `bash scripts/canary_down.sh`
+
+See `scripts/PROMOTION_GATES.md` for the full gate definitions.
+
 ## Tests
 
 ```bash
 cd backend && python -m pytest tests/ -v
 ```
 
-Unit tests cover: position sizer, circuit breaker, OBI strategy, ROC strategy, signal resolver, candle aggregator, ATR regime filter, and paper trader.
+Unit tests cover: position sizer, circuit breaker, OBI strategy, ROC strategy, signal resolver, candle aggregator, ATR regime filter, paper trader, orphan incident replay, price guard, and trend guard.
 
 ## Environment Variables
 

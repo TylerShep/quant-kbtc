@@ -14,6 +14,8 @@ from typing import Optional
 
 import structlog
 
+from config import settings
+
 from data.kalshi_ws import KalshiOrderClient
 from execution.position_manager import PositionManager, ManagedPosition
 from risk.position_sizer import PositionSizer
@@ -90,12 +92,18 @@ class LiveTrader:
         obi: float = 0.0,
         roc: float = 0.0,
     ) -> Optional[ManagedPosition]:
-        size_dollars = self.sizer.calculate_size(conviction)
+        size_dollars = self.sizer.calculate_size(conviction, direction)
         cost_per = price / 100
         contracts = int(size_dollars / cost_per) if cost_per > 0 else 0
         if contracts < 1:
             logger.warning("live.position_too_small", size=size_dollars, price=price)
             return None
+
+        max_contracts = settings.risk.max_live_contracts
+        if contracts > max_contracts:
+            logger.warning("live.contracts_capped",
+                           raw=contracts, cap=max_contracts, price=price)
+            contracts = max_contracts
 
         pos = await self.position_manager.enter(
             ticker=ticker,

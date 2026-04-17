@@ -15,13 +15,40 @@ from config import settings
 
 
 class Backtester:
-    FEE_RATE = 0.007
+    FEE_RATE = 0.007  # legacy fallback, unused by kalshi_fee()
+
+    @staticmethod
+    def kalshi_fee(contracts: int, price_cents: float, maker: bool = False) -> float:
+        """Kalshi probability-weighted fee per their 2026 schedule.
+
+        Taker: roundup(0.07 * C * P * (1-P)),  max 1.75c / contract
+        Maker: roundup(0.0175 * C * P * (1-P)), max 0.44c / contract
+
+        ``price_cents`` should be a Kalshi contract price (1-99).  If a
+        BTC spot price (>100) is passed, it's clamped to a typical
+        contract mid-price of 50c so fees remain realistic.
+        Returns fee in dollars.
+        """
+        import math
+        if price_cents > 99:
+            price_cents = 50.0
+        p = price_cents / 100.0
+        if maker:
+            raw = 0.0175 * contracts * p * (1 - p)
+            per_contract_cap = 0.0044
+        else:
+            raw = 0.07 * contracts * p * (1 - p)
+            per_contract_cap = 0.0175
+        fee = math.ceil(raw * 100) / 100.0
+        return min(fee, per_contract_cap * contracts)
 
     def __init__(self, candles: list[dict], ob_history: dict,
-                 config: Optional[dict] = None):
+                 config: Optional[dict] = None,
+                 settlement_data: Optional[dict] = None):
         self.candles = candles
         self.ob_history = ob_history
         self.config = config or {}
+        self.settlement_data = settlement_data or {}
         self.trades: list[dict] = []
         self.equity_curve: list[float] = []
         self.signal_log: list[dict] = []
@@ -51,7 +78,12 @@ class Backtester:
                 pnl_pct = self._calc_pnl_pct(position, candle["close"])
                 position["candles_held"] += 1
 
-                if pnl_pct <= -stop_loss:
+                effective_sl = stop_loss
+                if position["direction"] == "short":
+                    short_mult = self.config.get("short_stop_loss_mult", settings.risk.short_stop_loss_mult)
+                    effective_sl *= short_mult
+
+                if pnl_pct <= -effective_sl:
                     self._close_position(position, candle, "STOP_LOSS", current_bankroll)
                     current_bankroll = self.equity_curve[-1]
                     position = None
@@ -146,10 +178,20 @@ class Backtester:
 
     def _close_position(self, position: dict, candle: dict,
                         reason: str, current_bankroll: float):
-        pnl_pct = self._calc_pnl_pct(position, candle["close"])
+        exit_price = candle["close"]
+        if reason in ("TIME_EXIT", "SETTLEMENT", "END_OF_DATA"):
+            ticker = candle.get("ticker")
+            if ticker and ticker in self.settlement_data:
+                exp = self.settlement_data[ticker].get("expiration_value")
+                if exp:
+                    exit_price = exp
+
+        pnl_pct = self._calc_pnl_pct(position, exit_price)
         notional = position["contracts"] * position["entry_price"] / 100
         gross_pnl = pnl_pct * notional
-        fees = notional * self.FEE_RATE
+        entry_fee = self.kalshi_fee(position["contracts"], position["entry_price"])
+        exit_fee = self.kalshi_fee(position["contracts"], exit_price)
+        fees = entry_fee + exit_fee
         net_pnl = gross_pnl - fees
 
         self.trades.append({
@@ -157,7 +199,7 @@ class Backtester:
             "exit_timestamp": candle["timestamp"],
             "direction": position["direction"],
             "entry_price": position["entry_price"],
-            "exit_price": candle["close"],
+            "exit_price": exit_price,
             "pnl": round(net_pnl, 4),
             "pnl_pct": round(pnl_pct, 4),
             "fees": round(fees, 4),

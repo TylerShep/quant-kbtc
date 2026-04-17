@@ -37,9 +37,13 @@ class WindowResult:
 
 
 class WalkForwardOptimizer:
-    def __init__(self, candles: list[dict], ob_history: dict):
+    def __init__(self, candles: list[dict], ob_history: dict,
+                 settlement_data: Optional[dict] = None,
+                 tfi_history: Optional[dict] = None):
         self.candles = candles
         self.ob_history = ob_history
+        self.settlement_data = settlement_data or {}
+        self.tfi_history = tfi_history or {}
 
     def run(self, param_space: dict, objective: str = "sharpe_ratio") -> list[WindowResult]:
         windows = self._generate_windows()
@@ -51,7 +55,8 @@ class WalkForwardOptimizer:
             )
 
             test_candles = self.candles[test_range[0] : test_range[1]]
-            bt = Backtester(test_candles, self.ob_history, best_params)
+            bt = Backtester(test_candles, self.ob_history, best_params,
+                            settlement_data=self.settlement_data)
             test_result = bt.run()
 
             if test_result["total_trades"] < WALK_FORWARD_CONFIG["min_trades_per_window"]:
@@ -103,7 +108,8 @@ class WalkForwardOptimizer:
         best_score = float("-inf")
 
         for params in param_combos:
-            bt = Backtester(train_candles, self.ob_history, params)
+            bt = Backtester(train_candles, self.ob_history, params,
+                            settlement_data=self.settlement_data)
             result = bt.run()
             if result["total_trades"] < 30:
                 continue

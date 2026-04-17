@@ -57,31 +57,53 @@ const CONVICTION_ORDER = ['HIGH', 'NORMAL', 'LOW'];
 const SESSION_ORDER = ['ASIA', 'LONDON', 'US_OPEN', 'US_MAIN', 'US_CLOSE'];
 const REGIME_ORDER = ['LOW', 'MEDIUM', 'HIGH'];
 
+const attrCache: Record<string, { attribution: Attribution; mode: string }> = {};
+
+async function fetchAttrForMode(m: string): Promise<{ attribution: Attribution | null; mode: string }> {
+  const modeParam = `?mode=${m}`;
+  try {
+    const res = await fetch(`/api/attribution${modeParam}`);
+    if (res.ok) {
+      const j: AttrResponse = await res.json();
+      attrCache[m] = { attribution: j.attribution, mode: j.mode };
+      return attrCache[m];
+    }
+  } catch {}
+  return attrCache[m] ?? { attribution: null, mode: m };
+}
+
 export function AttributionPanel({ tradingMode }: { tradingMode?: string }) {
+  const activeMode = tradingMode ?? 'paper';
+  const cached = attrCache[activeMode];
   const [expanded, setExpanded] = useState(false);
-  const [attr, setAttr] = useState<Attribution | null>(null);
-  const [mode, setMode] = useState<string>('');
+  const [attr, setAttr] = useState<Attribution | null>(cached?.attribution ?? null);
+  const [mode, setMode] = useState<string>(cached?.mode ?? '');
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
+    const c = attrCache[activeMode];
+    if (c) {
+      setAttr(c.attribution);
+      setMode(c.mode);
+    }
+
     let cancelled = false;
-    const modeParam = tradingMode ? `?mode=${tradingMode}` : '';
     (async () => {
       try {
-        const res = await fetch(`/api/attribution${modeParam}`);
+        const result = await fetchAttrForMode(activeMode);
         if (cancelled) return;
-        if (res.ok) {
-          const j: AttrResponse = await res.json();
-          setAttr(j.attribution);
-          setMode(j.mode);
-        }
+        setAttr(result.attribution);
+        setMode(result.mode);
         setErr(null);
+
+        const other = activeMode === 'paper' ? 'live' : 'paper';
+        fetchAttrForMode(other);
       } catch {
         if (!cancelled) setErr('Failed to load attribution');
       }
     })();
     return () => { cancelled = true; };
-  }, [tradingMode]);
+  }, [activeMode]);
 
   const sig = attr?.signal_attribution ?? {};
   const sess = attr?.session_attribution ?? {};

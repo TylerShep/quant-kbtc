@@ -190,13 +190,30 @@ async def run_tuning_cycle(
 ) -> TuningResult:
     """Run a full tuning cycle: walk-forward -> evaluate -> recommend/apply."""
     from backtesting.walk_forward import WalkForwardOptimizer
+    from backtesting.data_loader import load_kalshi_markets_db, load_tfi_history_db
 
     current = get_current_params()
     param_space = build_param_space(current)
 
     logger.info("auto_tuner.starting", candle_count=len(candles))
 
-    optimizer = WalkForwardOptimizer(candles, ob_history)
+    settlement_data: dict = {}
+    tfi_history: dict = {}
+    if pool:
+        try:
+            settlement_data = await load_kalshi_markets_db(pool)
+            tfi_history = await load_tfi_history_db(pool)
+            logger.info("auto_tuner.data_loaded",
+                        settlements=len(settlement_data),
+                        tfi_points=len(tfi_history))
+        except Exception as e:
+            logger.warning("auto_tuner.data_load_failed", error=str(e))
+
+    optimizer = WalkForwardOptimizer(
+        candles, ob_history,
+        settlement_data=settlement_data,
+        tfi_history=tfi_history,
+    )
     results = optimizer.run(param_space, objective="sharpe_ratio")
 
     if not results:

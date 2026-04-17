@@ -22,7 +22,7 @@ OVERFITTING_RED_FLAGS = {
     "too_few_trades": 50,
 }
 
-FEE_RATE = 0.007
+FEE_RATE = 0.007  # legacy constant kept for reference; actual fees come from trade records
 
 
 def compute_metrics(trades: list[dict], equity_curve: list[float],
@@ -93,10 +93,14 @@ def compute_metrics(trades: list[dict], equity_curve: list[float],
     avg_win = round(sum(winners) / len(winners), 4) if winners else 0
     avg_loss = round(sum(losers) / len(losers), 4) if losers else 0
 
-    # Break-even win rate after fees (from cost-fee-optimizer skill)
-    net_win = abs(avg_win) - FEE_RATE if avg_win else 0
-    net_loss = abs(avg_loss) + FEE_RATE if avg_loss else 0
-    breakeven_wr = round(net_loss / (net_win + net_loss), 4) if (net_win + net_loss) > 0 else 0.5
+    # Break-even win rate from actual dollar P&L (includes fees already)
+    winning_trades = [t for t in trades if t["pnl"] > 0]
+    losing_trades = [t for t in trades if t["pnl"] <= 0]
+    avg_win_dollars = sum(t["pnl"] for t in winning_trades) / len(winning_trades) if winning_trades else 0
+    avg_loss_dollars = abs(sum(t["pnl"] for t in losing_trades) / len(losing_trades)) if losing_trades else 0
+    breakeven_wr = round(
+        avg_loss_dollars / (avg_win_dollars + avg_loss_dollars), 4
+    ) if (avg_win_dollars + avg_loss_dollars) > 0 else 0.5
 
     regime_stats = _regime_breakdown(trades)
 

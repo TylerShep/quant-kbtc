@@ -24,6 +24,7 @@ from typing import Optional
 
 import structlog
 
+from config import settings
 from data.kalshi_ws import KalshiOrderClient
 
 logger = structlog.get_logger(__name__)
@@ -89,15 +90,21 @@ class PositionManager:
         self.orphaned_positions: list[OrphanedPosition] = []
         self._db_pool = None
 
-        # Supervised single-trade mode: after each completed live round-trip,
-        # the coordinator auto-pauses for post-trade review. Set to None for
-        # unlimited (normal operation once testing is complete).
-        self.live_trade_limit: Optional[int] = 1
+        # Supervised live-trade mode: after `live_trade_limit` completed round-
+        # trips, the coordinator auto-pauses for post-trade review. Set to None
+        # for unlimited (normal operation once testing is complete). Restored
+        # from persisted state if present.
+        self.live_trade_limit: Optional[int] = 2
         self._completed_live_trades: int = 0
 
         # Tracks tickers confirmed as settled/finalized to prevent
         # reconciliation from re-adopting them as orphans (BUG-008).
         self._settled_tickers: set[str] = set()
+
+        # Per-ticker cooldown: skip reconciliation for recently-exited tickers
+        # to avoid race conditions with Kalshi's position API lag.
+        self._exit_cooldowns: dict[str, float] = {}
+        self.RECONCILE_COOLDOWN_SEC = 90.0
 
     # ── Public properties ─────────────────────────────────────────────
 
@@ -125,6 +132,21 @@ class PositionManager:
 
     def set_db_pool(self, pool) -> None:
         self._db_pool = pool
+
+    def _record_exit_cooldown(self, ticker: str) -> None:
+        """Mark a ticker as recently exited so reconciliation skips it."""
+        self._exit_cooldowns[ticker] = time.time()
+
+    def _is_in_cooldown(self, ticker: str) -> bool:
+        """True if ticker exited too recently for reliable reconciliation."""
+        exit_time = self._exit_cooldowns.get(ticker)
+        if exit_time is None:
+            return False
+        elapsed = time.time() - exit_time
+        if elapsed > self.RECONCILE_COOLDOWN_SEC:
+            del self._exit_cooldowns[ticker]
+            return False
+        return True
 
     # ── State transitions ─────────────────────────────────────────────
 
@@ -291,6 +313,26 @@ class PositionManager:
             logger.warning("position_manager.market_settled_check_failed",
                            ticker=ticker, error=str(e))
         return None
+
+    async def _verify_with_retry(self, ticker: str, retries: int = 3,
+                                  backoff: float = 2.0) -> int:
+        """verify_position_on_exchange with retries on VERIFY_FAILED.
+
+        During settlement the Kalshi API often returns transient errors.
+        Retrying avoids false-negative orphan adoption.
+        """
+        for attempt in range(1, retries + 1):
+            result = await self.verify_position_on_exchange(ticker)
+            if result != VERIFY_FAILED:
+                return result
+            if attempt < retries:
+                wait = backoff * attempt
+                logger.warning("position_manager.verify_retry",
+                               ticker=ticker, attempt=attempt, wait=wait)
+                await asyncio.sleep(wait)
+        logger.error("position_manager.verify_exhausted",
+                     ticker=ticker, retries=retries)
+        return VERIFY_FAILED
 
     async def _check_flat_on_exchange(self, ticker: str) -> bool:
         """Return True only if exchange confirms zero position on ticker."""
@@ -683,6 +725,7 @@ class PositionManager:
         self.position = None
         self._transition(PositionState.FLAT)
         self._completed_live_trades += 1
+        self._record_exit_cooldown(trade_result["ticker"])
 
         logger.info("position_manager.exit_confirmed",
                      ticker=trade_result["ticker"],
@@ -702,6 +745,19 @@ class PositionManager:
     async def _handle_settlement_inner(self, result: str) -> Optional[dict]:
         """Settlement logic without lock (caller must hold it)."""
         if self.position is None:
+            return None
+
+        # BUG-022 fix: refuse to settle on an ambiguous result. Empty string or
+        # any non-yes/no value silently mapped to "no" in the old code, which
+        # turned wins into recorded losses whenever settlement fired before
+        # Kalshi finalized the market. Caller must retry later with a real
+        # "yes"/"no".
+        if result not in ("yes", "no"):
+            logger.critical(
+                "position_manager.settlement_invalid_result",
+                ticker=self.position.ticker,
+                result_raw=result,
+            )
             return None
 
         pos = self.position
@@ -758,14 +814,16 @@ class PositionManager:
             "max_adverse_excursion": pos.max_adverse_excursion,
         }
 
-        remaining = await self.verify_position_on_exchange(pos.ticker)
+        remaining = await self._verify_with_retry(pos.ticker)
         if remaining == VERIFY_FAILED:
-            self.adopt_orphan(pos.ticker, pos.direction,
-                              pos.contracts, pos.entry_price)
+            self._settled_tickers.add(pos.ticker)
+            self._record_exit_cooldown(pos.ticker)
             self.position = None
             self._transition(PositionState.FLAT)
             self._completed_live_trades += 1
             trade_result["exit_reason"] = "CONTRACT_SETTLED_VERIFY_FAILED"
+            logger.warning("position_manager.settlement_verify_failed_no_orphan",
+                           ticker=pos.ticker)
             return trade_result
 
         remaining_abs = abs(remaining) if remaining != 0 else 0
@@ -785,6 +843,8 @@ class PositionManager:
             trade_result["pnl_pct"] = round(pnl_pct, 4)
             trade_result["fees"] = round(fees, 4)
 
+        self._settled_tickers.add(pos.ticker)
+        self._record_exit_cooldown(pos.ticker)
         self.position = None
         self._transition(PositionState.FLAT)
         self._completed_live_trades += 1
@@ -801,9 +861,14 @@ class PositionManager:
         if already:
             for o in self.orphaned_positions:
                 if o.ticker == ticker:
-                    o.contracts += contracts
-                    logger.warning("position_manager.orphan_updated",
-                                   ticker=ticker, new_total=o.contracts)
+                    if o.contracts != contracts:
+                        logger.warning("position_manager.orphan_count_replaced",
+                                       ticker=ticker, old=o.contracts,
+                                       new=contracts)
+                        o.contracts = contracts
+                    else:
+                        logger.debug("position_manager.orphan_unchanged",
+                                     ticker=ticker, contracts=contracts)
             return
         orphan = OrphanedPosition(
             ticker=ticker,
@@ -835,6 +900,20 @@ class PositionManager:
 
                 if status in ("closed", "settled", "finalized"):
                     result = market.get("result", "")
+                    # BUG-022 fix: Kalshi reports status="closed" immediately at
+                    # close_time but takes ~2-3 min to finalize the result. If
+                    # we settle during that window, result="" defaults to "no"
+                    # which silently records wins as losses. Wait for a real
+                    # "yes"/"no" before computing PnL.
+                    if result not in ("yes", "no"):
+                        logger.info(
+                            "position_manager.orphan_awaiting_finalization",
+                            ticker=orphan.ticker,
+                            status=status,
+                            result_raw=result,
+                        )
+                        remaining_list.append(orphan)
+                        continue
                     settled_price = 100 if result == "yes" else 0
                     d = 1 if orphan.direction == "long" else -1
                     pnl_per = d * (settled_price - orphan.avg_entry_price) / 100
@@ -991,6 +1070,10 @@ class PositionManager:
                 if ticker in self._settled_tickers:
                     logger.debug("position_manager.reconcile_skip_settled", ticker=ticker)
                     continue
+                if self._is_in_cooldown(ticker):
+                    logger.info("position_manager.reconcile_skip_cooldown",
+                                ticker=ticker)
+                    continue
                 try:
                     market_data = await self.client.get_market(ticker)
                     market_status = market_data.get("market", {}).get("status", "")
@@ -1002,6 +1085,26 @@ class PositionManager:
                 except Exception as e:
                     logger.warning("position_manager.reconcile_market_check_failed",
                                    ticker=ticker, error=str(e))
+                max_sane = settings.risk.max_live_contracts * 3
+                if contracts > max_sane:
+                    logger.critical(
+                        "position_manager.oversized_orphan_detected",
+                        ticker=ticker, contracts=contracts, max_sane=max_sane)
+                    try:
+                        side = "yes" if direction == "long" else "no"
+                        await self.client.create_order(
+                            ticker=ticker, side=side,
+                            action="sell", count=contracts,
+                            order_type="market",
+                        )
+                        logger.info("position_manager.oversized_orphan_closed",
+                                    ticker=ticker, contracts=contracts)
+                        continue
+                    except Exception as close_err:
+                        logger.error(
+                            "position_manager.oversized_orphan_close_failed",
+                            ticker=ticker, error=str(close_err))
+
                 self.adopt_orphan(ticker, direction, contracts, avg_entry_cents)
 
         if tracked_ticker and tracked_ticker not in exchange_tickers:
@@ -1109,6 +1212,7 @@ class PositionManager:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "completed_live_trades": self._completed_live_trades,
             "live_trade_limit": self.live_trade_limit,
+            "settled_tickers": list(self._settled_tickers),
         }
 
     def restore_from_snapshot(self, snapshot: dict) -> None:
@@ -1133,10 +1237,14 @@ class PositionManager:
         if restored_limit is not None:
             self.live_trade_limit = restored_limit
 
+        restored_settled = snapshot.get("settled_tickers", [])
+        self._settled_tickers = set(restored_settled)
+
         logger.info("position_manager.restored",
                      state=self.state.value,
                      has_position=self.has_position,
-                     orphans=len(self.orphaned_positions))
+                     orphans=len(self.orphaned_positions),
+                     settled_tickers=len(self._settled_tickers))
 
     def reset_trade_counter(self) -> None:
         """Reset the completed trade counter (e.g. after operator review)."""

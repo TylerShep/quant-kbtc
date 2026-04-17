@@ -208,9 +208,11 @@ app.add_middleware(
 
 from api.routes import router as api_router
 from api.ws import router as ws_router
+from api.historicals import router as historicals_router
 
 app.include_router(api_router, prefix="/api")
 app.include_router(ws_router, prefix="/api")
+app.include_router(historicals_router, prefix="/api")
 
 
 FRONTEND_DIR = Path(__file__).parent / "static"

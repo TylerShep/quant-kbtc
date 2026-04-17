@@ -41,39 +41,54 @@ function formatPct(rate: number): string {
   return `${pct.toFixed(1)}%`;
 }
 
+const dailyCache: Record<string, DailyStatRow[]> = {};
+const regimeCache: Record<string, RegimeStatRow[]> = {};
+
+async function fetchStatsForMode(mode: string): Promise<{ daily: DailyStatRow[]; regimes: RegimeStatRow[] }> {
+  const modeParam = `?mode=${mode}`;
+  try {
+    const [dRes, rRes] = await Promise.all([
+      fetch(`/api/stats/daily${modeParam}`),
+      fetch(`/api/stats/by-regime${modeParam}`),
+    ]);
+    const daily = dRes.ok ? ((await dRes.json()) as DailyStatsResponse).daily ?? [] : dailyCache[mode] ?? [];
+    const regimes = rRes.ok ? ((await rRes.json()) as RegimeStatsResponse).regimes ?? [] : regimeCache[mode] ?? [];
+    dailyCache[mode] = Array.isArray(daily) ? daily : [];
+    regimeCache[mode] = Array.isArray(regimes) ? regimes : [];
+    return { daily: dailyCache[mode], regimes: regimeCache[mode] };
+  } catch {
+    return { daily: dailyCache[mode] ?? [], regimes: regimeCache[mode] ?? [] };
+  }
+}
+
 export function StatsPanel({ stats, tradingMode }: StatsPanelProps) {
+  const mode = tradingMode ?? 'paper';
   const [expanded, setExpanded] = useState(false);
-  const [daily, setDaily] = useState<DailyStatRow[]>([]);
-  const [regimes, setRegimes] = useState<RegimeStatRow[]>([]);
+  const [daily, setDaily] = useState<DailyStatRow[]>(dailyCache[mode] ?? []);
+  const [regimes, setRegimes] = useState<RegimeStatRow[]>(regimeCache[mode] ?? []);
   const [loadErr, setLoadErr] = useState<string | null>(null);
 
   useEffect(() => {
+    setDaily(dailyCache[mode] ?? []);
+    setRegimes(regimeCache[mode] ?? []);
+
     let cancelled = false;
-    const modeParam = tradingMode ? `?mode=${tradingMode}` : '';
     (async () => {
       try {
-        const [dRes, rRes] = await Promise.all([
-          fetch(`/api/stats/daily${modeParam}`),
-          fetch(`/api/stats/by-regime${modeParam}`),
-        ]);
+        const result = await fetchStatsForMode(mode);
         if (cancelled) return;
-        if (dRes.ok) {
-          const j: DailyStatsResponse = await dRes.json();
-          setDaily(Array.isArray(j.daily) ? j.daily : []);
-        }
-        if (rRes.ok) {
-          const j: RegimeStatsResponse = await rRes.json();
-          setRegimes(Array.isArray(j.regimes) ? j.regimes : []);
-        }
+        setDaily(result.daily);
+        setRegimes(result.regimes);
         setLoadErr(null);
+
+        const other = mode === 'paper' ? 'live' : 'paper';
+        fetchStatsForMode(other);
       } catch {
         if (!cancelled) setLoadErr('Failed to load stats');
       }
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [tradingMode]);
+    return () => { cancelled = true; };
+  }, [mode]);
 
   const best = stats?.best_trade;
   const worst = stats?.worst_trade;

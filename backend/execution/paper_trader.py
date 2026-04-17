@@ -78,7 +78,7 @@ class PaperTrader:
         if self.position is not None:
             return None
 
-        size_dollars = self.sizer.calculate_size(conviction)
+        size_dollars = self.sizer.calculate_size(conviction, direction)
         cost_per = price / 100
         contracts = int(size_dollars / cost_per) if cost_per > 0 else 0
         if contracts < 1:
@@ -160,6 +160,16 @@ class PaperTrader:
     def handle_settlement(self, result: str) -> Optional[PaperTrade]:
         """Handle contract settlement by recording PnL at settled price."""
         if self.position is None:
+            return None
+        # BUG-022 fix: refuse to settle with an ambiguous result. Old code
+        # silently treated any non-"yes" value as a loss, which produced
+        # phantom losses whenever settlement fired before finalization.
+        if result not in ("yes", "no"):
+            logger.warning(
+                "paper.settlement_invalid_result",
+                ticker=self.position.ticker,
+                result_raw=result,
+            )
             return None
         settled_price = 100 if result == "yes" else 0
         return self.exit(settled_price, "CONTRACT_SETTLED")
