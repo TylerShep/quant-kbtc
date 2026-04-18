@@ -56,6 +56,7 @@ class ManagedPosition:
     order_id: Optional[str] = None
     entry_cost_dollars: Optional[float] = None
     entry_fees_dollars: Optional[float] = None
+    signal_driver: str = "-"
 
 
 @dataclass
@@ -374,6 +375,7 @@ class PositionManager:
         regime: str,
         obi: float = 0.0,
         roc: float = 0.0,
+        signal_driver: str = "-",
     ) -> Optional[ManagedPosition]:
         """Place an entry order with full exchange verification.
 
@@ -510,6 +512,7 @@ class PositionManager:
                 order_id=order_id,
                 entry_cost_dollars=entry_cost,
                 entry_fees_dollars=entry_fees,
+                signal_driver=signal_driver,
             )
             self._transition(PositionState.OPEN)
 
@@ -718,6 +721,7 @@ class PositionManager:
             "exit_order_id": exit_order_id,
             "entry_obi": pos.entry_obi,
             "entry_roc": pos.entry_roc,
+            "signal_driver": pos.signal_driver,
             "max_favorable_excursion": pos.max_favorable_excursion,
             "max_adverse_excursion": pos.max_adverse_excursion,
         }
@@ -810,6 +814,7 @@ class PositionManager:
             "exit_order_id": None,
             "entry_obi": pos.entry_obi,
             "entry_roc": pos.entry_roc,
+            "signal_driver": pos.signal_driver,
             "max_favorable_excursion": pos.max_favorable_excursion,
             "max_adverse_excursion": pos.max_adverse_excursion,
         }
@@ -1299,6 +1304,7 @@ class PositionManager:
                 "entry_price": self.position.entry_price,
                 "candles_held": self.position.candles_held,
                 "conviction": self.position.conviction,
+                "signal_driver": self.position.signal_driver,
             } if self.position else None,
             "orphaned_positions": [
                 {

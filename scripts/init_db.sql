@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS signal_log (
     decision        VARCHAR(40),
     conviction      VARCHAR(20),
     skip_reason     VARCHAR(60),
-    size_mult       NUMERIC(4,2)
+    size_mult       NUMERIC(4,2),
+    spread_state    VARCHAR(20)
 );
 SELECT create_hypertable('signal_log', 'timestamp', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_signal_ticker ON signal_log (ticker, timestamp DESC);
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS trades (
     candles_held    INTEGER,
     entry_obi       NUMERIC(6,4),
     entry_roc       NUMERIC(10,4),
+    signal_driver   VARCHAR(32),
     closed_at       TIMESTAMPTZ,
     trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper'
 );

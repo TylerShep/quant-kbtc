@@ -93,6 +93,10 @@ def cmd_run(args):
 
     _print_results(results, elapsed)
 
+    filter_conv = getattr(args, "filter_conviction", None)
+    if filter_conv:
+        _print_conviction_subset(bt.trades, filter_conv)
+
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,6 +349,49 @@ def _print_results(results: dict, elapsed: float):
     print(f"\n  Passes Minimum Thresholds: {'YES' if passes else 'NO'}")
 
 
+def _print_conviction_subset(trades: list[dict], conviction: str) -> None:
+    """Print win-rate, profit factor, and trade count for a single conviction tier.
+
+    Used to gate the ROC LOW activation — spec targets:
+      win rate > 52%, profit factor > 1.2, n >= 20 net of fees.
+    """
+    subset = [t for t in trades if t.get("conviction") == conviction]
+    n = len(subset)
+    print(f"\n  Filter: conviction = {conviction}")
+    print("  " + "-" * 48)
+    if n == 0:
+        print(f"    No trades at conviction={conviction}")
+        return
+    wins = [t for t in subset if t.get("pnl", 0) > 0]
+    losses = [t for t in subset if t.get("pnl", 0) < 0]
+    win_rate = len(wins) / n if n else 0.0
+    gross_win = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
+    total_pnl = sum(t.get("pnl", 0) for t in subset)
+    total_fees = sum(t.get("fees", 0) for t in subset)
+    avg_pnl = total_pnl / n if n else 0.0
+
+    pf_str = f"{pf:.2f}" if pf != float("inf") else "inf"
+    print(f"    Trades (n):      {n}")
+    print(f"    Win Rate:        {win_rate:.1%}    (target > 52%)")
+    print(f"    Profit Factor:   {pf_str}    (target > 1.20)")
+    print(f"    Total PnL:       ${total_pnl:,.2f}    (net of ${total_fees:,.2f} fees)")
+    print(f"    Avg PnL/trade:   ${avg_pnl:,.4f}")
+
+    passes = (n >= 20) and (win_rate > 0.52) and (pf > 1.2)
+    gate_str = "PASS" if passes else "FAIL"
+    notes = []
+    if n < 20:
+        notes.append(f"n={n} < 20")
+    if win_rate <= 0.52:
+        notes.append("WR <= 52%")
+    if pf <= 1.2:
+        notes.append("PF <= 1.20")
+    suffix = f"  ({', '.join(notes)})" if notes else ""
+    print(f"    Activation Gate: {gate_str}{suffix}")
+
+
 def _add_data_flags(parser):
     """Add common --csv / --from-db / --symbol / --source flags to a subparser."""
     group = parser.add_mutually_exclusive_group(required=True)
@@ -371,6 +418,11 @@ def main():
     p_run.add_argument("--config", help="JSON string of config overrides")
     p_run.add_argument("--output", default="backtest_reports")
     p_run.add_argument("--no-report", action="store_true", help="Skip HTML report generation")
+    p_run.add_argument(
+        "--filter-conviction",
+        choices=["HIGH", "NORMAL", "LOW"],
+        help="After the full run, print win-rate / profit-factor / n for trades at this conviction only",
+    )
 
     # --- walk-forward ---
     p_wf = sub.add_parser("walk-forward", help="Run walk-forward optimization")

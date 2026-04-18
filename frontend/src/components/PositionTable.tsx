@@ -103,6 +103,7 @@ function PositionsView({ position, orphanedPositions }: {
           <th className="text-right px-4 py-2 font-normal">Entry Price</th>
           <th className="text-right px-4 py-2 font-normal">Candles Held</th>
           <th className="text-right px-4 py-2 font-normal">Conviction</th>
+          <th className="text-right px-4 py-2 font-normal">Signal</th>
         </tr>
       </thead>
       <tbody>
@@ -122,6 +123,9 @@ function PositionsView({ position, orphanedPositions }: {
             <td className="px-4 py-2 text-right font-mono">{position.candles_held}</td>
             <td className="px-4 py-2 text-right">
               <ConvictionBadge conviction={position.conviction} />
+            </td>
+            <td className="px-4 py-2 text-right">
+              <SignalDriverBadge driver={position.signal_driver} />
             </td>
           </tr>
         )}
@@ -143,6 +147,9 @@ function PositionsView({ position, orphanedPositions }: {
               {new Date(o.detected_at).toLocaleTimeString(undefined, {
                 hour: '2-digit', minute: '2-digit'
               })}
+            </td>
+            <td className="px-4 py-2 text-right">
+              <SignalDriverBadge driver="-" />
             </td>
           </tr>
         ))}
@@ -182,6 +189,7 @@ function DBTradesView({
             <th className="text-right px-3 py-2 font-normal">PnL%</th>
             <th className="text-left px-3 py-2 font-normal">Exit Reason</th>
             <th className="text-left px-3 py-2 font-normal">Conviction</th>
+            <th className="text-left px-3 py-2 font-normal">Signal</th>
             <th className="text-right px-3 py-2 font-normal">Candles</th>
             <th className="text-right px-3 py-2 font-normal">Time</th>
           </tr>
@@ -233,6 +241,7 @@ function ErroredTradesView({
             <th className="text-right px-3 py-2 font-normal">PnL</th>
             <th className="text-left px-3 py-2 font-normal">Exit Reason</th>
             <th className="text-left px-3 py-2 font-normal">Error Reason</th>
+            <th className="text-left px-3 py-2 font-normal">Signal</th>
             <th className="text-right px-3 py-2 font-normal">Candles</th>
             <th className="text-right px-3 py-2 font-normal">Flagged</th>
           </tr>
@@ -278,6 +287,9 @@ function ErroredTradeRow({ trade }: { trade: ErroredTrade }) {
           {trade.error_reason}
         </span>
       </td>
+      <td className="px-3 py-1.5">
+        <SignalDriverBadge driver={trade.signal_driver} />
+      </td>
       <td className="px-3 py-1.5 text-right font-mono">{trade.candles_held}</td>
       <td className="px-3 py-1.5 text-right text-[var(--text-muted)] font-mono whitespace-nowrap">
         {trade.flagged_at ? new Date(trade.flagged_at).toLocaleString(undefined, {
@@ -319,6 +331,9 @@ function TradeRow({ trade }: { trade: DBTrade }) {
       <td className="px-3 py-1.5 text-[var(--text-secondary)]">{trade.exit_reason}</td>
       <td className="px-3 py-1.5">
         <ConvictionBadge conviction={trade.conviction} />
+      </td>
+      <td className="px-3 py-1.5">
+        <SignalDriverBadge driver={trade.signal_driver} />
       </td>
       <td className="px-3 py-1.5 text-right font-mono">{trade.candles_held}</td>
       <td className="px-3 py-1.5 text-right text-[var(--text-muted)] font-mono whitespace-nowrap">
@@ -406,6 +421,32 @@ function ConvictionBadge({ conviction }: { conviction: string }) {
       }`}
     >
       {conviction}
+    </span>
+  );
+}
+
+function SignalDriverBadge({ driver }: { driver?: string }) {
+  const label = driver && driver.length > 0 ? driver : '-';
+  if (label === '-') {
+    return <span className="text-[10px] text-[var(--text-muted)] font-mono">-</span>;
+  }
+  const [base, suffix] = label.split('/');
+  const baseStyle =
+    base === 'OBI+ROC'
+      ? 'bg-[var(--green-dim)] text-[var(--green)]'
+      : base === 'OBI/ROC'
+      ? 'bg-[var(--red-dim)] text-[var(--red)]'
+      : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]';
+  const suffixStyle =
+    suffix === 'TIGHT'
+      ? 'text-[var(--green)]'
+      : suffix === 'WIDE'
+      ? 'text-[var(--red)]'
+      : 'text-[var(--text-muted)]';
+  return (
+    <span className="inline-flex items-center gap-1 font-mono text-[10px]">
+      <span className={`px-1.5 py-0.5 rounded font-medium ${baseStyle}`}>{base}</span>
+      {suffix && <span className={suffixStyle}>/{suffix}</span>}
     </span>
   );
 }

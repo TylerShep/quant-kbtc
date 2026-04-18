@@ -43,6 +43,7 @@ class LiveTrade:
     exit_order_id: Optional[str] = None
     entry_obi: float = 0.0
     entry_roc: float = 0.0
+    signal_driver: str = "-"
 
 
 class LiveTrader:
@@ -91,6 +92,7 @@ class LiveTrader:
         regime: str,
         obi: float = 0.0,
         roc: float = 0.0,
+        signal_driver: str = "-",
     ) -> Optional[ManagedPosition]:
         size_dollars = self.sizer.calculate_size(conviction, direction)
         cost_per = price / 100
@@ -114,6 +116,7 @@ class LiveTrader:
             regime=regime,
             obi=obi,
             roc=roc,
+            signal_driver=signal_driver,
         )
 
         if pos:
@@ -205,6 +208,7 @@ class LiveTrader:
             exit_order_id=result.get("exit_order_id"),
             entry_obi=result.get("entry_obi", 0.0),
             entry_roc=result.get("entry_roc", 0.0),
+            signal_driver=result.get("signal_driver", "-"),
         )
 
     def get_state(self) -> dict:

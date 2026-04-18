@@ -1,0 +1,80 @@
+---
+name: spread-div
+description: Dedicated logic for the Spread Divergence post-resolver conviction modifier on the Kalshi BTC 15min bot. Use this skill when modifying the SpreadRegimeFilter, tuning SD thresholds, extending the modifier to a new regime, or debugging why spread_state is UNKNOWN / NORMAL / WIDE / TIGHT in the logs. NEVER add spread as a third directional signal — it only modifies existing convictions.
+---
+
+# Spread Divergence Modifier
+
+## Role Purpose
+Spread Divergence is a **post-resolver conviction modifier**. It does NOT produce a directional signal. It reads the live bid-ask spread, compares it against a rolling baseline, and emits a `SpreadState` (`WIDE` / `NORMAL` / `TIGHT`) that the resolver uses to bump existing conviction up or down one step.
+
+## Core Principle
+Adding spread as a third directional signal would require a 27-cell coordination table and make HIGH conviction nearly unreachable (per the signal-conflict-resolver skill). Instead, SD is a graduated confidence adjustment applied AFTER `COORDINATION_TABLE` lookup, and NEVER manufactures a trade from `NONE`.
+
+## Regime Fit
+- `MEDIUM` — SD active. Spread divergences here reflect true microstructure (flow imbalance, toxic liquidity, sudden quote crossing).
+- `LOW` — SD inactive. Low ATR already means tight noise; spread moves are dominated by market-maker rotations, not informational edge.
+- `HIGH` — SD inactive. `SignalConflictResolver` already blocks entries. SD doesn't matter.
+
+## State Machine
+```python
+class SpreadState(str, Enum):
+    WIDE   = "WIDE"    # spread_z >= SD_WIDE_THRESHOLD  (default +0.40)  -> downgrade
+    NORMAL = "NORMAL"  # safe default, no adjustment
+    TIGHT  = "TIGHT"   # spread_z <= SD_TIGHT_THRESHOLD (default -0.20)  -> upgrade
+```
+
+Where `spread_z = (current_spread - baseline_median) / baseline_median`, and `baseline_median` is the rolling median of the last `SD_BASELINE_WINDOW` snapshots.
+
+## Conviction Modification Table
+
+| Resolver output | SpreadState | Final conviction | Notes                              |
+|-----------------|-------------|------------------|-------------------------------------|
+| HIGH            | WIDE        | NORMAL           | Downgrade one step                  |
+| HIGH            | TIGHT       | HIGH             | Already max — no upgrade possible   |
+| NORMAL          | WIDE        | LOW              | Downgrade one step                  |
+| NORMAL          | TIGHT       | HIGH             | Upgrade one step                    |
+| LOW             | WIDE        | NONE             | Drop entirely; skip reason `SPREAD_WIDE_DOWNGRADE` |
+| LOW             | TIGHT       | NORMAL           | Upgrade one step                    |
+| NONE            | any         | NONE             | NEVER upgrade from NONE             |
+
+## Parameters (env-driven via `SpreadDivConfig`)
+
+| Env var              | Default | Purpose                                                |
+|----------------------|--------:|--------------------------------------------------------|
+| `SD_ENABLED`         | `true`  | Kill switch. `false` -> modifier is a no-op.           |
+| `SD_BASELINE_WINDOW` | `60`    | Number of snapshots in the rolling median (~30 min).   |
+| `SD_WIDE_THRESHOLD`  | `0.40`  | +40% above baseline -> WIDE.                           |
+| `SD_TIGHT_THRESHOLD` | `-0.20` | -20% below baseline -> TIGHT.                          |
+| `SD_MIN_HISTORY`     | `20`    | Minimum samples before modifier fires.                 |
+| `SD_STALENESS_SEC`   | `90`    | If the feed goes stale, history returns `[]` -> NORMAL.|
+
+## Integration Points
+
+1. **`backend/strategies/spread_div.py`** — `evaluate_spread_divergence(history, current_spread, atr_regime, overrides=None)` is the only pure function. Must be called exactly once per tick.
+2. **`backend/filters/spread_regime.py`** — `SpreadRegimeFilter.update(spread_cents)` maintains the rolling history. Mirrors `ATRRegimeFilter` including `warmup(values)` and staleness handling.
+3. **`backend/strategies/resolver.py`** — `SignalConflictResolver.resolve(..., spread_state=SpreadState.NORMAL)` applies the modifier AFTER the coordination table lookup and before returning the decision. `Conviction.upgrade()` and `Conviction.downgrade()` are the two primitives.
+4. **`backend/coordinator.py`** — instantiate `self.spread_filter = SpreadRegimeFilter()` in `__init__`, call `self.spread_filter.update(features.spread_cents)` every tick in `_on_market_update`, compute `spread_state` in `_evaluate_entry_for`, pass it into `resolver.resolve(...)`, include it in `_serialize_decision`, and call `await self._warmup_spread_filter()` from `start()`.
+5. **`signal_log.spread_state`** — column added in `backend/migrations/003_spread_state.sql`. Every `_persist_signal` INSERT binds `decision.spread_state.value`.
+
+## Warmup
+`SpreadRegimeFilter.warmup(values)` pre-seeds the rolling history from the last ~200 `ob_snapshots.spread_cents` rows at startup. Without warmup, the filter needs ~20 ticks (~10 minutes) before it can emit WIDE/TIGHT — long enough that most short-lived divergences are missed. Always call warmup in `start()` immediately after `_warmup_atr()`.
+
+## Backtester
+`backend/backtesting/data_loader.py` must SELECT `spread_cents` and include it in each OB dict. `backend/backtesting/backtester.py` instantiates its own `SpreadRegimeFilter`, calls `update()` every candle, and passes `spread_state` into `resolver.resolve(...)`. `signal_log` entries must include `spread_state` and `spread_cents` so the walk-forward optimizer can sweep `sd_wide_threshold` / `sd_tight_threshold`.
+
+## Common Pitfalls
+- **Do not** use SD to generate direction. It is a modifier, not a signal.
+- **Do not** apply SD in `LOW` or `HIGH` regimes. Both `evaluate_spread_divergence` and `resolver.resolve` already gate on `atr_regime == "MEDIUM"`; keep those guards in sync if you ever add a new regime.
+- **Do not** forget staleness. If the WS feed drops spread updates, `SpreadRegimeFilter.spread_history()` returns `[]` and `evaluate_spread_divergence` returns `NORMAL`. That's the safe default — never inject the last-known value.
+- **Do not** let TIGHT upgrade `NONE`. `Conviction.upgrade(NONE) == NONE` by construction; the resolver only applies the modifier when `conviction != NONE`.
+- **Calibrate before merging**. Run the spread distribution SQL (`percentile_cont` on `ob_snapshots.spread_cents`) and target `WIDE` firing on the top 10-15% of MEDIUM-regime snapshots and `TIGHT` on the bottom 15-20%. If live distribution drifts, re-tune rather than dialling down the modifier.
+- **Frozen dataclass config**. `SpreadDivConfig` is `frozen=True`. Unit tests that override thresholds must use the `override_sd` fixture (which uses `object.__setattr__` + teardown) rather than assigning attributes directly.
+
+## Reading Spread Behaviour From Logs
+```
+signal_log
+  conviction = HIGH  AND spread_state = WIDE  -> downgraded to NORMAL
+  conviction = NORMAL AND spread_state = TIGHT -> upgraded to HIGH
+  conviction = NONE  AND skip_reason = SPREAD_WIDE_DOWNGRADE -> LOW+WIDE drop
+```

@@ -53,3 +53,105 @@ Re-run the full promotion workflow after any change to:
 - `backend/execution/live_trader.py` (entry/exit logic)
 - Reconciliation frequency or cooldown parameters
 - Settlement handling logic
+
+---
+
+# Strategy Activation Gates
+
+The gate sets above guard the execution path. The gates below guard the
+**signal path** — used when activating a new conviction tier or post-resolver
+modifier. No new signal may go live-LIVE until it has cleared both.
+
+## Gate Set C: Offline Calibration + Backtest
+
+### C1. Spread distribution sanity (Spread Divergence specific)
+
+Run against the remote DB before merging any SD threshold change:
+
+```bash
+ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+SELECT
+  percentile_cont(0.10) WITHIN GROUP (ORDER BY spread_cents) AS p10,
+  percentile_cont(0.25) WITHIN GROUP (ORDER BY spread_cents) AS p25,
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY spread_cents) AS p50,
+  percentile_cont(0.75) WITHIN GROUP (ORDER BY spread_cents) AS p75,
+  percentile_cont(0.85) WITHIN GROUP (ORDER BY spread_cents) AS p85,
+  percentile_cont(0.90) WITHIN GROUP (ORDER BY spread_cents) AS p90,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY spread_cents) AS p95,
+  AVG(spread_cents) AS mean,
+  STDDEV(spread_cents) AS std,
+  COUNT(*) AS n
+FROM ob_snapshots
+WHERE timestamp > NOW() - INTERVAL '14 days' AND spread_cents IS NOT NULL;\""
+```
+
+And the hour-of-day profile:
+
+```bash
+ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+SELECT
+  EXTRACT(HOUR FROM timestamp) AS hour,
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY spread_cents) AS median_spread,
+  COUNT(*) AS n
+FROM ob_snapshots
+WHERE timestamp > NOW() - INTERVAL '14 days' AND spread_cents IS NOT NULL
+GROUP BY hour ORDER BY hour;\""
+```
+
+**Target**: with defaults (`SD_WIDE=+0.40`, `SD_TIGHT=-0.20`), `WIDE` should
+fire for the top 10-15% of MEDIUM-regime readings and `TIGHT` for the bottom
+15-20%. If p95/p50 differs significantly from ~1.4 or p10/p50 from ~0.80,
+adjust thresholds and re-run.
+
+### C2. ROC-only LOW expectancy backtest (ROC activation specific)
+
+```bash
+cd backend && python3 -m backtesting.cli run \
+  --from-db --bankroll 1000 --filter-conviction LOW
+```
+
+| Metric           | Target         |
+|------------------|----------------|
+| Trade count (n)  | >= 20          |
+| Win rate         | > 52%          |
+| Profit factor    | > 1.20 net of fees |
+
+**Pass criteria**: all three or no activation. Record the numbers in the PR description.
+
+## Gate Set D: Paper Runtime (48-hour minimum)
+
+After merging and deploying with `SD_ENABLED=true` and `ROC_LOW_CONVICTION_PAPER_ENABLED=true`:
+
+| # | Gate | Criteria | Query |
+|---|------|----------|-------|
+| D1 | SD fire rate — WIDE | 10-15% of MEDIUM-regime signals | `SELECT COUNT(*) FILTER (WHERE spread_state='WIDE')::FLOAT / COUNT(*) FROM signal_log WHERE atr_regime='MEDIUM'` |
+| D2 | SD fire rate — TIGHT | 15-20% of MEDIUM-regime signals | same, `WHERE spread_state='TIGHT'` |
+| D3 | SD `UNKNOWN` absence | <1% of signals (staleness check) | `spread_state IS NULL OR spread_state='UNKNOWN'` |
+| D4 | LOW paper trades | >= 10 completed trades at conviction=LOW | `SELECT COUNT(*) FROM trades WHERE conviction='LOW' AND trading_mode='paper'` |
+| D5 | LOW paper win rate | > 52% over the 48h window | win_rate on same subset |
+| D6 | LOW paper profit factor | > 1.20 net of fees | gross_wins / gross_losses |
+| D7 | No divergence vs backtest | live LOW WR within ±5pp of backtest WR | compare |
+
+**Pass criteria**: D1-D3 within band, D4-D7 pass. Only then flip
+`ROC_LOW_CONVICTION_LIVE_ENABLED=true`. Live roll-out still requires the
+existing Gate Set A (replay) + B (canary, when execution path is touched).
+
+## Rollout Sequence (combined ROC + SD)
+
+```
+1. PR opened. Run Gate Set C (C1 + C2) BEFORE review.
+2. Merge to main.
+3. Apply migration:
+     ssh botuser@167.71.247.154 \
+       "docker exec kbtc-db psql -U kalshi -d kbtc -f /tmp/003_spread_state.sql"
+   (rsync the migration via scripts/deploy.sh first, then run the above)
+4. Deploy with:
+     SD_ENABLED=true
+     ROC_LOW_CONVICTION_PAPER_ENABLED=false
+     ROC_LOW_CONVICTION_LIVE_ENABLED=false
+5. After 24h: verify D1-D3 (SD distribution sane).
+6. Flip ROC_LOW_CONVICTION_PAPER_ENABLED=true, redeploy.
+7. After 48h of paper runtime: run Gate Set D. If pass, continue.
+8. Flip ROC_LOW_CONVICTION_LIVE_ENABLED=true, redeploy.
+9. Monitor first 24h of LIVE LOW trades closely via the Discord trade webhook.
+```

@@ -30,6 +30,7 @@ class PaperPosition:
     candles_held: int = 0
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
+    signal_driver: str = "-"
 
 
 @dataclass
@@ -50,6 +51,7 @@ class PaperTrade:
     exit_time: datetime
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
+    signal_driver: str = "-"
 
 
 class PaperTrader:
@@ -74,6 +76,7 @@ class PaperTrader:
         regime: str,
         obi: float = 0.0,
         roc: float = 0.0,
+        signal_driver: str = "-",
     ) -> Optional[PaperPosition]:
         if self.position is not None:
             return None
@@ -95,6 +98,7 @@ class PaperTrader:
             regime_at_entry=regime,
             entry_obi=obi,
             entry_roc=roc,
+            signal_driver=signal_driver,
         )
         logger.info(
             "paper.entry",
@@ -142,6 +146,7 @@ class PaperTrader:
             exit_time=datetime.now(timezone.utc),
             max_favorable_excursion=pos.max_favorable_excursion,
             max_adverse_excursion=pos.max_adverse_excursion,
+            signal_driver=pos.signal_driver,
         )
 
         self.sizer.record_trade(net_pnl)
@@ -184,6 +189,7 @@ class PaperTrader:
                 "entry_price": self.position.entry_price,
                 "candles_held": self.position.candles_held,
                 "conviction": self.position.conviction,
+                "signal_driver": self.position.signal_driver,
             }
             if self.position
             else None,

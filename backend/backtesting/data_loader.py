@@ -100,7 +100,8 @@ async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
             ) AS bucket,
             obi,
             total_bid_vol,
-            total_ask_vol
+            total_ask_vol,
+            spread_cents
         FROM ob_snapshots
         {where_clause}
         ORDER BY bucket, timestamp DESC
@@ -116,6 +117,7 @@ async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
                 "obi": float(r[1]) if r[1] else 0.5,
                 "total_bid_vol": float(r[2]) if r[2] else 0,
                 "total_ask_vol": float(r[3]) if r[3] else 0,
+                "spread_cents": float(r[4]) if r[4] is not None else None,
             }
             for r in result
         }

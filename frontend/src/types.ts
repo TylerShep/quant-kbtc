@@ -51,6 +51,7 @@ export interface PaperPosition {
   entry_price: number;
   candles_held: number;
   conviction: string;
+  signal_driver?: string;
 }
 
 export interface PaperTrade {
@@ -76,6 +77,7 @@ export interface DBTrade {
   regime_at_entry: string;
   candles_held: number;
   closed_at: string | null;
+  signal_driver?: string;
 }
 
 export interface TradesResponse {
@@ -145,6 +147,8 @@ export interface Decision {
   conviction: string;
   obi_dir: string;
   roc_dir: string;
+  spread_state?: string;
+  signal_driver?: string;
   skip_reason: string | null;
   should_trade: boolean;
 }

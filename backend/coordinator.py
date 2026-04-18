@@ -24,7 +24,9 @@ from features.engine import FeatureEngine
 from strategies.obi import evaluate_obi, check_obi_exit, Direction
 from strategies.roc import evaluate_roc, calculate_roc, check_roc_exit
 from strategies.resolver import SignalConflictResolver, Conviction
+from strategies.spread_div import evaluate_spread_divergence, SpreadState
 from filters.atr_regime import ATRRegimeFilter
+from filters.spread_regime import SpreadRegimeFilter
 from risk.position_sizer import PositionSizer
 from risk.circuit_breaker import CircuitBreaker
 from execution.paper_trader import PaperTrader
@@ -48,6 +50,7 @@ class Coordinator:
         self.candle_aggregator = CandleAggregator()
         self.feature_engine = FeatureEngine()
         self.atr_filter = ATRRegimeFilter()
+        self.spread_filter = SpreadRegimeFilter()
         self.price_guard = PriceGuard()
         self.trend_guard = TrendGuard()
         self.resolver = SignalConflictResolver()
@@ -138,6 +141,7 @@ class Coordinator:
         await self.live_trader.position_manager.restore_state()
         await self._restore_state()
         await self._warmup_atr()
+        await self._warmup_spread_filter()
         self.data_manager.add_listener(self._on_market_update)
         await self.data_manager.start()
         asyncio.create_task(self._schedule_tuning())
@@ -186,6 +190,8 @@ class Coordinator:
         features = self.feature_engine.update(symbol, state)
         if features is None:
             return
+
+        self.spread_filter.update(features.spread_cents)
 
         # ── 1. Candle aggregator ───────────────────────────────────────
         completed_candle = None
@@ -653,8 +659,8 @@ class Coordinator:
                                (timestamp, ticker, direction, side, contracts, entry_price,
                                 exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                                 regime_at_entry, candles_held, entry_obi, entry_roc,
-                                closed_at, error_reason, flagged_at, trading_mode)
-                               VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s)""",
+                                signal_driver, closed_at, error_reason, flagged_at, trading_mode)
+                               VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s)""",
                             (
                                 trade.ticker, trade.direction,
                                 "yes" if trade.direction == "long" else "no",
@@ -664,6 +670,7 @@ class Coordinator:
                                 trade.candles_held,
                                 getattr(trade, "entry_obi", 0.0) or 0.0,
                                 getattr(trade, "entry_roc", 0.0) or 0.0,
+                                getattr(trade, "signal_driver", "-") or "-",
                                 f"TRADE_ANOMALY: {anomaly_text}"[:200],
                                 "live",
                             ),
@@ -872,15 +879,15 @@ class Coordinator:
                                    (timestamp, ticker, direction, side, contracts, entry_price,
                                     exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                                     regime_at_entry, candles_held, entry_obi, entry_roc,
-                                    closed_at, trading_mode)
-                                   VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)""",
+                                    signal_driver, closed_at, trading_mode)
+                                   VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)""",
                                 (
                                     info["ticker"], info["direction"],
                                     "yes" if info["direction"] == "long" else "no",
                                     info["contracts"], info["entry_price"],
                                     info["exit_price"], pnl, round(pnl_pct, 4), round(fees, 4),
                                     info["reason"], "UNKNOWN", "UNKNOWN", 0,
-                                    0.0, 0.0, "live",
+                                    0.0, 0.0, "UNKNOWN", "live",
                                 ),
                             )
                     except Exception as e:
@@ -972,17 +979,25 @@ class Coordinator:
             atr_pct=current_atr_pct,
         )
 
+        spread_state = evaluate_spread_divergence(
+            spread_history=self.spread_filter.spread_history(),
+            current_spread=features.spread_cents,
+            atr_regime=regime,
+            overrides=overrides,
+        )
+
         decision = self.resolver.resolve(
             obi_direction=obi_dir,
             roc_direction=roc_dir,
             atr_regime=regime,
             can_trade=can_trade,
+            spread_state=spread_state,
         )
 
         # TFI conviction gating — downgrade when trade flow disagrees with OBI
         hs_cfg = settings.historical_sync
         if (hs_cfg.tfi_conviction_enabled
-                and decision.should_trade
+                and decision.should_trade_in(mode)
                 and decision.obi_dir != Direction.NEUTRAL):
             ticker = getattr(state, "kalshi_ticker", None) or symbol
             tfi = self.historical_sync.get_tfi(ticker) if self.historical_sync else None
@@ -1015,7 +1030,7 @@ class Coordinator:
 
         self.trend_guard.apply_short_trend_filter(decision, closes, mode)
 
-        if decision.should_trade:
+        if decision.should_trade_in(mode):
             entry_price = self._get_entry_price(state, decision.direction)
             if entry_price is not None and entry_price > 0:
                 allowed, guard_reason = self.price_guard.is_allowed(
@@ -1046,6 +1061,7 @@ class Coordinator:
                         regime=regime,
                         obi=features.obi,
                         roc=roc_val,
+                        signal_driver=decision.signal_driver,
                     )
                     if pos:
                         self._on_trade_entry(pos, symbol, state, features, decision, roc_val, mode)
@@ -1060,6 +1076,17 @@ class Coordinator:
                 state, features, decision, decision.skip_reason,
                 roc_value=roc_val,
             ))
+        elif (decision.conviction == Conviction.LOW
+                and decision.direction is not None
+                and not decision.should_trade_in(mode)
+                and self._tick_count % 60 == 0):
+            logger.info("coordinator.roc_low_skipped",
+                        direction=decision.direction.value,
+                        roc_dir=decision.roc_dir.value,
+                        obi_dir=decision.obi_dir.value,
+                        spread_state=decision.spread_state.value,
+                        regime=regime,
+                        mode=mode)
 
     def _register_position_ticker(self, ticker: str, symbol: str) -> None:
         """Tell the WS client to watch lifecycle events for this ticker."""
@@ -1087,6 +1114,7 @@ class Coordinator:
                 regime=regime,
                 obi=features.obi,
                 roc=roc_val,
+                signal_driver=decision.signal_driver,
             )
             if pos:
                 self._on_trade_entry(pos, symbol, state, features, decision, roc_val, "live")
@@ -1203,8 +1231,10 @@ class Coordinator:
             "conviction": d.conviction.value,
             "obi_dir": d.obi_dir.value,
             "roc_dir": d.roc_dir.value,
+            "spread_state": d.spread_state.value,
+            "signal_driver": d.signal_driver,
             "skip_reason": d.skip_reason,
-            "should_trade": d.should_trade,
+            "should_trade": d.should_trade_in(mode),
         }
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -1556,6 +1586,35 @@ class Coordinator:
         except Exception as e:
             logger.warning("coordinator.atr_warmup_failed", error=str(e))
 
+    async def _warmup_spread_filter(self) -> None:
+        """Pre-seed SpreadRegimeFilter from recent ob_snapshots so the
+        spread baseline is populated before the first live tick rather
+        than needing ~20 ticks (~10 min) to warm up.
+        """
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with pool.connection() as conn:
+                rows = await conn.execute(
+                    """SELECT spread_cents FROM ob_snapshots
+                       WHERE spread_cents IS NOT NULL
+                       ORDER BY timestamp DESC LIMIT 200"""
+                )
+                result = await rows.fetchall()
+            if not result:
+                logger.info("coordinator.spread_warmup_skipped", reason="no_snapshots")
+                return
+            values = [float(r[0]) for r in reversed(result) if r[0] is not None]
+            consumed = self.spread_filter.warmup(values)
+            state = self.spread_filter.get_state()
+            logger.info("coordinator.spread_warmup_complete",
+                        values_consumed=consumed,
+                        baseline_cents=state.get("baseline_cents"),
+                        history_len=state.get("history_len", 0))
+        except Exception as e:
+            logger.warning("coordinator.spread_warmup_failed", error=str(e))
+
     def _detect_rapid_fire(self) -> bool:
         """Returns True if we're in a rapid-fire loop (3+ exits in 60s)."""
         now = time.time()
@@ -1592,8 +1651,8 @@ class Coordinator:
                            (timestamp, ticker, direction, side, contracts, entry_price,
                             exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                             regime_at_entry, candles_held, entry_obi, entry_roc,
-                            closed_at, error_reason, flagged_at, trading_mode)
-                           VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s)""",
+                            signal_driver, closed_at, error_reason, flagged_at, trading_mode)
+                           VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), %s)""",
                         (
                             trade.ticker, trade.direction,
                             "yes" if trade.direction == "long" else "no",
@@ -1602,6 +1661,7 @@ class Coordinator:
                             trade.conviction, trade.regime_at_entry, trade.candles_held,
                             getattr(trade, "entry_obi", 0.0) or 0.0,
                             getattr(trade, "entry_roc", 0.0) or 0.0,
+                            getattr(trade, "signal_driver", "-") or "-",
                             error_reason, mode,
                         ),
                     )
@@ -1627,8 +1687,9 @@ class Coordinator:
                     """INSERT INTO trades
                        (timestamp, ticker, direction, side, contracts, entry_price,
                         exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
-                        regime_at_entry, candles_held, entry_obi, entry_roc, closed_at, trading_mode)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                        regime_at_entry, candles_held, entry_obi, entry_roc,
+                        signal_driver, closed_at, trading_mode)
+                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
                        RETURNING id""",
                     (
                         trade.ticker, trade.direction,
@@ -1638,6 +1699,7 @@ class Coordinator:
                         trade.conviction, trade.regime_at_entry, trade.candles_held,
                         getattr(trade, "entry_obi", 0.0) or 0.0,
                         getattr(trade, "entry_roc", 0.0) or 0.0,
+                        getattr(trade, "signal_driver", "-") or "-",
                         mode,
                     ),
                 )
@@ -1660,8 +1722,8 @@ class Coordinator:
                     """INSERT INTO signal_log
                        (timestamp, ticker, obi_value, obi_direction, roc_value,
                         roc_direction, atr_regime, decision, conviction,
-                        skip_reason, size_mult)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        skip_reason, size_mult, spread_state)
+                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         state.kalshi_ticker or state.symbol,
                         features.obi,
@@ -1673,6 +1735,7 @@ class Coordinator:
                         decision.conviction.value,
                         decision.skip_reason,
                         decision.size_multiplier,
+                        decision.spread_state.value,
                     ),
                 )
         except Exception as e:

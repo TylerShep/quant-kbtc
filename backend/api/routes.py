@@ -494,7 +494,7 @@ async def trades(
         rows = await conn.execute(
             """SELECT timestamp, ticker, direction, contracts, entry_price,
                       exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
-                      regime_at_entry, candles_held, closed_at
+                      regime_at_entry, candles_held, closed_at, signal_driver
                FROM trades
                WHERE trading_mode = %s
                ORDER BY timestamp DESC
@@ -520,6 +520,7 @@ async def trades(
             "regime_at_entry": r[11],
             "candles_held": r[12],
             "closed_at": r[13].isoformat() if r[13] else None,
+            "signal_driver": r[14] or "-",
         })
 
     result = {
@@ -555,7 +556,8 @@ async def errored_trades(
         rows = await conn.execute(
             """SELECT timestamp, ticker, direction, contracts, entry_price,
                       exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
-                      regime_at_entry, candles_held, closed_at, error_reason, flagged_at
+                      regime_at_entry, candles_held, closed_at, error_reason, flagged_at,
+                      signal_driver
                FROM errored_trades
                WHERE trading_mode = %s
                ORDER BY timestamp DESC
@@ -583,6 +585,7 @@ async def errored_trades(
             "closed_at": r[13].isoformat() if r[13] else None,
             "error_reason": r[14],
             "flagged_at": r[15].isoformat() if r[15] else None,
+            "signal_driver": r[16] or "-",
         })
 
     return {

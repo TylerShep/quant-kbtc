@@ -119,6 +119,16 @@ class ATRConfig:
 
 
 @dataclass(frozen=True)
+class SpreadDivConfig:
+    enabled: bool = field(default_factory=lambda: _env_bool("SD_ENABLED", True))
+    baseline_window: int = field(default_factory=lambda: _env_int("SD_BASELINE_WINDOW", 60))
+    wide_threshold: float = field(default_factory=lambda: _env_float("SD_WIDE_THRESHOLD", 0.40))
+    tight_threshold: float = field(default_factory=lambda: _env_float("SD_TIGHT_THRESHOLD", -0.20))
+    min_history: int = field(default_factory=lambda: _env_int("SD_MIN_HISTORY", 20))
+    staleness_sec: int = field(default_factory=lambda: _env_int("SD_STALENESS_SEC", 90))
+
+
+@dataclass(frozen=True)
 class RiskConfig:
     risk_per_trade_pct: float = field(default_factory=lambda: _env_float("RISK_PER_TRADE_PCT", 0.02))
     max_risk_per_trade_pct: float = field(default_factory=lambda: _env_float("MAX_RISK_PER_TRADE_PCT", 0.03))
@@ -163,6 +173,12 @@ class BotConfig:
     )
     cors_origins: str = field(
         default_factory=lambda: _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
+    )
+    roc_low_conviction_paper_enabled: bool = field(
+        default_factory=lambda: _env_bool("ROC_LOW_CONVICTION_PAPER_ENABLED", False)
+    )
+    roc_low_conviction_live_enabled: bool = field(
+        default_factory=lambda: _env_bool("ROC_LOW_CONVICTION_LIVE_ENABLED", False)
     )
 
     @property
@@ -210,6 +226,7 @@ class Settings:
     obi: OBIConfig = field(default_factory=OBIConfig)
     roc: ROCConfig = field(default_factory=ROCConfig)
     atr: ATRConfig = field(default_factory=ATRConfig)
+    spread_div: SpreadDivConfig = field(default_factory=SpreadDivConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     bot: BotConfig = field(default_factory=BotConfig)
     historical_sync: HistoricalSyncConfig = field(default_factory=HistoricalSyncConfig)

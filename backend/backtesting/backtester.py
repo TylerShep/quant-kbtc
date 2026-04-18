@@ -7,9 +7,11 @@ from __future__ import annotations
 from typing import Optional
 
 from filters.atr_regime import ATRRegimeFilter
+from filters.spread_regime import SpreadRegimeFilter
 from strategies.obi import evaluate_obi, check_obi_exit
 from strategies.roc import evaluate_roc, calculate_roc, check_roc_exit
 from strategies.resolver import SignalConflictResolver
+from strategies.spread_div import evaluate_spread_divergence
 from backtesting.metrics import compute_metrics
 from config import settings
 
@@ -55,6 +57,7 @@ class Backtester:
 
     def run(self, bankroll: float = 10000.0) -> dict:
         atr_filter = ATRRegimeFilter()
+        spread_filter = SpreadRegimeFilter()
         resolver = SignalConflictResolver()
         position = None
         current_bankroll = bankroll
@@ -73,6 +76,8 @@ class Backtester:
             ob = self.ob_history.get(candle["timestamp"])
             obi_val = ob["obi"] if ob else 0.5
             obi_history.append(obi_val)
+            spread_cents = ob.get("spread_cents") if ob else None
+            spread_filter.update(spread_cents)
 
             if position:
                 pnl_pct = self._calc_pnl_pct(position, candle["close"])
@@ -128,7 +133,16 @@ class Backtester:
                     overrides=overrides,
                 )
 
-                decision = resolver.resolve(obi_dir, roc_dir, regime, True)
+                spread_state = evaluate_spread_divergence(
+                    spread_history=spread_filter.spread_history(),
+                    current_spread=spread_cents,
+                    atr_regime=regime,
+                    overrides=overrides,
+                )
+
+                decision = resolver.resolve(
+                    obi_dir, roc_dir, regime, True, spread_state=spread_state,
+                )
 
                 self.signal_log.append({
                     "timestamp": candle["timestamp"],
@@ -139,6 +153,8 @@ class Backtester:
                     "conviction": decision.conviction.value,
                     "regime": regime,
                     "skip_reason": decision.skip_reason,
+                    "spread_state": spread_state.value,
+                    "spread_cents": spread_cents,
                 })
 
                 if decision.should_trade:
