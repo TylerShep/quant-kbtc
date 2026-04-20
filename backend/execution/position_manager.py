@@ -22,9 +22,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+import httpx
 import structlog
 
 from config import settings
+from data.fill_stream import Fill, FillStream
 from data.kalshi_ws import KalshiOrderClient
 
 logger = structlog.get_logger(__name__)
@@ -57,6 +59,17 @@ class ManagedPosition:
     entry_cost_dollars: Optional[float] = None
     entry_fees_dollars: Optional[float] = None
     signal_driver: str = "-"
+    # BUG-025: which authority produced the entry price/cost/fees fields.
+    # ``"fill_ws"`` means we drained per-execution Fill events from the
+    # authenticated fill WebSocket. ``"order_response"`` is the historical
+    # path that parses the polled REST order. Surfaced in trade rows so
+    # operators can audit how often the WS engaged.
+    entry_fill_source: str = "order_response"
+    # BUG-025: snapshot of the live wallet balance (in dollars) immediately
+    # after the entry was confirmed. Used by ``coordinator._persist_trade``
+    # to compute the wallet-delta PnL and quarantine trades whose recorded
+    # PnL drifts from the actual cash movement.
+    wallet_at_entry: Optional[float] = None
 
 
 @dataclass
@@ -66,6 +79,16 @@ class OrphanedPosition:
     contracts: int
     avg_entry_price: float
     detected_at: str
+    # Optional upstream cause for analytics. Set to "EXPIRY_409" when the
+    # orphan was created because an exit hit a 409 Conflict at expiry; lets
+    # check_orphans record the eventual settlement as EXPIRY_409_SETTLED
+    # instead of the generic ORPHAN_SETTLED.
+    cause: Optional[str] = None
+    # Whether the supervised round-trip counter has already advanced for
+    # this orphan. The 409 settlement path bumps eagerly, so check_orphans
+    # must skip the bump in that case to avoid double-counting against the
+    # ``live_trade_limit`` gate.
+    counted: bool = False
 
 
 # Kalshi canonical terminal statuses (API v2 spec 3.13.0)
@@ -75,6 +98,25 @@ FILL_POLL_INTERVAL = 0.25
 FILL_POLL_TIMEOUT = 15.0
 VERIFY_FAILED = -1
 
+# BUG-022: When an entry "market" order rests on the book (Kalshi treats
+# the price field as a limit floor), short-circuit the poll loop after
+# this many seconds so the caller can cancel the order and re-verify.
+# Without this we wait the full FILL_POLL_TIMEOUT, widening the window in
+# which the resting order can match and become an orphan.
+ENTRY_REST_BAILOUT_SEC = 2.0
+
+# BUG-022: Settle time after canceling a resting entry order before
+# we re-query the positions endpoint. Mirrors the BUG-002 ledger-lag
+# pattern used after entry/exit fills.
+ENTRY_CANCEL_SETTLE_SEC = 1.0
+
+# BUG-025: How long the fill-stream drain may block waiting for per-
+# execution Fill events. Strictly bounded so a missed WS frame can never
+# starve the entry/exit state machine. The drain runs *after* the order
+# has already terminalized so it only adds wait time when fills arrive
+# after the REST poll returns -- typically zero-cost on the happy path.
+FILL_STREAM_DRAIN_TIMEOUT_SEC = 2.0
+
 
 class PositionManager:
     """Thread-safe, exchange-anchored position lifecycle manager.
@@ -83,8 +125,16 @@ class PositionManager:
     so only one order operation can be in-flight at any time.
     """
 
-    def __init__(self, client: KalshiOrderClient):
+    def __init__(
+        self,
+        client: KalshiOrderClient,
+        fill_stream: Optional[FillStream] = None,
+    ):
         self.client = client
+        # BUG-025: optional authoritative source for per-execution fill
+        # data. When unset (tests, paper-only, dev) the manager keeps
+        # using the legacy ``_parse_fill_*`` parsers verbatim.
+        self.fill_stream = fill_stream
         self._lock = asyncio.Lock()
         self.state = PositionState.FLAT
         self.position: Optional[ManagedPosition] = None
@@ -106,6 +156,14 @@ class PositionManager:
         # to avoid race conditions with Kalshi's position API lag.
         self._exit_cooldowns: dict[str, float] = {}
         self.RECONCILE_COOLDOWN_SEC = 90.0
+
+        # Per-ticker entry cooldown: after a phantom_entry_prevented event,
+        # immediately re-attempting the same ticker reproduces the same race
+        # because the in-flight resting order may still be bouncing through
+        # Kalshi's books. A short cooldown (default 30s) lets the exchange
+        # state stabilise. Configurable per instance for tests.
+        self._entry_phantom_cooldowns: dict[str, float] = {}
+        self.PHANTOM_ENTRY_COOLDOWN_SEC = 30.0
 
     # ── Public properties ─────────────────────────────────────────────
 
@@ -146,6 +204,33 @@ class PositionManager:
         elapsed = time.time() - exit_time
         if elapsed > self.RECONCILE_COOLDOWN_SEC:
             del self._exit_cooldowns[ticker]
+            return False
+        return True
+
+    def _record_phantom_entry_cooldown(self, ticker: str) -> None:
+        """Mark a ticker as just-prevented so quick re-entries are blocked."""
+        self._entry_phantom_cooldowns[ticker] = time.time()
+
+    def _is_in_phantom_entry_cooldown(self, ticker: str) -> bool:
+        """True if ticker is still inside its post-phantom cooldown window."""
+        recorded = self._entry_phantom_cooldowns.get(ticker)
+        if recorded is None:
+            return False
+        elapsed = time.time() - recorded
+        if elapsed > self.PHANTOM_ENTRY_COOLDOWN_SEC:
+            del self._entry_phantom_cooldowns[ticker]
+            return False
+        return True
+
+    def can_enter_ticker(self, ticker: str) -> bool:
+        """Public pre-check used by the coordinator to avoid spinning up an
+        entry task when the position manager would refuse anyway. Mirrors the
+        gating performed inside ``enter()``; lock-free so it's safe from the
+        synchronous coordinator path.
+        """
+        if not self.can_enter:
+            return False
+        if self._is_in_phantom_entry_cooldown(ticker):
             return False
         return True
 
@@ -257,16 +342,107 @@ class PositionManager:
                 pass
         return None
 
-    async def _poll_order_fill(self, order_id: str) -> dict:
+    # ── BUG-025: fill-stream drain helper ─────────────────────────────
+
+    async def _drain_fill_stream(
+        self,
+        order_id: Optional[str],
+        *,
+        min_count: int,
+        leg: str,
+    ) -> tuple[list[Fill], str]:
+        """Drain per-execution Fill events for ``order_id`` from the WS.
+
+        Returns ``(fills, source)`` where ``source`` is:
+          * ``"fill_ws"`` -- at least one Fill was returned and matched
+            ``min_count``. Caller should override price/cost/fees from
+            the aggregated VWAP.
+          * ``"fill_ws_partial"`` -- some Fills were returned but the
+            cumulative count is below ``min_count``. Caller should still
+            prefer the WS values (they're truth for what filled), but
+            log so we can tell apart from a clean drain.
+          * ``"order_response"`` -- no Fills returned (stream off, miss,
+            timeout). Caller falls back to the existing
+            ``_parse_fill_*`` parsers; **no behavior change vs. today**.
+
+        ``leg`` is just a log label (``"entry"`` / ``"exit"`` / ``"orphan"``).
+        """
+        if self.fill_stream is None or not order_id or min_count <= 0:
+            return [], "order_response"
+        try:
+            fills = await self.fill_stream.drain_for_order(
+                order_id,
+                min_count=min_count,
+                timeout_sec=FILL_STREAM_DRAIN_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            logger.warning(
+                "position_manager.fill_stream_drain_error",
+                leg=leg, order_id=order_id, error=str(e),
+            )
+            return [], "order_response"
+        if not fills:
+            logger.info(
+                "position_manager.fill_stream_miss",
+                leg=leg, order_id=order_id, min_count=min_count,
+            )
+            return [], "order_response"
+        total = sum(f.count for f in fills)
+        source = "fill_ws" if total >= min_count else "fill_ws_partial"
+        vwap = FillStream.vwap_yes_cents(fills)
+        cost = FillStream.total_cost_dollars(fills)
+        fees = FillStream.total_fees_dollars(fills)
+        logger.info(
+            "position_manager.fill_stream_capture",
+            leg=leg, order_id=order_id,
+            executions=len(fills),
+            count=total, expected=min_count,
+            vwap_yes_cents=round(vwap, 4) if vwap is not None else None,
+            cost_dollars=round(cost, 4),
+            fees_dollars=round(fees, 4),
+            source=source,
+        )
+        return fills, source
+
+    async def _poll_order_fill(
+        self,
+        order_id: str,
+        *,
+        early_rest_bailout_sec: Optional[float] = None,
+    ) -> dict:
+        """Poll Kalshi for order terminalization.
+
+        Returns the order_data dict from the most recent successful poll.
+
+        Args:
+            order_id: Kalshi order id returned by create_order.
+            early_rest_bailout_sec: If set and the order is observed to be
+                ``status == "resting"`` after this many seconds elapsed,
+                short-circuit the loop and return the resting order_data
+                so the caller can cancel it. Defaults to None (no early
+                bailout, original behavior).
+        """
         elapsed = 0.0
+        last_order_data: dict = {}
         while elapsed < FILL_POLL_TIMEOUT:
             await asyncio.sleep(FILL_POLL_INTERVAL)
             elapsed += FILL_POLL_INTERVAL
             try:
                 detail = await self.client.get_order(order_id)
                 order_data = detail.get("order", {})
+                last_order_data = order_data
                 status = order_data.get("status", "")
                 if status in TERMINAL_STATUSES:
+                    return order_data
+                if (
+                    early_rest_bailout_sec is not None
+                    and status == "resting"
+                    and elapsed >= early_rest_bailout_sec
+                ):
+                    logger.info("position_manager.poll_order_early_bailout",
+                                order_id=order_id, status=status,
+                                elapsed=elapsed,
+                                bailout_sec=early_rest_bailout_sec)
                     return order_data
             except Exception as e:
                 logger.warning("position_manager.poll_order_error",
@@ -277,7 +453,40 @@ class PositionManager:
             detail = await self.client.get_order(order_id)
             return detail.get("order", {})
         except Exception:
-            return {}
+            return last_order_data
+
+    async def _cancel_entry_order_safely(
+        self, order_id: str, ticker: str
+    ) -> bool:
+        """Cancel a (presumed-resting) entry order, swallowing the 404
+        Kalshi returns when the order has already terminalized.
+
+        Returns True if cancel API succeeded (order is now canceled or was
+        already terminal); False on a non-404 error.
+
+        BUG-022: Without this, an entry "market" order that rested on the
+        book can match minutes later and create an orphan position. Calling
+        this immediately after a non-terminal poll closes that window.
+        """
+        try:
+            await self.client.cancel_order(order_id)
+            logger.info("position_manager.entry_canceled_on_timeout",
+                        ticker=ticker, order_id=order_id)
+            return True
+        except httpx.HTTPStatusError as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (404, 410):
+                logger.info("position_manager.entry_cancel_already_terminal",
+                            ticker=ticker, order_id=order_id, http_status=status)
+                return True
+            logger.warning("position_manager.entry_cancel_failed",
+                           ticker=ticker, order_id=order_id,
+                           http_status=status, error=str(e))
+            return False
+        except Exception as e:
+            logger.warning("position_manager.entry_cancel_failed",
+                           ticker=ticker, order_id=order_id, error=str(e))
+            return False
 
     # ── Exchange verification ─────────────────────────────────────────
 
@@ -398,6 +607,23 @@ class PositionManager:
                                count=len(self.orphaned_positions))
                 return None
 
+            # BUG-022 follow-up: cool down the ticker that just produced a
+            # phantom_entry_prevented event. Quick re-entries reproduce the
+            # same race because in-flight resting orders may still be
+            # bouncing through Kalshi's books.
+            if self._is_in_phantom_entry_cooldown(ticker):
+                cooldown_remaining = round(
+                    self.PHANTOM_ENTRY_COOLDOWN_SEC
+                    - (time.time() - self._entry_phantom_cooldowns[ticker]),
+                    2,
+                )
+                logger.info(
+                    "position_manager.enter_blocked_phantom_cooldown",
+                    ticker=ticker,
+                    cooldown_remaining_sec=max(cooldown_remaining, 0.0),
+                )
+                return None
+
             # Pre-order: confirm exchange is flat
             if not await self._check_flat_on_exchange(ticker):
                 self._transition(PositionState.DESYNC)
@@ -447,24 +673,50 @@ class PositionManager:
                     self._transition(PositionState.FLAT)
                     return None
 
-            # Poll for fill
+            # Poll for fill. BUG-022: bail out early if the order is
+            # observed resting (Kalshi treated yes_price/no_price as a
+            # limit floor) so we can cancel before it matches later.
             fill_price = price
             filled_contracts = 0
             entry_cost = None
             entry_fees = None
+            order_data: dict = {}
+            status = ""
+            poll_filled = 0
+            poll_canceled_resting = False
             if order_id:
-                order_data = await self._poll_order_fill(order_id)
+                order_data = await self._poll_order_fill(
+                    order_id, early_rest_bailout_sec=ENTRY_REST_BAILOUT_SEC,
+                )
                 status = order_data.get("status", "")
-                filled_count = self._parse_fill_count(order_data)
+                poll_filled = self._parse_fill_count(order_data)
 
-                if status == "canceled" and filled_count == 0:
+                if status == "canceled" and poll_filled == 0:
                     logger.warning("position_manager.entry_canceled",
                                    ticker=ticker, order_id=order_id)
                     self._transition(PositionState.FLAT)
                     return None
 
-                if filled_count > 0:
-                    filled_contracts = filled_count
+                # BUG-022: any non-terminal status (resting, executing,
+                # unknown) means a portion of the order may still match
+                # later. Cancel now, then re-poll to capture any partial
+                # fill that may have occurred during cancel.
+                if status not in TERMINAL_STATUSES:
+                    poll_canceled_resting = True
+                    await self._cancel_entry_order_safely(order_id, ticker)
+                    await asyncio.sleep(ENTRY_CANCEL_SETTLE_SEC)
+                    try:
+                        detail = await self.client.get_order(order_id)
+                        order_data = detail.get("order", {}) or order_data
+                        status = order_data.get("status", "") or status
+                        poll_filled = self._parse_fill_count(order_data)
+                    except Exception as e:
+                        logger.warning(
+                            "position_manager.post_cancel_poll_failed",
+                            ticker=ticker, order_id=order_id, error=str(e))
+
+                if poll_filled > 0:
+                    filled_contracts = poll_filled
 
                 parsed_price = self._parse_fill_price_yes_side(order_data)
                 if parsed_price is not None:
@@ -474,10 +726,17 @@ class PositionManager:
                 entry_fees = self._parse_actual_fees(order_data)
 
             # Ledger lag: wait before verification so Kalshi's position
-            # endpoint reflects the fill that just occurred (Fix 2).
-            await asyncio.sleep(1.5)
+            # endpoint reflects the fill that just occurred (Fix 2). Skip
+            # the extra sleep if we already slept after canceling.
+            if not poll_canceled_resting:
+                await asyncio.sleep(1.5)
 
-            verified = await self.verify_position_on_exchange(ticker)
+            # BUG-022: use retrying verify so a transient stale-positions
+            # read doesn't push us into phantom_entry_prevented when a fill
+            # is still propagating through Kalshi's ledger.
+            verified = await self._verify_with_retry(
+                ticker, retries=3, backoff=1.5,
+            )
             if verified == VERIFY_FAILED:
                 if filled_contracts > 0:
                     logger.warning("position_manager.entry_verify_failed_trusting_poll",
@@ -493,11 +752,73 @@ class PositionManager:
                                  ticker=ticker, poll_filled=filled_contracts,
                                  exchange=0)
                 logger.info("position_manager.phantom_entry_prevented",
-                            ticker=ticker)
+                            ticker=ticker, status=status,
+                            canceled_resting=poll_canceled_resting,
+                            order_id=order_id)
                 self._transition(PositionState.FLAT)
+                # Block re-entries on the same ticker for the cooldown
+                # window so the coordinator doesn't burn through retries
+                # while the cancelled order is still settling on Kalshi.
+                self._record_phantom_entry_cooldown(ticker)
                 return None
             else:
+                # Exchange is the source of truth — even if poll reported a
+                # different (e.g. zero) fill count, trust the verified count.
+                if poll_canceled_resting and filled_contracts == 0:
+                    logger.warning(
+                        "position_manager.entry_filled_after_cancel",
+                        ticker=ticker, order_id=order_id,
+                        verified=verified)
+                    # Final order fetch to recover fill price/cost/fees that
+                    # the resting poll missed.
+                    try:
+                        detail = await self.client.get_order(order_id)
+                        order_data = detail.get("order", {}) or order_data
+                        parsed_price = self._parse_fill_price_yes_side(order_data)
+                        if parsed_price is not None:
+                            fill_price = parsed_price
+                        recovered_cost = self._parse_fill_cost(order_data)
+                        if recovered_cost is not None:
+                            entry_cost = recovered_cost
+                        recovered_fees = self._parse_actual_fees(order_data)
+                        if recovered_fees is not None:
+                            entry_fees = recovered_fees
+                    except Exception as e:
+                        logger.warning(
+                            "position_manager.fill_recovery_fetch_failed",
+                            ticker=ticker, order_id=order_id, error=str(e))
                 filled_contracts = verified
+
+            # BUG-025: prefer per-execution Fill events from the
+            # authenticated WS over the polled order response. Order
+            # responses can return stale ``yes_price_dollars`` / under-
+            # report ``taker_fill_cost_dollars``; the fill stream is the
+            # only source that matches the actual cash movement. Falls
+            # back transparently to the parsed values when the stream is
+            # disconnected, missing fills, or returned partial data.
+            ws_fills, fill_source = await self._drain_fill_stream(
+                order_id, min_count=filled_contracts, leg="entry",
+            )
+            if ws_fills:
+                ws_vwap = FillStream.vwap_yes_cents(ws_fills)
+                if ws_vwap is not None:
+                    fill_price = ws_vwap
+                entry_cost = FillStream.total_cost_dollars(ws_fills)
+                entry_fees = FillStream.total_fees_dollars(ws_fills)
+
+            # BUG-025: capture wallet balance immediately after the
+            # position is confirmed. ``coordinator._persist_trade``
+            # diffs this against the post-exit wallet to catch any
+            # drift between recorded PnL and real cash movement.
+            wallet_at_entry: Optional[float] = None
+            try:
+                bal_data = await self.client.get_balance()
+                wallet_at_entry = float(bal_data.get("balance", 0)) / 100.0
+            except Exception as e:
+                logger.warning(
+                    "position_manager.wallet_capture_failed",
+                    leg="entry", ticker=ticker, error=str(e),
+                )
 
             self.position = ManagedPosition(
                 ticker=ticker,
@@ -513,12 +834,16 @@ class PositionManager:
                 entry_cost_dollars=entry_cost,
                 entry_fees_dollars=entry_fees,
                 signal_driver=signal_driver,
+                entry_fill_source=fill_source,
+                wallet_at_entry=wallet_at_entry,
             )
             self._transition(PositionState.OPEN)
 
             logger.info("position_manager.entry_confirmed",
                          ticker=ticker, direction=direction,
-                         contracts=filled_contracts, price=fill_price)
+                         contracts=filled_contracts, price=fill_price,
+                         entry_fill_source=fill_source,
+                         wallet_at_entry=wallet_at_entry)
             return self.position
 
     # ── EXIT ──────────────────────────────────────────────────────────
@@ -535,9 +860,12 @@ class PositionManager:
             result = await self._exit_inner(price, reason)
             if result and result.get("_settled"):
                 settled_result = result["_result"]
+                via_409 = result.get("_via_409", False)
                 logger.info("position_manager.exit_redirected_to_settlement",
-                            result=settled_result)
-                return await self._handle_settlement_inner(settled_result)
+                            result=settled_result, via_409=via_409)
+                return await self._handle_settlement_inner(
+                    settled_result, via_409=via_409,
+                )
             return result
 
     async def _exit_inner(self, price: float, reason: str) -> Optional[dict]:
@@ -578,7 +906,7 @@ class PositionManager:
                     logger.info("position_manager.exit_conflict_settled",
                                 ticker=pos.ticker, result=settled)
                     self._transition(PositionState.OPEN)
-                    return {"_settled": True, "_result": settled}
+                    return {"_settled": True, "_result": settled, "_via_409": True}
 
             recovered = await self._recover_order_after_failure(client_order_id)
             if recovered:
@@ -593,6 +921,7 @@ class PositionManager:
         exited_contracts = 0
         actual_fees = None
         exit_cost = None
+        exit_fill_source = "order_response"
         if exit_order_id:
             order_data = await self._poll_order_fill(exit_order_id)
             status = order_data.get("status", "")
@@ -613,6 +942,21 @@ class PositionManager:
 
             actual_fees = self._parse_actual_fees(order_data)
             exit_cost = self._parse_fill_cost(order_data)
+
+            # BUG-025: prefer the WS Fill events over the polled order's
+            # quoted price/cost/fees. See enter() for the rationale and
+            # fallback semantics.
+            ws_fills, exit_fill_source = await self._drain_fill_stream(
+                exit_order_id,
+                min_count=exited_contracts or pos.contracts,
+                leg="exit",
+            )
+            if ws_fills:
+                ws_vwap = FillStream.vwap_yes_cents(ws_fills)
+                if ws_vwap is not None:
+                    exit_price = ws_vwap
+                exit_cost = FillStream.total_cost_dollars(ws_fills)
+                actual_fees = FillStream.total_fees_dollars(ws_fills)
 
         # Ledger lag: wait before verification so Kalshi's position
         # endpoint reflects the fill that just occurred (Fix 2).
@@ -724,6 +1068,15 @@ class PositionManager:
             "signal_driver": pos.signal_driver,
             "max_favorable_excursion": pos.max_favorable_excursion,
             "max_adverse_excursion": pos.max_adverse_excursion,
+            # BUG-025 reconciliation context. Coordinator persists these
+            # alongside the trade row so analytics can quantify how often
+            # the WS path engaged and how big any remaining cost-vs-wallet
+            # drift was.
+            "entry_cost_dollars": pos.entry_cost_dollars,
+            "exit_cost_dollars": exit_cost,
+            "entry_fill_source": pos.entry_fill_source,
+            "exit_fill_source": exit_fill_source,
+            "wallet_at_entry": pos.wallet_at_entry,
         }
 
         self.position = None
@@ -736,17 +1089,24 @@ class PositionManager:
                      contracts=exited_contracts,
                      pnl=trade_result["pnl"], reason=reason,
                      completed_trades=self._completed_live_trades,
-                     trade_limit=self.live_trade_limit)
+                     trade_limit=self.live_trade_limit,
+                     entry_fill_source=pos.entry_fill_source,
+                     exit_fill_source=exit_fill_source)
         return trade_result
 
     # ── SETTLEMENT ────────────────────────────────────────────────────
 
-    async def handle_settlement(self, result: str) -> Optional[dict]:
-        """Handle contract settlement. Acquires lock, verifies with exchange."""
-        async with self._lock:
-            return await self._handle_settlement_inner(result)
+    async def handle_settlement(self, result: str, *, via_409: bool = False) -> Optional[dict]:
+        """Handle contract settlement. Acquires lock, verifies with exchange.
 
-    async def _handle_settlement_inner(self, result: str) -> Optional[dict]:
+        ``via_409`` is True when settlement was reached via a 409 Conflict on
+        an exit attempt (the contract was already closing on the exchange).
+        Used to disambiguate ``EXPIRY_409_SETTLED`` from a normal settlement.
+        """
+        async with self._lock:
+            return await self._handle_settlement_inner(result, via_409=via_409)
+
+    async def _handle_settlement_inner(self, result: str, *, via_409: bool = False) -> Optional[dict]:
         """Settlement logic without lock (caller must hold it)."""
         if self.position is None:
             return None
@@ -795,6 +1155,12 @@ class PositionManager:
 
         net_pnl, pnl_pct, fees = _calc_settlement_pnl(settled_contracts)
 
+        # When settlement was reached via a 409 Conflict on an exit, label
+        # the trade EXPIRY_409_SETTLED so it's distinguishable from a clean
+        # contract settlement. Both paths are legitimate; the disambiguation
+        # only matters for analytics and orphan-vs-expiry attribution.
+        base_exit_reason = "EXPIRY_409_SETTLED" if via_409 else "CONTRACT_SETTLED"
+
         trade_result = {
             "ticker": pos.ticker,
             "direction": pos.direction,
@@ -804,7 +1170,7 @@ class PositionManager:
             "pnl": round(net_pnl, 4),
             "pnl_pct": round(pnl_pct, 4),
             "fees": round(fees, 4),
-            "exit_reason": "CONTRACT_SETTLED",
+            "exit_reason": base_exit_reason,
             "conviction": pos.conviction,
             "regime_at_entry": pos.regime_at_entry,
             "candles_held": pos.candles_held,
@@ -817,6 +1183,14 @@ class PositionManager:
             "signal_driver": pos.signal_driver,
             "max_favorable_excursion": pos.max_favorable_excursion,
             "max_adverse_excursion": pos.max_adverse_excursion,
+            # BUG-025: settlement has no exit fills; cost is simply not
+            # populated and ``exit_fill_source`` is "settlement" so the
+            # coordinator's reconciliation skips the cost diff for these.
+            "entry_cost_dollars": pos.entry_cost_dollars,
+            "exit_cost_dollars": None,
+            "entry_fill_source": pos.entry_fill_source,
+            "exit_fill_source": "settlement",
+            "wallet_at_entry": pos.wallet_at_entry,
         }
 
         remaining = await self._verify_with_retry(pos.ticker)
@@ -834,12 +1208,34 @@ class PositionManager:
         remaining_abs = abs(remaining) if remaining != 0 else 0
         if remaining_abs > 0:
             logger.error("position_manager.settlement_position_still_open",
-                         ticker=pos.ticker, remaining=remaining)
+                         ticker=pos.ticker, remaining=remaining,
+                         via_409=via_409)
+            # Tag the orphan with the upstream cause so check_orphans can
+            # later record it as EXPIRY_409_SETTLED instead of ORPHAN_SETTLED.
+            # When this is the full-position redirect (remaining_abs >=
+            # pos.contracts) we also pre-flag the orphan as counted because
+            # we bump _completed_live_trades immediately below; without
+            # this the orphan-recovery path would double-count.
+            preflag_counted = remaining_abs >= pos.contracts
             self.adopt_orphan(pos.ticker, pos.direction,
-                              remaining_abs, pos.entry_price)
+                              remaining_abs, pos.entry_price,
+                              cause="EXPIRY_409" if via_409 else None,
+                              counted=preflag_counted)
             if remaining_abs >= pos.contracts:
                 self.position = None
                 self._transition(PositionState.FLAT)
+                # Fix C: the round-trip ended (orphan path will close the
+                # position), so the supervised counter must advance even
+                # though we return None here. Otherwise the bot keeps
+                # accepting new live entries despite hitting the limit.
+                self._completed_live_trades += 1
+                logger.info(
+                    "position_manager.settlement_orphan_redirect_counted",
+                    ticker=pos.ticker,
+                    completed_trades=self._completed_live_trades,
+                    trade_limit=self.live_trade_limit,
+                    via_409=via_409,
+                )
                 return None
             settled_contracts = pos.contracts - remaining_abs
             trade_result["contracts"] = settled_contracts
@@ -855,13 +1251,16 @@ class PositionManager:
         self._completed_live_trades += 1
         logger.info("position_manager.settlement_trade_counted",
                      completed_trades=self._completed_live_trades,
-                     trade_limit=self.live_trade_limit)
+                     trade_limit=self.live_trade_limit,
+                     via_409=via_409)
         return trade_result
 
     # ── ORPHAN MANAGEMENT ─────────────────────────────────────────────
 
     def adopt_orphan(self, ticker: str, direction: str, contracts: int,
-                     avg_entry_price: float) -> None:
+                     avg_entry_price: float, *,
+                     cause: Optional[str] = None,
+                     counted: bool = False) -> None:
         already = any(o.ticker == ticker for o in self.orphaned_positions)
         if already:
             for o in self.orphaned_positions:
@@ -874,6 +1273,13 @@ class PositionManager:
                     else:
                         logger.debug("position_manager.orphan_unchanged",
                                      ticker=ticker, contracts=contracts)
+                    # Upgrade the cause if a more specific one arrives. Don't
+                    # downgrade EXPIRY_409 → None; the original tag wins.
+                    if cause and not o.cause:
+                        o.cause = cause
+                    # ``counted`` is sticky: once set, never clear it.
+                    if counted and not o.counted:
+                        o.counted = True
             return
         orphan = OrphanedPosition(
             ticker=ticker,
@@ -881,11 +1287,13 @@ class PositionManager:
             contracts=contracts,
             avg_entry_price=avg_entry_price,
             detected_at=datetime.now(timezone.utc).isoformat(),
+            cause=cause,
+            counted=counted,
         )
         self.orphaned_positions.append(orphan)
         logger.warning("position_manager.orphan_adopted",
                         ticker=ticker, direction=direction,
-                        contracts=contracts)
+                        contracts=contracts, cause=cause, counted=counted)
         asyncio.ensure_future(self._persist_state())
 
     async def check_orphans(self) -> list[dict]:
@@ -924,6 +1332,15 @@ class PositionManager:
                     pnl_per = d * (settled_price - orphan.avg_entry_price) / 100
                     gross = pnl_per * orphan.contracts
                     fees = (orphan.contracts * orphan.avg_entry_price / 100) * 0.007
+                    # If the orphan originated from a 409-Conflict exit at
+                    # expiry, label it EXPIRY_409_SETTLED so analytics can
+                    # separate true phantom-fill orphans from expiry-time
+                    # exit conflicts (the latter are not bugs).
+                    settled_reason = (
+                        "EXPIRY_409_SETTLED"
+                        if orphan.cause == "EXPIRY_409"
+                        else "ORPHAN_SETTLED"
+                    )
                     closed.append({
                         "ticker": orphan.ticker,
                         "direction": orphan.direction,
@@ -931,7 +1348,11 @@ class PositionManager:
                         "entry_price": orphan.avg_entry_price,
                         "exit_price": settled_price,
                         "pnl": round(gross - fees, 4),
-                        "reason": "ORPHAN_SETTLED",
+                        "reason": settled_reason,
+                        # Surface the counted flag so the coordinator only
+                        # advances the supervised counter for orphans that
+                        # weren't already counted by the settlement path.
+                        "already_counted": orphan.counted,
                     })
                     self._settled_tickers.add(orphan.ticker)
                     continue
@@ -961,6 +1382,7 @@ class PositionManager:
                         actual_price = bid
                         orphan_exit_cost = None
                         orphan_fees = None
+                        orphan_fill_source = "order_response"
                         if order_id:
                             order_data = await self._poll_order_fill(order_id)
                             filled = self._parse_fill_count(order_data)
@@ -969,6 +1391,22 @@ class PositionManager:
                                 actual_price = parsed
                             orphan_exit_cost = self._parse_fill_cost(order_data)
                             orphan_fees = self._parse_actual_fees(order_data)
+
+                            # BUG-025: same WS-first override as the main
+                            # exit path. Orphan recoveries are infrequent
+                            # but every dollar of price accuracy matters
+                            # for attribution.
+                            ws_fills, orphan_fill_source = await self._drain_fill_stream(
+                                order_id,
+                                min_count=filled or orphan.contracts,
+                                leg="orphan",
+                            )
+                            if ws_fills:
+                                ws_vwap = FillStream.vwap_yes_cents(ws_fills)
+                                if ws_vwap is not None:
+                                    actual_price = ws_vwap
+                                orphan_exit_cost = FillStream.total_cost_dollars(ws_fills)
+                                orphan_fees = FillStream.total_fees_dollars(ws_fills)
 
                         if filled == 0:
                             remaining = await self.verify_position_on_exchange(
@@ -998,6 +1436,8 @@ class PositionManager:
                             "pnl": round(gross - fees, 4),
                             "reason": "ORPHAN_RECOVERY",
                             "order_id": order_id,
+                            "already_counted": orphan.counted,
+                            "exit_fill_source": orphan_fill_source,
                         })
 
                         unfilled = orphan.contracts - filled
@@ -1008,6 +1448,14 @@ class PositionManager:
                                 contracts=unfilled,
                                 avg_entry_price=orphan.avg_entry_price,
                                 detected_at=orphan.detected_at,
+                                cause=orphan.cause,
+                                # The original orphan was counted (or not)
+                                # for the round-trip. The remainder is the
+                                # same logical round-trip, so the flag must
+                                # carry over to the next check_orphans call
+                                # — otherwise we'd double-count when the
+                                # remainder closes too.
+                                counted=True,
                             ))
                         continue
                     except Exception as e:
@@ -1227,15 +1675,25 @@ class PositionManager:
         except ValueError:
             self.state = PositionState.FLAT
 
+        # Defensive: a snapshot persisted by an older binary won't have the
+        # newer dataclass fields (BUG-025: ``entry_fill_source``,
+        # ``wallet_at_entry``). A snapshot persisted by a *newer* binary
+        # could similarly carry keys we don't yet know about. Filter to
+        # only fields the current dataclass declares so a rolling upgrade
+        # never crashes restore_state().
         pos_data = snapshot.get("position")
         if pos_data:
-            self.position = ManagedPosition(**pos_data)
+            allowed = set(ManagedPosition.__dataclass_fields__.keys())
+            filtered = {k: v for k, v in pos_data.items() if k in allowed}
+            self.position = ManagedPosition(**filtered)
         else:
             self.position = None
 
         self.orphaned_positions = []
+        orphan_allowed = set(OrphanedPosition.__dataclass_fields__.keys())
         for o_data in snapshot.get("orphaned_positions", []):
-            self.orphaned_positions.append(OrphanedPosition(**o_data))
+            filtered = {k: v for k, v in o_data.items() if k in orphan_allowed}
+            self.orphaned_positions.append(OrphanedPosition(**filtered))
 
         self._completed_live_trades = snapshot.get("completed_live_trades", 0)
         restored_limit = snapshot.get("live_trade_limit")
@@ -1257,6 +1715,28 @@ class PositionManager:
         logger.info("position_manager.trade_counter_reset",
                      trade_limit=self.live_trade_limit)
         asyncio.ensure_future(self._persist_state())
+
+    def bump_completed_trades(self, n: int = 1, *, source: str = "external") -> int:
+        """Advance the supervised round-trip counter.
+
+        The orphan-recovery path (``coordinator._check_orphaned_positions``)
+        closes positions outside of ``exit()``/``handle_settlement``, so it
+        needs an explicit way to tell the position manager that another
+        live round-trip is now complete. Without this, the supervised
+        ``live_trade_limit`` gate never trips for orphan-only round-trips,
+        and the bot could silently keep entering past the configured limit.
+
+        Returns the new total. ``n`` must be >= 0.
+        """
+        if n <= 0:
+            return self._completed_live_trades
+        self._completed_live_trades += n
+        logger.info("position_manager.completed_trades_bumped",
+                     source=source, increment=n,
+                     completed_trades=self._completed_live_trades,
+                     trade_limit=self.live_trade_limit)
+        asyncio.ensure_future(self._persist_state())
+        return self._completed_live_trades
 
     async def _persist_state(self) -> None:
         if self._db_pool is None:
@@ -1313,6 +1793,7 @@ class PositionManager:
                     "contracts": o.contracts,
                     "avg_entry_price": o.avg_entry_price,
                     "detected_at": o.detected_at,
+                    "cause": o.cause,
                 }
                 for o in self.orphaned_positions
             ],

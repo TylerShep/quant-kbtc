@@ -34,12 +34,16 @@ class Conviction(str, Enum):
 
     @staticmethod
     def upgrade(level: "Conviction") -> "Conviction":
-        """Upgrade conviction one step. NONE is never upgraded — spread tightness
-        cannot manufacture a trade where no signal exists.
+        """Upgrade conviction one step, capped at NORMAL.
+
+        NONE is never upgraded — spread tightness cannot manufacture a trade
+        where no signal exists.  NORMAL is the ceiling — upgrading to HIGH
+        caused oversized positions on single-signal (OBI-only) trades that
+        were net negative in production paper trading.
         """
         _ladder = {
             Conviction.HIGH: Conviction.HIGH,
-            Conviction.NORMAL: Conviction.HIGH,
+            Conviction.NORMAL: Conviction.NORMAL,
             Conviction.LOW: Conviction.NORMAL,
             Conviction.NONE: Conviction.NONE,
         }

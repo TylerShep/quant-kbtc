@@ -133,11 +133,12 @@ def test_live_low_tradeable_when_live_flag_true(set_bot_flags):
 
 
 def test_conviction_upgrade_ladder():
-    """Conviction.upgrade() must never manufacture a trade from NONE."""
+    """Conviction.upgrade() must never manufacture a trade from NONE,
+    and caps at NORMAL to prevent oversized positions on single-signal trades."""
     assert Conviction.upgrade(Conviction.NONE) == Conviction.NONE
     assert Conviction.upgrade(Conviction.LOW) == Conviction.NORMAL
-    assert Conviction.upgrade(Conviction.NORMAL) == Conviction.HIGH
-    assert Conviction.upgrade(Conviction.HIGH) == Conviction.HIGH  # already max
+    assert Conviction.upgrade(Conviction.NORMAL) == Conviction.NORMAL  # capped
+    assert Conviction.upgrade(Conviction.HIGH) == Conviction.HIGH
 
 
 # ── describe_signal_driver ────────────────────────────────────────────────

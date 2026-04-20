@@ -31,12 +31,15 @@ from risk.position_sizer import PositionSizer
 from risk.circuit_breaker import CircuitBreaker
 from execution.paper_trader import PaperTrader
 from execution.live_trader import LiveTrader
+from data.fill_stream import FillStream
 from api.ws import ws_manager
 from database import get_pool, close_pool
 from notifications import get_notifier
 from filters.price_guard import PriceGuard
 from filters.trend_guard import TrendGuard
+from filters.edge_profile import evaluate as evaluate_edge_profile
 from ml.feature_capture import extract_features, save_features, label_trade
+from ml.inference import ml_gate
 from data.historical_sync import HistoricalSync
 
 logger = structlog.get_logger(__name__)
@@ -61,8 +64,16 @@ class Coordinator:
         self.paper_breaker = CircuitBreaker(self.paper_sizer, never_halt=True)
         self.live_breaker = CircuitBreaker(self.live_sizer)
 
+        # BUG-025: shared FillStream subscriber. Constructed eagerly so
+        # snapshot/restore and reconciliation logic always see a non-None
+        # value, but ``start()`` is what actually opens the WebSocket --
+        # which only runs when ``settings.live.use_fill_stream`` is True.
+        self.fill_stream: Optional[FillStream] = (
+            FillStream() if settings.live.use_fill_stream else None
+        )
+
         self.paper_trader = PaperTrader(self.paper_sizer)
-        self.live_trader = LiveTrader(self.live_sizer)
+        self.live_trader = LiveTrader(self.live_sizer, fill_stream=self.fill_stream)
 
         self.trading_mode = settings.bot.trading_mode
         self.trading_paused = "off"  # "off" | "settling" | "paused"
@@ -144,15 +155,29 @@ class Coordinator:
         await self._warmup_spread_filter()
         self.data_manager.add_listener(self._on_market_update)
         await self.data_manager.start()
+        # BUG-025: kick off the authenticated fill subscriber. Failure
+        # to connect is non-fatal -- PositionManager falls back to the
+        # polled order response transparently.
+        if self.fill_stream is not None:
+            try:
+                await self.fill_stream.start()
+            except Exception as e:
+                logger.warning("coordinator.fill_stream_start_failed", error=str(e))
         asyncio.create_task(self._schedule_tuning())
         asyncio.create_task(self._schedule_daily_attribution())
         asyncio.create_task(self._schedule_weekly_digest())
         asyncio.create_task(self._schedule_paper_sizer_resets())
         await self.historical_sync.start(self._pool)
-        logger.info("coordinator.started")
+        logger.info("coordinator.started",
+                    fill_stream_enabled=self.fill_stream is not None)
 
     async def stop(self):
         await self._save_state()
+        if self.fill_stream is not None:
+            try:
+                await self.fill_stream.stop()
+            except Exception:
+                pass
         await self.data_manager.stop()
         try:
             await self.live_trader.client.aclose()
@@ -631,7 +656,11 @@ class Coordinator:
             anomalies.append("Missing entry_order_id (order may not have been confirmed)")
 
         if hasattr(trade, "exit_order_id") and trade.exit_order_id is None:
-            if trade.exit_reason not in ("CONTRACT_SETTLED", "CONTRACT_SETTLED_VERIFY_FAILED"):
+            if trade.exit_reason not in (
+                "CONTRACT_SETTLED",
+                "CONTRACT_SETTLED_VERIFY_FAILED",
+                "EXPIRY_409_SETTLED",
+            ):
                 anomalies.append("Missing exit_order_id (exit may not have been confirmed)")
 
         if trade.contracts == 0:
@@ -856,6 +885,7 @@ class Coordinator:
         """Periodically check orphaned positions for break-even exit."""
         try:
             closed = await self.live_trader.check_orphans()
+            new_round_trips = 0
             for info in closed:
                 pnl = info["pnl"]
                 notional = info["contracts"] * info["entry_price"] / 100
@@ -864,10 +894,17 @@ class Coordinator:
 
                 logger.info("coordinator.orphan_recovered",
                             ticker=info["ticker"], pnl=pnl,
-                            reason=info["reason"])
+                            reason=info["reason"],
+                            already_counted=info.get("already_counted", False))
 
                 if await self._is_duplicate_orphan_trade(info["ticker"], info["reason"]):
                     continue
+
+                # Fix C: every orphan that closes here ended a real live
+                # round-trip and must move the supervised counter — unless
+                # the settlement path already counted it (already_counted).
+                if not info.get("already_counted", False):
+                    new_round_trips += 1
 
                 self.live_sizer.record_trade(pnl)
 
@@ -907,10 +944,22 @@ class Coordinator:
                     mode="live",
                 ))
 
+            # Fix C: advance the supervised round-trip counter once we've
+            # finished processing this batch. The position manager owns the
+            # counter, but only the coordinator knows which orphans were
+            # newly settled here (vs already counted by the 409 settlement
+            # path). Bump in a single call so the persisted snapshot only
+            # writes once per check.
+            if new_round_trips > 0:
+                self.live_trader.position_manager.bump_completed_trades(
+                    new_round_trips, source="orphan_recovery",
+                )
+
             remaining = len(self.live_trader.orphaned_positions)
             if closed:
                 logger.info("coordinator.orphan_check_complete",
-                            closed=len(closed), remaining=remaining)
+                            closed=len(closed), remaining=remaining,
+                            counter_bumped=new_round_trips)
                 try:
                     await self.sync_live_bankroll()
                 except Exception as e:
@@ -1030,6 +1079,49 @@ class Coordinator:
 
         self.trend_guard.apply_short_trend_filter(decision, closes, mode)
 
+        # ML gate — final pre-entry filter. Runs AFTER all signal/filter logic.
+        # Fail-open: if no model is loaded (no .pkl on disk), ml_gate returns
+        # (True, 0.5) and the trade proceeds unchanged.
+        ml_cfg = settings.ml
+        if (ml_cfg.gate_enabled
+                and decision.should_trade_in(mode)
+                and ((mode == "paper" and ml_cfg.gate_paper)
+                     or (mode == "live" and ml_cfg.gate_live))):
+            feat = extract_features(
+                features=features,
+                candle_aggregator=self.candle_aggregator,
+                atr_filter=self.atr_filter,
+                state=state,
+                historical_sync=self.historical_sync,
+            )
+            allowed, p_win = ml_gate(feat)
+            if not allowed:
+                pre_dir = decision.direction.value if decision.direction else None
+                decision = decision.with_conviction(
+                    Conviction.NONE,
+                    skip_reason=f"ML_GATE_REJECTED_p{p_win:.2f}",
+                )
+                logger.info("coordinator.ml_gate_rejected",
+                            p_win=round(p_win, 3), mode=mode, direction=pre_dir)
+
+        # Edge profile gate — LIVE LANE ONLY. Restricts live trading to the
+        # subset of setups validated by paper-trading attribution. Paper is
+        # never affected so it keeps generating training data.
+        if (mode == "live"
+                and settings.edge_profile.enabled
+                and decision.should_trade_in(mode)):
+            edge_ok, edge_reason = evaluate_edge_profile(
+                decision=decision, entry_price=None,
+            )
+            if not edge_ok:
+                pre_dir = decision.direction.value if decision.direction else None
+                decision = decision.with_conviction(
+                    Conviction.NONE, skip_reason=edge_reason,
+                )
+                logger.info("coordinator.edge_profile_rejected",
+                            reason=edge_reason, mode=mode, direction=pre_dir,
+                            driver=decision.signal_driver)
+
         if decision.should_trade_in(mode):
             entry_price = self._get_entry_price(state, decision.direction)
             if entry_price is not None and entry_price > 0:
@@ -1044,9 +1136,41 @@ class Coordinator:
                                     reason=guard_reason, mode=mode)
                     return
 
+                # Edge profile price cap (LIVE only) — checked here because
+                # entry_price is finally known. The pre-filter above already
+                # rejected wrong direction / driver / hour for cheap signals.
+                if mode == "live" and settings.edge_profile.enabled:
+                    edge_ok, edge_reason = evaluate_edge_profile(
+                        decision=decision, entry_price=entry_price,
+                    )
+                    if not edge_ok:
+                        logger.info("coordinator.edge_profile_rejected",
+                                    reason=edge_reason, mode=mode,
+                                    price=entry_price,
+                                    direction=decision.direction.value,
+                                    driver=decision.signal_driver)
+                        asyncio.create_task(self._persist_signal(
+                            state, features, decision, edge_reason,
+                            roc_value=roc_val,
+                        ))
+                        return
+
                 ticker = state.kalshi_ticker or symbol
 
                 if mode == "live":
+                    # BUG-022 follow-up: don't even spin up the entry task
+                    # if the position manager would refuse this ticker (e.g.
+                    # because it's still in the post-phantom cooldown
+                    # window). Avoids burning the lock on a no-op.
+                    pm = self.live_trader.position_manager
+                    if not pm.can_enter_ticker(ticker):
+                        if self._tick_count % 30 == 0:
+                            logger.info(
+                                "coordinator.live_entry_skipped_pm_refused",
+                                ticker=ticker,
+                                reason="cooldown_or_state",
+                            )
+                        return
                     self._live_entry_in_flight = True
                     asyncio.create_task(self._handle_live_entry(
                         trader, ticker, decision, entry_price, regime,
@@ -1439,9 +1563,9 @@ class Coordinator:
                     rows = await conn.execute(
                         """SELECT date, total_trades, total_pnl, attribution
                            FROM daily_attribution
-                           WHERE date >= %s AND date <= %s
+                           WHERE date >= %s AND date <= %s AND trading_mode = %s
                            ORDER BY date""",
-                        (week_start.isoformat(), week_end.isoformat()),
+                        (week_start.isoformat(), week_end.isoformat(), self.trading_mode),
                     )
                     result = await rows.fetchall()
 
@@ -1490,8 +1614,8 @@ class Coordinator:
                 async with pool.connection() as conn:
                     rows = await conn.execute(
                         """SELECT date, attribution FROM daily_attribution
-                           WHERE date >= %s AND date <= %s""",
-                        (prior_start.isoformat(), prior_end.isoformat()),
+                           WHERE date >= %s AND date <= %s AND trading_mode = %s""",
+                        (prior_start.isoformat(), prior_end.isoformat(), self.trading_mode),
                     )
                     prior_rows = await rows.fetchall()
 
@@ -1627,13 +1751,55 @@ class Coordinator:
         return False
 
     async def _persist_trade(self, trade, mode: str = "paper") -> tuple[bool, Optional[int]]:
-        """Persist trade to DB. Returns (quarantined, trade_id)."""
+        """Persist trade to DB. Returns (quarantined, trade_id).
+
+        BUG-025: For live trades we additionally read the post-exit wallet
+        balance, diff against the pre-entry snapshot captured by
+        ``PositionManager.enter``, and quarantine when the recorded PnL
+        drifts from the actual cash movement by more than
+        ``WALLET_DRIFT_QUARANTINE_DOLLARS``. The recorded PnL itself is
+        unchanged (cost-based formula stays authoritative for downstream
+        attribution); the drift surface is purely diagnostic.
+        """
+        WALLET_DRIFT_QUARANTINE_DOLLARS = 0.05
+
         try:
             pool = self._pool
             if pool is None:
                 return False, None
 
             sizer = self.live_sizer if mode == "live" else self.paper_sizer
+
+            # ── BUG-025 wallet-PnL reconciliation (live only) ──────────
+            wallet_pnl: Optional[float] = None
+            pnl_drift: Optional[float] = None
+            wallet_pre = getattr(trade, "wallet_at_entry", None)
+            entry_fill_source = getattr(trade, "entry_fill_source", "order_response") or "order_response"
+            exit_fill_source = getattr(trade, "exit_fill_source", "order_response") or "order_response"
+            entry_cost_dollars = getattr(trade, "entry_cost_dollars", None)
+            exit_cost_dollars = getattr(trade, "exit_cost_dollars", None)
+            if mode == "live" and wallet_pre is not None:
+                try:
+                    bal = await self.live_trader.client.get_balance()
+                    wallet_post = float(bal.get("balance", 0)) / 100.0
+                    wallet_pnl = round(wallet_post - wallet_pre, 4)
+                    pnl_drift = round(abs(trade.pnl - wallet_pnl), 4)
+                    logger.info(
+                        "coordinator.pnl_reconciliation",
+                        ticker=trade.ticker,
+                        recorded_pnl=trade.pnl,
+                        wallet_pnl=wallet_pnl,
+                        pnl_drift=pnl_drift,
+                        wallet_pre=wallet_pre,
+                        wallet_post=wallet_post,
+                        entry_fill_source=entry_fill_source,
+                        exit_fill_source=exit_fill_source,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "coordinator.wallet_reconciliation_failed",
+                        ticker=trade.ticker, error=str(e),
+                    )
 
             error_reason = None
             if mode == "live":
@@ -1643,8 +1809,29 @@ class Coordinator:
                 elif trade.candles_held == 0 and trade.exit_reason == "STOP_LOSS":
                     error_reason = "INSTANT_STOP_LOSS"
 
+            # BUG-025: even if the trade is otherwise clean, quarantine
+            # when wallet drift is meaningful so attribution doesn't
+            # silently absorb the error. Settlement-closed trades skip
+            # this -- exit_fill_source == "settlement" means there's no
+            # exit cost to compare against so drift is structural.
+            drift_quarantine = (
+                mode == "live"
+                and pnl_drift is not None
+                and pnl_drift > WALLET_DRIFT_QUARANTINE_DOLLARS
+                and exit_fill_source != "settlement"
+            )
+            if drift_quarantine and not error_reason:
+                error_reason = (
+                    f"BUG-025: PnL drift ${pnl_drift:.2f} "
+                    f"(recorded={trade.pnl:.2f}, wallet={wallet_pnl:.2f})"
+                )
+
             if error_reason:
-                sizer.reverse_trade(trade.pnl)
+                # Drift-only quarantines do NOT reverse the trade against
+                # the sizer -- the cost-based PnL is still our best
+                # estimate and the drift is being tracked separately.
+                if not drift_quarantine:
+                    sizer.reverse_trade(trade.pnl)
                 async with pool.connection() as conn:
                     await conn.execute(
                         """INSERT INTO errored_trades
@@ -1665,31 +1852,53 @@ class Coordinator:
                             error_reason, mode,
                         ),
                     )
-                logger.warning(
-                    "coordinator.trade_quarantined",
-                    ticker=trade.ticker,
-                    reason=error_reason,
-                    pnl=trade.pnl,
-                    rapid_count=self._rapid_fire_count,
-                    mode=mode,
-                )
-                asyncio.create_task(get_notifier().trade_quarantined(
-                    ticker=trade.ticker,
-                    direction=trade.direction,
-                    pnl=trade.pnl,
-                    error_reason=error_reason,
-                    rapid_count=self._rapid_fire_count,
-                ))
-                return True, None
+                if drift_quarantine:
+                    logger.warning(
+                        "coordinator.pnl_reconciliation_drift",
+                        ticker=trade.ticker,
+                        recorded_pnl=trade.pnl,
+                        wallet_pnl=wallet_pnl,
+                        drift=pnl_drift,
+                        threshold=WALLET_DRIFT_QUARANTINE_DOLLARS,
+                    )
+                else:
+                    logger.warning(
+                        "coordinator.trade_quarantined",
+                        ticker=trade.ticker,
+                        reason=error_reason,
+                        pnl=trade.pnl,
+                        rapid_count=self._rapid_fire_count,
+                        mode=mode,
+                    )
+                    asyncio.create_task(get_notifier().trade_quarantined(
+                        ticker=trade.ticker,
+                        direction=trade.direction,
+                        pnl=trade.pnl,
+                        error_reason=error_reason,
+                        rapid_count=self._rapid_fire_count,
+                    ))
+                # Drift quarantines still record the trade row below so
+                # attribution counts the round-trip; only the structural
+                # quarantines (rapid fire, instant stop) suppress the
+                # main row. Mirror the prior behavior here.
+                if not drift_quarantine:
+                    return True, None
 
+            # BUG-025: persist reconciliation columns alongside the row.
+            # The new schema uses ``ADD COLUMN IF NOT EXISTS`` so older
+            # DBs without migration 006 will still throw -- that is OK
+            # because the migration runs as part of the same deploy.
             async with pool.connection() as conn:
                 row = await conn.execute(
                     """INSERT INTO trades
                        (timestamp, ticker, direction, side, contracts, entry_price,
                         exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                         regime_at_entry, candles_held, entry_obi, entry_roc,
-                        signal_driver, closed_at, trading_mode)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                        signal_driver, closed_at, trading_mode,
+                        entry_cost_dollars, exit_cost_dollars,
+                        wallet_pnl, pnl_drift, fill_source)
+                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s,
+                               %s, %s, %s, %s, %s)
                        RETURNING id""",
                     (
                         trade.ticker, trade.direction,
@@ -1701,6 +1910,12 @@ class Coordinator:
                         getattr(trade, "entry_roc", 0.0) or 0.0,
                         getattr(trade, "signal_driver", "-") or "-",
                         mode,
+                        entry_cost_dollars, exit_cost_dollars,
+                        wallet_pnl, pnl_drift,
+                        # Pick the most informative source: prefer the
+                        # exit leg, fall back to entry, default to the
+                        # legacy label.
+                        exit_fill_source if exit_fill_source != "settlement" else entry_fill_source,
                     ),
                 )
                 result = await row.fetchone()

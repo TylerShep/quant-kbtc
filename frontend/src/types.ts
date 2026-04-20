@@ -140,6 +140,7 @@ export interface OrphanedPosition {
   contracts: number;
   avg_entry_price: number;
   detected_at: string;
+  cause?: string | null;
 }
 
 export interface Decision {

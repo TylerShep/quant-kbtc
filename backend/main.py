@@ -164,6 +164,10 @@ async def lifespan(app: FastAPI):
     )
 
     notifier = init_notifier()
+
+    from ml.inference import load_model
+    load_model()
+
     await coordinator.start()
 
     await notifier.bot_started(

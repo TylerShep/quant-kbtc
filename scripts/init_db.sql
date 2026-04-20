@@ -50,29 +50,38 @@ CREATE INDEX IF NOT EXISTS idx_signal_ticker ON signal_log (ticker, timestamp DE
 
 -- Trade records
 CREATE TABLE IF NOT EXISTS trades (
-    id              BIGSERIAL,
-    timestamp       TIMESTAMPTZ     NOT NULL,
-    ticker          VARCHAR(60)     NOT NULL,
-    direction       VARCHAR(10)     NOT NULL,
-    side            VARCHAR(10)     NOT NULL,
-    contracts       INTEGER         NOT NULL,
-    entry_price     NUMERIC(10,4)   NOT NULL,
-    exit_price      NUMERIC(10,4),
-    pnl             NUMERIC(14,4),
-    pnl_pct         NUMERIC(8,4),
-    fees            NUMERIC(10,4),
-    exit_reason     VARCHAR(40),
-    conviction      VARCHAR(10),
-    regime_at_entry VARCHAR(10),
-    candles_held    INTEGER,
-    entry_obi       NUMERIC(6,4),
-    entry_roc       NUMERIC(10,4),
-    signal_driver   VARCHAR(32),
-    closed_at       TIMESTAMPTZ,
-    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper'
+    id                  BIGSERIAL,
+    timestamp           TIMESTAMPTZ     NOT NULL,
+    ticker              VARCHAR(60)     NOT NULL,
+    direction           VARCHAR(10)     NOT NULL,
+    side                VARCHAR(10)     NOT NULL,
+    contracts           INTEGER         NOT NULL,
+    entry_price         NUMERIC(10,4)   NOT NULL,
+    exit_price          NUMERIC(10,4),
+    pnl                 NUMERIC(14,4),
+    pnl_pct             NUMERIC(8,4),
+    fees                NUMERIC(10,4),
+    exit_reason         VARCHAR(40),
+    conviction          VARCHAR(10),
+    regime_at_entry     VARCHAR(10),
+    candles_held        INTEGER,
+    entry_obi           NUMERIC(6,4),
+    entry_roc           NUMERIC(10,4),
+    signal_driver       VARCHAR(32),
+    closed_at           TIMESTAMPTZ,
+    trading_mode        VARCHAR(10)     NOT NULL DEFAULT 'paper',
+    -- BUG-025 reconciliation columns (mirrored in 006_pnl_reconciliation.sql)
+    entry_cost_dollars  NUMERIC(10,4),
+    exit_cost_dollars   NUMERIC(10,4),
+    wallet_pnl          NUMERIC(14,4),
+    pnl_drift           NUMERIC(10,4),
+    fill_source         VARCHAR(20)     DEFAULT 'order_response'
 );
 SELECT create_hypertable('trades', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_pnl_drift
+    ON trades (pnl_drift DESC NULLS LAST) WHERE pnl_drift IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_trades_fill_source ON trades (fill_source);
 
 -- Bankroll history
 CREATE TABLE IF NOT EXISTS bankroll_history (
@@ -124,14 +133,15 @@ CREATE TABLE IF NOT EXISTS param_recommendations (
 );
 SELECT create_hypertable('param_recommendations', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 
--- Daily attribution snapshots (one row per calendar day)
+-- Daily attribution snapshots (one row per calendar day per mode)
 CREATE TABLE IF NOT EXISTS daily_attribution (
-    date            DATE            NOT NULL PRIMARY KEY,
+    date            DATE            NOT NULL,
     total_trades    INTEGER         NOT NULL,
     total_pnl       NUMERIC(14,4)   NOT NULL,
     attribution     JSONB           NOT NULL,
     trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'paper',
-    created_at      TIMESTAMPTZ     DEFAULT NOW()
+    created_at      TIMESTAMPTZ     DEFAULT NOW(),
+    PRIMARY KEY (date, trading_mode)
 );
 
 -- Bot state (key-value for heartbeat, bankroll persistence, etc.)

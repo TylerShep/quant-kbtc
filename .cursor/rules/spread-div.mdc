@@ -31,12 +31,18 @@ Where `spread_z = (current_spread - baseline_median) / baseline_median`, and `ba
 | Resolver output | SpreadState | Final conviction | Notes                              |
 |-----------------|-------------|------------------|-------------------------------------|
 | HIGH            | WIDE        | NORMAL           | Downgrade one step                  |
-| HIGH            | TIGHT       | HIGH             | Already max — no upgrade possible   |
+| HIGH            | TIGHT       | HIGH             | Already at ceiling — no change      |
 | NORMAL          | WIDE        | LOW              | Downgrade one step                  |
-| NORMAL          | TIGHT       | HIGH             | Upgrade one step                    |
+| NORMAL          | TIGHT       | NORMAL           | Capped — upgrade ceiling is NORMAL  |
 | LOW             | WIDE        | NONE             | Drop entirely; skip reason `SPREAD_WIDE_DOWNGRADE` |
 | LOW             | TIGHT       | NORMAL           | Upgrade one step                    |
 | NONE            | any         | NONE             | NEVER upgrade from NONE             |
+
+> **Why NORMAL is the ceiling**: Production paper trading showed NORMAL→HIGH upgrades
+> (OBI/TIGHT) were net -$329 across 10 trades (50% win rate, -$32.93 avg). The 1.30x
+> HIGH sizing amplified losses on single-signal OBI trades. LOW→NORMAL upgrades
+> (ROC/TIGHT) were +$276 across 14 trades — the modest upgrade works, the aggressive
+> one doesn't.
 
 ## Parameters (env-driven via `SpreadDivConfig`)
 

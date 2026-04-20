@@ -219,6 +219,90 @@ class HistoricalSyncConfig:
 
 
 @dataclass(frozen=True)
+class EdgeProfileConfig:
+    """Live-lane-only filter profile derived from paper trading attribution.
+
+    Empirical 7-day analysis (2026-04-13 → 2026-04-19, 245 clean trades)
+    showed a statistically significant long-side edge (t=3.31), short-side
+    anti-edge (t=-2.17), and that cheap entries (<$25) and OBI+ROC agreement
+    setups carry the bulk of expectancy. This config restricts the LIVE
+    lane to that validated subset while paper continues unfiltered for
+    ongoing data collection and ML training.
+
+    Default OFF — flip ``EDGE_LIVE_PROFILE_ENABLED=true`` to activate.
+    Paper lane is never affected by this profile.
+    """
+    enabled: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_PROFILE_ENABLED", False))
+    long_only: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_LONG_ONLY", True))
+    block_low_conviction: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_BLOCK_LOW_CONVICTION", True))
+    max_entry_price: float = field(default_factory=lambda: _env_float("EDGE_LIVE_MAX_ENTRY_PRICE", 25.0))
+    agreement_overrides_price_cap: bool = field(
+        default_factory=lambda: _env_bool("EDGE_LIVE_AGREEMENT_OVERRIDES_PRICE_CAP", True)
+    )
+    allowed_drivers: str = field(
+        default_factory=lambda: _env(
+            "EDGE_LIVE_ALLOWED_DRIVERS",
+            "OBI,OBI+ROC,ROC,ROC/TIGHT",
+        )
+    )
+    blocked_hours_utc: str = field(
+        default_factory=lambda: _env(
+            "EDGE_LIVE_BLOCKED_HOURS_UTC",
+            "0,1,2,3,4,5,6,7",
+        )
+    )
+
+    @property
+    def allowed_drivers_set(self) -> set[str]:
+        """Parse comma-separated driver list into a set of base labels."""
+        return {d.strip() for d in self.allowed_drivers.split(",") if d.strip()}
+
+    @property
+    def blocked_hours_set(self) -> set[int]:
+        """Parse comma-separated hour list into a set of ints (0-23)."""
+        out: set[int] = set()
+        for h in self.blocked_hours_utc.split(","):
+            h = h.strip()
+            if not h:
+                continue
+            try:
+                hi = int(h)
+                if 0 <= hi <= 23:
+                    out.add(hi)
+            except ValueError:
+                continue
+        return out
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    """Live-execution toggles separate from the always-on bot config.
+
+    Currently a single feature flag for the BUG-025 fill-stream wiring.
+    Defaults to ON so production picks it up immediately; can be flipped
+    via env to revert to the legacy polled-order-response path with no
+    redeploy.
+    """
+    use_fill_stream: bool = field(
+        default_factory=lambda: _env_bool("LIVE_USE_FILL_STREAM", True)
+    )
+
+
+@dataclass(frozen=True)
+class MLConfig:
+    """Production ML inference gate. Stays dormant until a trained model
+    artifact is dropped into backend/ml/models/ and ML_GATE_ENABLED=true.
+
+    Design follows fail-open in inference.py: when no model file exists,
+    `ml_gate()` returns (True, 1.0) and trades pass through unchanged.
+    """
+    gate_enabled: bool = field(default_factory=lambda: _env_bool("ML_GATE_ENABLED", False))
+    gate_paper: bool = field(default_factory=lambda: _env_bool("ML_GATE_PAPER", True))
+    gate_live: bool = field(default_factory=lambda: _env_bool("ML_GATE_LIVE", False))
+    min_p_win: float = field(default_factory=lambda: _env_float("ML_MIN_P_WIN", 0.0))
+
+
+@dataclass(frozen=True)
 class Settings:
     kalshi: KalshiConfig = field(default_factory=KalshiConfig)
     spot: SpotConfig = field(default_factory=SpotConfig)
@@ -229,7 +313,10 @@ class Settings:
     spread_div: SpreadDivConfig = field(default_factory=SpreadDivConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     bot: BotConfig = field(default_factory=BotConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     historical_sync: HistoricalSyncConfig = field(default_factory=HistoricalSyncConfig)
+    ml: MLConfig = field(default_factory=MLConfig)
+    edge_profile: EdgeProfileConfig = field(default_factory=EdgeProfileConfig)
 
 
 settings = Settings()

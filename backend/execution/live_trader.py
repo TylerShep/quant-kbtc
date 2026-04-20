@@ -16,6 +16,7 @@ import structlog
 
 from config import settings
 
+from data.fill_stream import FillStream
 from data.kalshi_ws import KalshiOrderClient
 from execution.position_manager import PositionManager, ManagedPosition
 from risk.position_sizer import PositionSizer
@@ -44,15 +45,29 @@ class LiveTrade:
     entry_obi: float = 0.0
     entry_roc: float = 0.0
     signal_driver: str = "-"
+    # BUG-025: reconciliation context propagated from PositionManager.
+    entry_cost_dollars: Optional[float] = None
+    exit_cost_dollars: Optional[float] = None
+    entry_fill_source: str = "order_response"
+    exit_fill_source: str = "order_response"
+    wallet_at_entry: Optional[float] = None
 
 
 class LiveTrader:
     FEE_RATE = 0.007
 
-    def __init__(self, sizer: PositionSizer):
+    def __init__(
+        self,
+        sizer: PositionSizer,
+        fill_stream: Optional[FillStream] = None,
+    ):
         self.sizer = sizer
         self.client = KalshiOrderClient()
-        self.position_manager = PositionManager(self.client)
+        # BUG-025: optional fill-stream subscriber. Constructed by main()
+        # alongside the live wiring; left None for paper/dev so unit tests
+        # don't have to stand up a WebSocket auth flow.
+        self.fill_stream = fill_stream
+        self.position_manager = PositionManager(self.client, fill_stream=fill_stream)
         self.trades: list[LiveTrade] = []
 
     # ── Backward-compatible properties ────────────────────────────────
@@ -209,6 +224,11 @@ class LiveTrader:
             entry_obi=result.get("entry_obi", 0.0),
             entry_roc=result.get("entry_roc", 0.0),
             signal_driver=result.get("signal_driver", "-"),
+            entry_cost_dollars=result.get("entry_cost_dollars"),
+            exit_cost_dollars=result.get("exit_cost_dollars"),
+            entry_fill_source=result.get("entry_fill_source", "order_response"),
+            exit_fill_source=result.get("exit_fill_source", "order_response"),
+            wallet_at_entry=result.get("wallet_at_entry"),
         )
 
     def get_state(self) -> dict:

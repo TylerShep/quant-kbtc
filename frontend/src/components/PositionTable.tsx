@@ -133,8 +133,11 @@ function PositionsView({ position, orphanedPositions }: {
           <tr key={o.ticker} className="border-t border-[var(--border)] opacity-70">
             <td className="px-4 py-2 font-mono text-[var(--yellow,#eab308)]">{o.ticker}</td>
             <td className="px-4 py-2">
-              <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-[var(--yellow-dim,rgba(234,179,8,0.15))] text-[var(--yellow,#eab308)]">
-                ORPHAN
+              <span
+                className="px-2 py-0.5 rounded text-[10px] font-medium bg-[var(--yellow-dim,rgba(234,179,8,0.15))] text-[var(--yellow,#eab308)]"
+                title={o.cause === 'EXPIRY_409' ? 'Settlement reached via 409 Conflict at expiry' : undefined}
+              >
+                {o.cause === 'EXPIRY_409' ? 'EXPIRY-409' : 'ORPHAN'}
               </span>
             </td>
             <td className="px-4 py-2">

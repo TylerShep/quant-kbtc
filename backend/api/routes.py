@@ -154,6 +154,19 @@ async def status():
         except Exception:
             pass
 
+    fill_stream_status = None
+    if coordinator.fill_stream is not None:
+        fs = coordinator.fill_stream
+        fill_stream_status = {
+            "connected": bool(fs.connected),
+            "message_count": fs.message_count,
+            "last_message_age_sec": (
+                round(time.time() - fs.last_message_time, 2)
+                if fs.last_message_time is not None else None
+            ),
+            "connect_attempts": fs.connect_attempts,
+        }
+
     return {
         "market_states": states,
         "atr": coordinator.atr_filter.get_state(),
@@ -170,6 +183,7 @@ async def status():
         "live_decision": coordinator._serialize_decision("live") if coordinator.live_enabled else None,
         "paper_risk": coordinator.paper_breaker.get_state(),
         "live_risk": coordinator.live_breaker.get_state(),
+        "fill_stream": fill_stream_status,
     }
 
 
