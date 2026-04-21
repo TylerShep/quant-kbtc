@@ -2,6 +2,10 @@
 
 Automated trading bot for Kalshi's BTC 15-minute prediction markets. Combines Order Book Imbalance (OBI) and Rate of Change (ROC) momentum signals with ATR-based volatility regime filtering, automated risk management, and a real-time dashboard.
 
+![KBTC dashboard — equity, BTC price, OBI, ATR regime, and trade history](docs/images/dashboard.png)
+
+> Real-time dashboard: equity curve, BTC price with EMA overlays, OBI / ATR regime indicators, and live trade attribution. The screenshot above shows a paper-trading session — 315 trades, 49.5% win rate, +$10,648 cumulative PnL.
+
 ## Architecture
 
 ```
