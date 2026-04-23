@@ -1,17 +1,68 @@
+# Secrets & credentials
 .env
+.env.*
+!.env.example
+!.env.canary.example
 *.pem
 *.key
+*.crt
+*.cer
+*.p12
+*.pfx
 .secrets/
-__pycache__/
-*.pyc
-.pytest_cache/
+id_rsa*
+id_ed25519*
+*.ppk
+
+# Python
+**/__pycache__/
+**/*.pyc
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# Build artifacts
 dist/
 build/
 .venv/
 venv/
-*.log
-backtest_reports/
-node_modules/
 frontend/dist/
-.DS_Store
+
+# Editor / OS
+**/.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+
+# Trading bot data & artifacts
+backtest_reports/
+kbtc-backups/
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+
+# ML model artifacts (keep .gitkeep)
+backend/ml/models/*
+!backend/ml/models/.gitkeep
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.pt
+*.pth
+*.parquet

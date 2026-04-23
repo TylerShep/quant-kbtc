@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Usage: bash scripts/phantom_entry_monitor.sh [user@host]
 
-REMOTE="${1:-botuser@167.71.247.154}"
+REMOTE="${1:-${KBTC_DEPLOY_HOST:-deploy@your-host}}"
 
 echo "=== BUG-022 Phantom-Entry Monitor ==="
 echo "Remote: ${REMOTE}"

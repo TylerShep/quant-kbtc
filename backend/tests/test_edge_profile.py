@@ -131,7 +131,10 @@ def test_blocks_obi_tight_driver(override_edge):
 
 
 def test_allows_roc_tight_driver(override_edge):
-    """ROC/TIGHT was net +$276 in paper — must be in the default allowlist."""
+    """ROC/TIGHT is not in the live default allowlist as of 2026-04-21
+    (9-day counterfactual showed decay to 1d -$618 / 3d -$284 with 22% short WR),
+    but when an operator opts it back in via env, the filter must still honor it.
+    This test pins that the allowlist machinery works for ROC/TIGHT."""
     override_edge(enabled=True, blocked_hours_utc="",
                   allowed_drivers="OBI,OBI+ROC,ROC,ROC/TIGHT",
                   block_low_conviction=False)
@@ -301,7 +304,11 @@ def test_defaults_off_until_explicitly_enabled():
     assert "OBI" in cfg.allowed_drivers_set
     assert "OBI+ROC" in cfg.allowed_drivers_set
     assert "ROC" in cfg.allowed_drivers_set
-    assert "ROC/TIGHT" in cfg.allowed_drivers_set
+    assert "ROC/TIGHT" not in cfg.allowed_drivers_set, (
+        "ROC/TIGHT was removed 2026-04-21 after 9-day paper counterfactual "
+        "showed 1d -$618, 3d -$284, 7d +$61 with shorts at 22% WR. "
+        "Must NOT be in the default allowlist until walk-forward re-validation."
+    )
     assert "OBI/TIGHT" not in cfg.allowed_drivers_set, (
         "OBI/TIGHT was net -$329 in paper attribution — must NOT be in "
         "the default allowlist."

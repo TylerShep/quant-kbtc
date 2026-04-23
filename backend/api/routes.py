@@ -6,9 +6,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
+from api.auth import require_api_token
 from database import get_pool
 
 
@@ -187,10 +188,21 @@ async def status():
     }
 
 
-@router.post("/trading-mode")
+@router.post("/trading-mode", dependencies=[Depends(require_api_token)])
 async def set_trading_mode(req: TradingModeRequest):
-    """Switch between paper and live trading modes."""
+    """Switch between paper and live trading modes.
+
+    Switching to live used to block on a synchronous Kalshi /portfolio/balance
+    fetch; that endpoint has a long tail (we've measured 15s+ in the wild),
+    so the toggle felt sluggish or hung. We now flip the mode immediately
+    and run the wallet refresh in the background, broadcasting the fresh
+    bankroll over WebSocket once it lands. The cached ``live_sizer.bankroll``
+    (last persisted on the previous sync) is correct enough to size a trade
+    against; the periodic reconciler will overwrite it within 30s if the
+    background fetch hiccups.
+    """
     from main import coordinator
+    import asyncio
 
     if req.mode not in ("paper", "live"):
         return {"error": "Mode must be 'paper' or 'live'", "success": False}
@@ -218,20 +230,13 @@ async def set_trading_mode(req: TradingModeRequest):
     if old_mode == req.mode:
         return {"success": True, "mode": req.mode, "message": f"Already in {req.mode} mode"}
 
-    if req.mode == "live":
-        try:
-            wallet = await coordinator.sync_live_bankroll()
-        except Exception as e:
-            return {
-                "error": f"Failed to fetch Kalshi balance: {e}",
-                "success": False,
-            }
-
     coordinator.trading_mode = req.mode
     if req.mode == "paper":
         coordinator.trading_paused = "off"
-    import asyncio
     asyncio.create_task(coordinator._save_state())
+
+    if req.mode == "live":
+        asyncio.create_task(_refresh_live_bankroll_in_background())
 
     resp = {
         "success": True,
@@ -241,10 +246,36 @@ async def set_trading_mode(req: TradingModeRequest):
     }
     if req.mode == "live":
         resp["live_bankroll"] = round(coordinator.live_sizer.bankroll, 2)
+        resp["bankroll_refresh"] = "pending"
     return resp
 
 
-@router.post("/reset-drawdown")
+async def _refresh_live_bankroll_in_background() -> None:
+    """Fetch fresh Kalshi balance after a live-mode toggle and notify
+    dashboards. Failures are non-fatal — the cached bankroll keeps the bot
+    operational and the periodic reconciler will retry within 30s."""
+    from main import coordinator
+    from api.ws import ws_manager
+    import structlog
+
+    log = structlog.get_logger(__name__)
+    try:
+        wallet = await coordinator.sync_live_bankroll()
+        await ws_manager.broadcast({
+            "type": "live_bankroll_refreshed",
+            "wallet": round(wallet, 2),
+            "live_bankroll": round(coordinator.live_sizer.bankroll, 2),
+        })
+    except Exception as e:
+        log.warning("api.toggle_bankroll_refresh_failed", error=str(e))
+        await ws_manager.broadcast({
+            "type": "live_bankroll_refresh_failed",
+            "error": str(e),
+            "live_bankroll": round(coordinator.live_sizer.bankroll, 2),
+        })
+
+
+@router.post("/reset-drawdown", dependencies=[Depends(require_api_token)])
 async def reset_drawdown(mode: str = None):
     """Reset drawdown peak to current bankroll for the given mode (paper/live)."""
     from main import coordinator
@@ -278,7 +309,7 @@ async def reset_drawdown(mode: str = None):
     }
 
 
-@router.post("/trade-limit")
+@router.post("/trade-limit", dependencies=[Depends(require_api_token)])
 async def set_trade_limit(req: dict = {}):
     """Set or reset the live trade limit.
 
@@ -306,7 +337,7 @@ async def set_trade_limit(req: dict = {}):
     }
 
 
-@router.post("/trading-pause")
+@router.post("/trading-pause", dependencies=[Depends(require_api_token)])
 async def set_trading_pause(req: TradingPauseRequest):
     """Pause or resume automated trading. Pausing stops new entries but allows exits."""
     from main import coordinator
@@ -384,7 +415,7 @@ async def deploy_check():
     }
 
 
-@router.post("/emergency-stop")
+@router.post("/emergency-stop", dependencies=[Depends(require_api_token)])
 async def emergency_stop():
     """Kill switch: force-close all positions and halt trading immediately.
 
@@ -430,7 +461,7 @@ async def emergency_stop():
     return results
 
 
-@router.post("/close-all-exchange-positions")
+@router.post("/close-all-exchange-positions", dependencies=[Depends(require_api_token)])
 async def close_all_exchange_positions():
     """Query Kalshi for ALL open positions and close them directly on the exchange.
 
@@ -771,7 +802,7 @@ async def get_param_overrides():
     }
 
 
-@router.delete("/param-overrides")
+@router.delete("/param-overrides", dependencies=[Depends(require_api_token)])
 async def clear_param_overrides():
     """Clear parameter overrides, reverting to defaults."""
     from main import coordinator

@@ -2,8 +2,8 @@
 Offline XGBoost training script for the ML entry gate.
 
 Usage:
-    # Export data from DB first:
-    #   ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc \
+    # Export data from DB first (set KBTC_DEPLOY_HOST=user@host):
+    #   ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc \
     #     -c \"COPY (SELECT * FROM trade_features WHERE label IS NOT NULL) TO STDOUT CSV HEADER\"" \
     #     > trade_features_export.csv
     #
@@ -12,6 +12,15 @@ Usage:
 
     # Or connect directly to the DB:
     #   python scripts/train_xgb.py --db-url postgresql://kalshi:kalshi_secret@localhost:5432/kbtc
+
+Feature invariant (READ BEFORE EDITING ENTRY_FEATURES):
+    Every name in ENTRY_FEATURES must be a key in the dict returned by
+    `backend/ml/feature_capture.py::extract_features()` at trade-entry time.
+    NEVER add columns that are populated only at trade exit (e.g. label, pnl,
+    max_favorable_excursion, max_adverse_excursion) -- those are outcome data
+    and including them creates label leakage during training plus silent
+    `feature_dict.get(..., 0)` substitution during live inference.
+    The contract is enforced by `backend/tests/test_train_serve_features.py`.
 """
 from __future__ import annotations
 
@@ -36,11 +45,6 @@ ENTRY_FEATURES = [
     "atr_pct", "spread_pct", "bid_depth", "ask_depth",
     "green_candles_3", "candle_body_pct", "volume_ratio",
     "time_remaining_sec", "hour_of_day", "day_of_week",
-]
-
-TRAINING_FEATURES = ENTRY_FEATURES + [
-    "max_favorable_excursion",
-    "max_adverse_excursion",
 ]
 
 
@@ -68,13 +72,13 @@ def load_data(csv_path: str | None = None, db_url: str | None = None) -> pd.Data
 def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
     df["binary_label"] = (df["label"] == 1).astype(int)
 
-    available_features = [f for f in TRAINING_FEATURES if f in df.columns]
-    has_mfe_mae = "max_favorable_excursion" in df.columns and "max_adverse_excursion" in df.columns
-    if has_mfe_mae:
-        mfe_null_pct = df["max_favorable_excursion"].isna().mean()
-        if mfe_null_pct > 0.5:
-            print(f"WARNING: {mfe_null_pct:.0%} of MFE values are NULL, excluding MFE/MAE from features")
-            available_features = ENTRY_FEATURES
+    missing = [f for f in ENTRY_FEATURES if f not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Training data is missing required entry-time columns: {missing}. "
+            "Run the migration / re-export trade_features."
+        )
+    available_features = list(ENTRY_FEATURES)
 
     X = df[available_features].fillna(0)
     y = df["binary_label"]
@@ -82,9 +86,8 @@ def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
     print(f"\n{'=' * 60}")
     print(f"Training XGBoost entry gate")
     print(f"  Rows: {len(df)}")
-    print(f"  Features: {len(available_features)}")
+    print(f"  Features: {len(available_features)} (entry-time only)")
     print(f"  Win rate: {y.mean():.1%}")
-    print(f"  MFE/MAE available: {has_mfe_mae and 'max_favorable_excursion' in available_features}")
     print(f"{'=' * 60}\n")
 
     model = XGBClassifier(

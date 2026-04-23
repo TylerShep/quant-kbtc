@@ -22,9 +22,10 @@ export interface Features {
 
 export interface WSMessage {
   type: string;
-  symbol: string;
-  data: Features;
-  state: MarketState;
+  symbol?: string;
+  data?: Features;
+  state?: MarketState;
+  [key: string]: unknown;
 }
 
 export interface RiskState {

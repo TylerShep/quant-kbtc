@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Usage: bash scripts/canary_status.sh [user@host]
 
-REMOTE="${1:-botuser@167.71.247.154}"
-PROJECT_DIR="/home/botuser/kbtc"
+REMOTE="${1:-${KBTC_DEPLOY_HOST:-deploy@your-host}}"
+PROJECT_DIR="${KBTC_PROJECT_DIR:-/home/botuser/kbtc}"
 
 echo "=== Canary Stack Status ==="
 echo ""

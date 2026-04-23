@@ -7,7 +7,7 @@ set -euo pipefail
 # Usage: bash scripts/canary_down.sh [--wipe] [user@host]
 #   --wipe  Also remove canary database volumes (full reset)
 
-REMOTE="botuser@167.71.247.154"
+REMOTE="${KBTC_DEPLOY_HOST:-deploy@your-host}"
 WIPE=false
 
 for arg in "$@"; do
@@ -17,7 +17,7 @@ for arg in "$@"; do
   esac
 done
 
-PROJECT_DIR="/home/botuser/kbtc"
+PROJECT_DIR="${KBTC_PROJECT_DIR:-/home/botuser/kbtc}"
 
 echo "=== Canary Stack Teardown ==="
 

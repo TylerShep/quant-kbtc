@@ -209,9 +209,12 @@ class FillStream:
 
         For ``action="buy"`` this is what we paid. For ``action="sell"``
         it's what we received. Sign is intentionally NOT flipped here --
-        ``PositionManager`` already treats both ``entry_cost`` and
-        ``exit_cost`` as positive dollar amounts spent/received and folds
-        them into PnL via ``contracts_value - entry_cost - exit_cost``.
+        ``PositionManager`` treats both ``entry_cost`` and ``exit_cost``
+        as positive dollar amounts (paid / received) and computes mid-
+        flight exit PnL as the cash-flow diff:
+        ``exit_cost - entry_cost - (entry_fees + exit_fees)``. See
+        BUG-027 for the previous (broken) formula and why the $1.00
+        max-payout term was removed for non-settlement exits.
         """
         total = 0.0
         for f in fills:

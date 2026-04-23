@@ -642,3 +642,213 @@ async def test_snapshot_with_unknown_keys_is_filtered():
     # Defaults applied for missing-but-known fields
     assert trader.position_manager.position.entry_fill_source == "order_response"
     assert trader.position_manager.position.wallet_at_entry is None
+
+
+# ── BUG-027: mid-flight PnL formula uses cash flow, not fictional payout ─
+
+
+@pytest.mark.parametrize(
+    "label,direction,entry_cost,exit_cost,entry_fees,exit_fees,expected_pnl",
+    [
+        # Winning long: bought 5 @ $0.30 ($1.50 cost), sold @ $0.70 ($3.50
+        # proceeds), $0.10 round-trip fees => $1.90 net.
+        ("long_winner", "long", 1.50, 3.50, 0.05, 0.05, 1.90),
+        # Losing long: bought 5 @ $0.40 ($2.00 cost), sold @ $0.20 ($1.00
+        # proceeds), $0.08 fees => -$1.08.
+        ("long_loser", "long", 2.00, 1.00, 0.04, 0.04, -1.08),
+        # Scratch trade: bought 5 @ $0.50 ($2.50), sold @ $0.50 ($2.50),
+        # only fees come out.
+        ("scratch", "long", 2.50, 2.50, 0.06, 0.06, -0.12),
+        # Short winner: opened NO 5 @ $0.40 ($2.00 cost), closed @ $0.20
+        # ($1.00 proceeds for the NO leg, since price moved in our favor
+        # the NO contract value rose from $0.60 to $0.80 -- but the
+        # ``exit_cost`` we actually capture is the dollar amount of the
+        # closing trade, regardless of side, so the math is identical).
+        ("short_winner", "short", 2.00, 4.00, 0.05, 0.05, 1.90),
+        # Zero-fee edge case (no taker, no maker): just the cash diff.
+        ("zero_fees", "long", 1.00, 1.50, 0.0, 0.0, 0.50),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mid_flight_pnl_uses_cash_flow_formula(
+    label, direction, entry_cost, exit_cost, entry_fees, exit_fees, expected_pnl,
+):
+    """Mid-flight exits compute PnL as ``exit_cost - entry_cost - fees``.
+
+    The previous (BUG-027) formula was ``contracts*$1 - entry_cost
+    - exit_cost - fees`` which fictionally assumed every contract paid
+    out $1 (only true at settlement) AND treated the sale proceeds
+    as an outflow. This regression test pins the corrected cash-flow
+    formula in place across long/short, winners/losers, and the
+    zero-fee boundary."""
+    trader = _make_trader()
+    pos = _set_position(trader, ticker="KXBTC-PNL", direction=direction,
+                        contracts=5, entry_price=30.0)
+    pos.entry_cost_dollars = entry_cost
+    pos.entry_fees_dollars = entry_fees
+
+    trader.client.create_order = AsyncMock(return_value={
+        "order": {"order_id": "ord-pnl"}
+    })
+    trader.position_manager._poll_order_fill = AsyncMock(return_value={
+        "status": "executed",
+        "fill_count_fp": "5.00",
+        "yes_price": 70 if direction == "long" else 30,
+        "taker_fill_cost_dollars": str(exit_cost),
+        "taker_fees_dollars": str(exit_fees),
+    })
+    trader.position_manager.verify_position_on_exchange = AsyncMock(return_value=0)
+
+    trade = await trader.exit(70.0 if direction == "long" else 30.0, "TEST")
+
+    assert trade is not None, f"{label}: exit returned None"
+    assert trade.pnl == pytest.approx(expected_pnl, abs=1e-4), (
+        f"{label}: expected pnl={expected_pnl} got {trade.pnl}"
+    )
+    # The recorded fees field should always be the round-trip total.
+    assert trade.fees == pytest.approx(entry_fees + exit_fees, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_mid_flight_pnl_does_not_invent_dollar_payout():
+    """Property: a *break-even* round-trip (sold for exactly what we
+    paid) must record PnL == -fees, never a positive number.
+
+    Pre-BUG-027 the formula returned roughly ``contracts - 2*entry_cost
+    - fees`` which for 5 contracts bought at $0.30 ($1.50 cost) showed
+    +$1.90 of "profit" on a true scratch -- the kind of false signal
+    that silently drained the live bankroll."""
+    trader = _make_trader()
+    pos = _set_position(trader, ticker="KXBTC-SCRATCH", contracts=5,
+                        entry_price=30.0)
+    pos.entry_cost_dollars = 1.50
+    pos.entry_fees_dollars = 0.05
+
+    trader.client.create_order = AsyncMock(return_value={
+        "order": {"order_id": "ord-scratch"}
+    })
+    trader.position_manager._poll_order_fill = AsyncMock(return_value={
+        "status": "executed",
+        "fill_count_fp": "5.00",
+        "yes_price": 30,
+        "taker_fill_cost_dollars": "1.50",
+        "taker_fees_dollars": "0.05",
+    })
+    trader.position_manager.verify_position_on_exchange = AsyncMock(return_value=0)
+
+    trade = await trader.exit(30.0, "TEST")
+
+    assert trade is not None
+    assert trade.pnl == pytest.approx(-0.10, abs=1e-6), (
+        f"break-even round-trip should record -fees (-$0.10), got {trade.pnl}"
+    )
+    assert trade.pnl < 0, "scratch trade with fees must never record a profit"
+
+
+@pytest.mark.asyncio
+async def test_mid_flight_pnl_skips_when_entry_cost_unknown():
+    """Backward compat: when entry_cost wasn't captured (e.g. restored
+    from a pre-BUG-025 snapshot), the cost-based formula is skipped
+    and we fall through to the legacy price-based estimate. The point
+    of this test is to make sure the new branch doesn't crash on
+    ``None`` inputs and still records *some* PnL."""
+    trader = _make_trader()
+    _set_position(trader, ticker="KXBTC-LEGACY", contracts=5, entry_price=30.0)
+    # entry_cost_dollars stays None on the position.
+
+    trader.client.create_order = AsyncMock(return_value={
+        "order": {"order_id": "ord-legacy"}
+    })
+    trader.position_manager._poll_order_fill = AsyncMock(return_value={
+        "status": "executed",
+        "fill_count_fp": "5.00",
+        "yes_price": 70,
+    })
+    trader.position_manager.verify_position_on_exchange = AsyncMock(return_value=0)
+
+    trade = await trader.exit(70.0, "TEST")
+    assert trade is not None
+    # Legacy formula must produce a sensible non-NaN number; we don't
+    # pin the exact value to avoid coupling to the price-based estimator
+    # that's slated for removal once every position has cost data.
+    assert isinstance(trade.pnl, float)
+
+
+# ── BUG-027: wallet_at_entry is captured PRE-entry, not POST-entry ──────
+
+
+@pytest.mark.asyncio
+async def test_wallet_at_entry_captured_before_create_order():
+    """``wallet_at_entry`` must be the wallet balance immediately *before*
+    we placed the entry order. Capturing it post-fill (pre-BUG-027)
+    would already have the entry debit baked in, making the round-trip
+    drift metric ``wallet_post - wallet_pre`` only see the exit leg.
+
+    This test asserts capture order via ``MagicMock.mock_calls``: the
+    ``get_balance`` call must precede ``create_order``."""
+    trader = _make_trader()
+    parent = MagicMock()
+    parent.attach_mock(
+        AsyncMock(return_value={"balance": 25_000}),  # $250.00
+        "get_balance",
+    )
+    parent.attach_mock(
+        AsyncMock(return_value={"order": {"order_id": "ord-wallet"}}),
+        "create_order",
+    )
+    trader.client.get_balance = parent.get_balance
+    trader.client.create_order = parent.create_order
+
+    trader.position_manager._check_flat_on_exchange = AsyncMock(return_value=True)
+    trader.position_manager._poll_order_fill = AsyncMock(return_value={
+        "status": "executed", "fill_count_fp": "5.00",
+        "yes_price": 30, "taker_fill_cost_dollars": "1.50",
+        "taker_fees_dollars": "0.05",
+    })
+    trader.position_manager.verify_position_on_exchange = AsyncMock(return_value=5)
+    trader.position_manager._persist_state = AsyncMock()
+
+    pos = await trader.position_manager.enter(
+        ticker="KXBTC-WALLET", direction="long", contracts=5,
+        price=30.0, conviction="NORMAL", regime="MEDIUM",
+    )
+
+    assert pos is not None
+    assert pos.wallet_at_entry == pytest.approx(250.00)
+    # Mock call order: get_balance must come before create_order so the
+    # snapshot reflects the pre-entry balance.
+    call_names = [c[0] for c in parent.mock_calls if c[0] in ("get_balance", "create_order")]
+    assert call_names.index("get_balance") < call_names.index("create_order"), (
+        f"wallet captured AFTER create_order: {call_names}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wallet_at_entry_capture_failure_does_not_block_entry():
+    """If ``get_balance`` raises before order placement, we still go on
+    to place the entry; ``wallet_at_entry`` just stays None and the
+    coordinator's reconciliation skips silently."""
+    trader = _make_trader()
+    trader.client.get_balance = AsyncMock(side_effect=RuntimeError("503"))
+    trader.client.create_order = AsyncMock(return_value={
+        "order": {"order_id": "ord-down"}
+    })
+
+    trader.position_manager._check_flat_on_exchange = AsyncMock(return_value=True)
+    trader.position_manager._poll_order_fill = AsyncMock(return_value={
+        "status": "executed", "fill_count_fp": "5.00",
+        "yes_price": 30, "taker_fill_cost_dollars": "1.50",
+        "taker_fees_dollars": "0.05",
+    })
+    trader.position_manager.verify_position_on_exchange = AsyncMock(return_value=5)
+    trader.position_manager._persist_state = AsyncMock()
+
+    pos = await trader.position_manager.enter(
+        ticker="KXBTC-NOWAL", direction="long", contracts=5,
+        price=30.0, conviction="NORMAL", regime="MEDIUM",
+    )
+
+    assert pos is not None
+    assert pos.wallet_at_entry is None
+    # Entry still completed
+    assert pos.contracts == 5

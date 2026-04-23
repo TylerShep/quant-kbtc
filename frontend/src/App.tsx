@@ -47,7 +47,7 @@ export type ViewMode = 'paper' | 'live';
 
 function App() {
   const { lastMessage, connected } = useWebSocket();
-  const status = useStatus(5000);
+  const { status, refetch: refetchStatus } = useStatus(5000);
   const tradingMode = status?.trading_mode;
   const [viewMode, setViewMode] = useState<ViewMode>('paper');
   const userPickedView = useRef(false);
@@ -92,10 +92,19 @@ function App() {
   }, [viewMode]);
 
   useEffect(() => {
-    if (!lastMessage || lastMessage.type !== 'market_update') return;
-    if (lastMessage.data) setFeatures(lastMessage.data);
-    if (lastMessage.state) setMarketState(lastMessage.state);
-  }, [lastMessage]);
+    if (!lastMessage) return;
+    if (lastMessage.type === 'market_update') {
+      if (lastMessage.data) setFeatures(lastMessage.data);
+      if (lastMessage.state) setMarketState(lastMessage.state);
+      return;
+    }
+    if (
+      lastMessage.type === 'live_bankroll_refreshed'
+      || lastMessage.type === 'live_bankroll_refresh_failed'
+    ) {
+      refetchStatus();
+    }
+  }, [lastMessage, refetchStatus]);
 
   const initialBankroll = stats?.initial_bankroll ?? 1000;
   const statsReady = stats !== null && equity !== null;
@@ -168,6 +177,7 @@ function App() {
             tradingMode={tradingMode ?? 'paper'}
             tradingPaused={status?.trading_paused ?? 'off'}
             viewMode={viewMode}
+            onAfterModeChange={refetchStatus}
           />
           <main className="flex-1 flex flex-col overflow-hidden">
             {/* View mode tabs */}

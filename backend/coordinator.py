@@ -100,6 +100,15 @@ class Coordinator:
         # One-time alert: fires when 500+ fully-labeled paper trades exist
         self._ml_data_ready_sent: bool = False
 
+        # Throttle for periodic Kalshi balance polling. Event-driven syncs
+        # (post-trade exit, /api/reset-drawdown, ghost cleared, startup,
+        # toggle-to-live) ignore this and always go to the wire; only the
+        # tick-driven `_periodic_reconciliation` poll honors it. Without
+        # this the bot was hitting /portfolio/balance ~30x/min, flooding
+        # logs and wasting Kalshi rate budget while flat.
+        self._last_bankroll_sync_ts: float = 0.0
+        self._bankroll_sync_min_interval_sec: float = 30.0
+
         self.historical_sync = HistoricalSync()
 
 
@@ -119,7 +128,8 @@ class Coordinator:
     def live_enabled(self) -> bool:
         return self.trading_mode == "live"
 
-    async def sync_live_bankroll(self, is_initial: bool = False) -> float:
+    async def sync_live_bankroll(self, is_initial: bool = False,
+                                  force: bool = True) -> float:
         """Fetch real Kalshi wallet balance and update live_sizer.
 
         The Kalshi wallet is the source of truth. Peak bankroll tracks the
@@ -129,9 +139,24 @@ class Coordinator:
 
         daily/weekly baselines are only set on initial sync (startup) or
         when explicitly requested — not on every sync call.
+
+        force=False short-circuits to the cached value if we synced within
+        ``_bankroll_sync_min_interval_sec``. Used by the periodic poll only;
+        all event-driven callers (post-trade, reset-drawdown, ghost cleared,
+        startup, toggle) leave force=True so they always see the freshest
+        balance.
         """
+        now = time.time()
+        if (
+            not force
+            and not is_initial
+            and (now - self._last_bankroll_sync_ts) < self._bankroll_sync_min_interval_sec
+        ):
+            return self.live_sizer.bankroll
+
         balance_data = await self.live_trader.client.get_balance()
         wallet = float(balance_data.get("balance", 0)) / 100
+        self._last_bankroll_sync_ts = time.time()
         if wallet > 0:
             self.live_sizer.bankroll = wallet
             old_peak = self.live_sizer.peak_bankroll
@@ -1435,27 +1460,22 @@ class Coordinator:
                 )
 
                 notifier = get_notifier()
-                msg = (
-                    f"Tuning cycle complete: consistency={result.edge_consistency:.1%}, "
-                    f"OOS Sharpe={result.avg_oos_sharpe:.2f}, "
-                    f"should_apply={result.should_apply}, reason={result.reason}"
-                )
-                if result.changes:
-                    changes_str = ", ".join(
-                        f"{k}: {v['from']}->{v['to']}" for k, v in result.changes.items()
-                    )
-                    msg += f"\nChanges: {changes_str}"
-                await notifier.send_heartbeat(msg)
 
+                health_alerts: list[str] = []
                 try:
                     from monitoring.signal_health import run_signal_health_check
-                    alerts = await run_signal_health_check(pool)
-                    if alerts:
-                        await notifier.send_heartbeat(
-                            f"Signal health alerts: {'; '.join(alerts)}"
-                        )
-                except Exception:
-                    pass
+                    health_alerts = await run_signal_health_check(pool) or []
+                except Exception as e:
+                    logger.warning("coordinator.signal_health_check_failed", error=str(e))
+
+                await notifier.tuning_cycle_report(
+                    edge_consistency=result.edge_consistency,
+                    avg_oos_sharpe=result.avg_oos_sharpe,
+                    should_apply=result.should_apply,
+                    reason=result.reason,
+                    changes=result.changes,
+                    health_alerts=health_alerts,
+                )
 
                 logger.info("coordinator.tuning_complete",
                             consistency=result.edge_consistency,
@@ -1757,9 +1777,12 @@ class Coordinator:
         balance, diff against the pre-entry snapshot captured by
         ``PositionManager.enter``, and quarantine when the recorded PnL
         drifts from the actual cash movement by more than
-        ``WALLET_DRIFT_QUARANTINE_DOLLARS``. The recorded PnL itself is
-        unchanged (cost-based formula stays authoritative for downstream
-        attribution); the drift surface is purely diagnostic.
+        ``WALLET_DRIFT_QUARANTINE_DOLLARS``. After BUG-027 the recorded
+        PnL is the correct cash-flow figure (``exit_cost - entry_cost
+        - fees``) and ``wallet_at_entry`` is captured pre-entry, so a
+        non-zero drift now indicates a real reconciliation problem
+        (missed fee, ledger lag, partial settlement) rather than a
+        formula bug.
         """
         WALLET_DRIFT_QUARANTINE_DOLLARS = 0.05
 
@@ -1828,8 +1851,12 @@ class Coordinator:
 
             if error_reason:
                 # Drift-only quarantines do NOT reverse the trade against
-                # the sizer -- the cost-based PnL is still our best
-                # estimate and the drift is being tracked separately.
+                # the sizer. After BUG-027 the recorded PnL matches the
+                # exchange's cash flow within rounding, so flagged drift
+                # is a reconciliation signal we should investigate but
+                # not a reason to overwrite the trade's effect on the
+                # bankroll. Structural quarantines (rapid fire / instant
+                # stop) still reverse the sizer below.
                 if not drift_quarantine:
                     sizer.reverse_trade(trade.pnl)
                 async with pool.connection() as conn:
@@ -2185,14 +2212,20 @@ class Coordinator:
 
     async def _periodic_reconciliation(self) -> None:
         """Periodic check: detect exchange positions the bot doesn't know about,
-        and sync wallet balance to keep internal bankroll accurate."""
+        and sync wallet balance to keep internal bankroll accurate.
+
+        The wallet sync is throttled (force=False) so we don't hit Kalshi
+        every ~2 seconds while the tick loop is hot. Event-driven callers
+        (post-trade exit, reset-drawdown, toggle, ghost cleared) bypass
+        the throttle.
+        """
         try:
             await self._reconcile_live_positions()
         except Exception as e:
             logger.warning("coordinator.periodic_reconcile_failed", error=str(e))
 
         try:
-            await self.sync_live_bankroll()
+            await self.sync_live_bankroll(force=False)
         except Exception as e:
             logger.warning("coordinator.periodic_wallet_sync_failed", error=str(e))
 

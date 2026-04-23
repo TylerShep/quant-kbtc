@@ -65,10 +65,14 @@ class ManagedPosition:
     # path that parses the polled REST order. Surfaced in trade rows so
     # operators can audit how often the WS engaged.
     entry_fill_source: str = "order_response"
-    # BUG-025: snapshot of the live wallet balance (in dollars) immediately
-    # after the entry was confirmed. Used by ``coordinator._persist_trade``
-    # to compute the wallet-delta PnL and quarantine trades whose recorded
-    # PnL drifts from the actual cash movement.
+    # BUG-025/BUG-027: snapshot of the live wallet balance (in dollars)
+    # captured *before* the entry order was placed. Used by
+    # ``coordinator._persist_trade`` to compute the round-trip wallet PnL
+    # (``wallet_post_exit - wallet_at_entry``) and quarantine trades
+    # whose recorded PnL drifts from the actual cash movement. Capturing
+    # pre-entry is critical: a post-entry snapshot would already have
+    # the entry debit baked in and the diff would only reflect the exit
+    # leg's cash flow, making the drift metric structurally wrong.
     wallet_at_entry: Optional[float] = None
 
 
@@ -145,7 +149,7 @@ class PositionManager:
         # trips, the coordinator auto-pauses for post-trade review. Set to None
         # for unlimited (normal operation once testing is complete). Restored
         # from persisted state if present.
-        self.live_trade_limit: Optional[int] = 2
+        self.live_trade_limit: Optional[int] = None
         self._completed_live_trades: int = 0
 
         # Tracks tickers confirmed as settled/finalized to prevent
@@ -629,6 +633,25 @@ class PositionManager:
                 self._transition(PositionState.DESYNC)
                 return None
 
+            # BUG-025/BUG-027: capture the wallet balance *before* placing
+            # the entry order. ``coordinator._persist_trade`` diffs this
+            # against the post-exit wallet to compute the round-trip cash
+            # PnL (``wallet_post - wallet_pre``). The previous version
+            # captured *after* the entry debit had already cleared, so the
+            # diff only saw the exit leg's cash flow and the drift metric
+            # always disagreed with the (also-broken) recorded PnL by
+            # roughly the entry cost. Capturing before order placement
+            # makes ``wallet_pnl`` an authoritative round-trip figure.
+            wallet_at_entry: Optional[float] = None
+            try:
+                bal_data = await self.client.get_balance()
+                wallet_at_entry = float(bal_data.get("balance", 0)) / 100.0
+            except Exception as e:
+                logger.warning(
+                    "position_manager.wallet_capture_failed",
+                    leg="entry_pre", ticker=ticker, error=str(e),
+                )
+
             self._transition(PositionState.ENTERING)
 
             side = "yes" if direction == "long" else "no"
@@ -805,20 +828,6 @@ class PositionManager:
                     fill_price = ws_vwap
                 entry_cost = FillStream.total_cost_dollars(ws_fills)
                 entry_fees = FillStream.total_fees_dollars(ws_fills)
-
-            # BUG-025: capture wallet balance immediately after the
-            # position is confirmed. ``coordinator._persist_trade``
-            # diffs this against the post-exit wallet to catch any
-            # drift between recorded PnL and real cash movement.
-            wallet_at_entry: Optional[float] = None
-            try:
-                bal_data = await self.client.get_balance()
-                wallet_at_entry = float(bal_data.get("balance", 0)) / 100.0
-            except Exception as e:
-                logger.warning(
-                    "position_manager.wallet_capture_failed",
-                    leg="entry", ticker=ticker, error=str(e),
-                )
 
             self.position = ManagedPosition(
                 ticker=ticker,
@@ -1012,22 +1021,36 @@ class PositionManager:
             self.adopt_orphan(pos.ticker, pos.direction, remainder, pos.entry_price)
             self._transition(PositionState.PARTIAL_EXIT)
 
-        # Build trade result -- prefer Kalshi's actual dollar costs over formula.
-        # Each Kalshi binary contract pays out $1.00 max. Both entry and exit
-        # taker_fill_cost_dollars represent money spent (entry=buy cost,
-        # exit=close cost). PnL = max_payout - entry_cost - exit_cost - all_fees.
+        # Build trade result -- cash-flow PnL from actual Kalshi dollar
+        # amounts. ``entry_cost`` is what we paid to open (positive
+        # outflow). ``exit_cost`` is what we *received* selling the
+        # position back -- ``FillStream.total_cost_dollars`` is unsigned
+        # for both buys and sells, and the corresponding ``taker_fill_
+        # cost_dollars`` field on a sell-side polled order is also the
+        # proceeds. So a mid-flight exit is:
+        #
+        #     PnL = exit_proceeds - entry_paid - all_fees
+        #         = exit_cost     - entry_cost - (entry_fees + exit_fees)
+        #
+        # The contract's $1.00 max payout never enters the math here --
+        # that's only relevant at settlement, which is handled by
+        # ``_handle_settlement_inner`` with its own (correct) formula.
+        # BUG-027: the previous version used
+        # ``contracts*$1.00 - entry_cost - exit_cost - fees`` which (a)
+        # invented a payout the trade never received and (b) treated
+        # the sale proceeds as an additional outflow, over-recording
+        # PnL by roughly ``2 * exit_cost`` on every LONG mid-flight exit.
         entry_cost = pos.entry_cost_dollars
         if entry_cost is not None and exit_cost is not None:
-            contracts_value = float(exited_contracts)
             entry_fees = pos.entry_fees_dollars or 0.0
             exit_fees = actual_fees or 0.0
             total_fees = entry_fees + exit_fees
-            net_pnl = contracts_value - entry_cost - exit_cost - total_fees
+            net_pnl = exit_cost - entry_cost - total_fees
             fees = total_fees
             notional = entry_cost if entry_cost > 0 else 1.0
             pnl_pct = net_pnl / notional if notional > 0 else 0
             logger.info("position_manager.pnl_cost_based",
-                        contracts_value=contracts_value,
+                        exited_contracts=exited_contracts,
                         entry_cost=entry_cost, exit_cost=exit_cost,
                         entry_fees=entry_fees, exit_fees=exit_fees,
                         net_pnl=net_pnl)
@@ -1696,9 +1719,9 @@ class PositionManager:
             self.orphaned_positions.append(OrphanedPosition(**filtered))
 
         self._completed_live_trades = snapshot.get("completed_live_trades", 0)
-        restored_limit = snapshot.get("live_trade_limit")
-        if restored_limit is not None:
-            self.live_trade_limit = restored_limit
+        # live_trade_limit is now controlled by the code default (None =
+        # unlimited). Ignore whatever the snapshot persisted so operators
+        # don't have to wipe bot_state when changing the limit.
 
         restored_settled = snapshot.get("settled_tickers", [])
         self._settled_tickers = set(restored_settled)

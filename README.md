@@ -84,6 +84,25 @@ The dashboard is available at `http://localhost:5173` (dev) or `http://localhost
 
 The deploy script rsyncs the project, adjusts ports for production, and rebuilds the container on the remote host. The frontend is pre-built and served as static files from `backend/static/`.
 
+### Dashboard API Authentication
+
+State-mutating endpoints (`/api/trading-mode`, `/api/emergency-stop`, `/api/close-all-exchange-positions`, `/api/reset-drawdown`, `/api/trade-limit`, `/api/trading-pause`, `DELETE /api/param-overrides`) require a bearer token via the `Authorization: Bearer <token>` header. GET endpoints are unauthenticated.
+
+Set `DASHBOARD_API_TOKEN` in the production `.env` (generate with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`). The dashboard prompts for the token on the first protected action and persists it in `localStorage`. To rotate, update the env var and restart; users will be re-prompted on their next mutating action. To "log out" a browser, clear `localStorage` from devtools.
+
+When `DASHBOARD_API_TOKEN` is empty (default in dev), auth is disabled and all endpoints are open. The bot logs a warning at startup if `BOT_ENV=production` but the token is unset.
+
+`curl` example:
+
+```bash
+curl -X POST http://your-host:8000/api/emergency-stop \
+  -H "Authorization: Bearer $DASHBOARD_API_TOKEN"
+```
+
+### Database Backups
+
+Daily `pg_dump` backups run at 03:30 UTC via cron on the droplet, push to a DigitalOcean Spaces bucket (~$5/mo), and post a status line to the `#kbtc-errors` Discord channel. Local copies are kept 7 days; remote copies 30 days via Spaces lifecycle policy. See [docs/runbooks/database-backups.md](docs/runbooks/database-backups.md) for one-time setup, the restore drill, and full disaster recovery procedure.
+
 ## Trading Modes
 
 The bot supports two modes, switchable from the dashboard sidebar:
@@ -182,8 +201,8 @@ The bot passively collects 14 entry-time features at trade entry, labels outcome
 ### Training (Manual)
 
 ```bash
-# Export labeled data from the remote DB
-ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc \
+# Export labeled data from the remote DB (set KBTC_DEPLOY_HOST=user@host)
+ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc \
   -c \"COPY (SELECT * FROM trade_features WHERE label IS NOT NULL) TO STDOUT CSV HEADER\"" \
   > trade_features_export.csv
 

@@ -20,5 +20,5 @@ export function useStatus(intervalMs = 5000) {
     return () => clearInterval(id);
   }, [fetchStatus, intervalMs]);
 
-  return status;
+  return { status, refetch: fetchStatus };
 }

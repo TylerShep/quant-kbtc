@@ -7,7 +7,7 @@ Risk channel:         circuit_breaker_tripped, circuit_breaker_cleared,
 Heartbeat channel:    heartbeat_ping, periodic_summary, daily_summary
 Errors channel:       bot_started, bot_stopped, ws_disconnected,
                       db_error, unhandled_exception
-Attribution channel:  daily_attribution, weekly_digest
+Attribution channel:  daily_attribution, weekly_digest, tuning_cycle_report
 
 Silently no-ops when webhook_url is empty so the bot works without Discord.
 """
@@ -501,6 +501,41 @@ class DiscordNotifier:
 
         embed = {
             "title": f"\U0001f4ca Daily Attribution \u2014 {date_str}",
+            "color": color,
+            "fields": fields,
+            "footer": self._footer(),
+        }
+        await self._post(self._attribution_url, embed)
+
+    async def tuning_cycle_report(
+        self,
+        edge_consistency: float,
+        avg_oos_sharpe: float,
+        should_apply: bool,
+        reason: str,
+        changes: Optional[dict] = None,
+        health_alerts: Optional[list[str]] = None,
+    ) -> None:
+        if should_apply:
+            color = COLOR_GREEN
+        elif health_alerts:
+            color = COLOR_ORANGE
+        else:
+            color = COLOR_YELLOW
+        fields = [
+            {"name": "Edge Consistency", "value": f"{edge_consistency:.1%}", "inline": True},
+            {"name": "OOS Sharpe", "value": f"{avg_oos_sharpe:.2f}", "inline": True},
+            {"name": "Auto-Apply", "value": "Yes" if should_apply else "No", "inline": True},
+            {"name": "Reason", "value": reason or "\u2014", "inline": False},
+        ]
+        if changes:
+            change_lines = [f"`{k}`: {v.get('from')} \u2192 {v.get('to')}" for k, v in changes.items()]
+            fields.append({"name": "Proposed Changes", "value": "\n".join(change_lines), "inline": False})
+        if health_alerts:
+            alert_lines = "\n".join(f"- {a}" for a in health_alerts)
+            fields.append({"name": "\u26a0\ufe0f Signal Health Alerts", "value": alert_lines, "inline": False})
+        embed = {
+            "title": "\U0001f527 Auto-Tuner Cycle Report",
             "color": color,
             "fields": fields,
             "footer": self._footer(),

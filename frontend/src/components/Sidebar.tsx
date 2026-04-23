@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { RiskState, PaperState, Features, CumulativeStats } from '../types';
+import { authedFetch } from '../api';
 
 interface SidebarProps {
   risk: RiskState | null;
@@ -9,9 +10,10 @@ interface SidebarProps {
   tradingMode?: string;
   tradingPaused?: 'off' | 'settling' | 'paused';
   viewMode?: string;
+  onAfterModeChange?: () => void;
 }
 
-export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = 'off', viewMode = 'paper' }: SidebarProps) {
+export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', tradingPaused = 'off', viewMode = 'paper', onAfterModeChange }: SidebarProps) {
   const statsLoading = stats === null;
   const equity = stats?.equity ?? risk?.bankroll ?? 0;
   const drawdown = risk?.drawdown_pct ?? 0;
@@ -97,7 +99,7 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
       <StatBlock label="Total Trades" value={statsLoading ? '...' : String(stats?.total_trades ?? paper?.total_trades ?? 0)} loading={statsLoading} />
 
       <div className="mt-auto flex flex-col gap-2">
-        <LiveToggle isLive={tradingMode === 'live'} tradingPaused={tradingPaused} />
+        <LiveToggle isLive={tradingMode === 'live'} tradingPaused={tradingPaused} onAfterChange={onAfterModeChange} />
         <LivePauseToggle
           isLive={tradingMode === 'live'}
           canTrade={canTrade}
@@ -109,7 +111,7 @@ export function Sidebar({ risk, paper, features, stats, tradingMode = 'paper', t
   );
 }
 
-function LiveToggle({ isLive, tradingPaused }: { isLive: boolean; tradingPaused: string }) {
+function LiveToggle({ isLive, tradingPaused, onAfterChange }: { isLive: boolean; tradingPaused: string; onAfterChange?: () => void }) {
   const [confirming, setConfirming] = useState(false);
   const [switching, setSwitching] = useState(false);
   const isSettling = tradingPaused === 'settling';
@@ -124,7 +126,7 @@ function LiveToggle({ isLive, tradingPaused }: { isLive: boolean; tradingPaused:
 
     setSwitching(true);
     try {
-      const res = await fetch('/api/trading-mode', {
+      const res = await authedFetch('/api/trading-mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: targetMode, confirm: true }),
@@ -132,6 +134,8 @@ function LiveToggle({ isLive, tradingPaused }: { isLive: boolean; tradingPaused:
       const data = await res.json();
       if (!data.success) {
         alert(data.error || 'Failed to switch mode');
+      } else {
+        onAfterChange?.();
       }
     } catch {
       alert('Failed to switch trading mode');
@@ -149,7 +153,7 @@ function LiveToggle({ isLive, tradingPaused }: { isLive: boolean; tradingPaused:
         <button
           onClick={async () => {
             try {
-              await fetch('/api/trading-pause', {
+              await authedFetch('/api/trading-pause', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ paused: false }),
@@ -218,7 +222,7 @@ function LivePauseToggle({ isLive, canTrade, tradingPaused, haltReason }: {
   const handleToggle = async () => {
     setToggling(true);
     try {
-      const res = await fetch('/api/trading-pause', {
+      const res = await authedFetch('/api/trading-pause', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ paused: isOff }),

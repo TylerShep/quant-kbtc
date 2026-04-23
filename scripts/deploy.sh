@@ -5,9 +5,9 @@ set -euo pipefail
 # Usage: ./scripts/deploy.sh [user@host]
 #        ./scripts/deploy.sh --force          # skip safety check
 
-PROJECT_DIR="/home/botuser/kbtc"
+PROJECT_DIR="${KBTC_PROJECT_DIR:-/home/botuser/kbtc}"
 FORCE=false
-REMOTE="botuser@167.71.247.154"
+REMOTE="${KBTC_DEPLOY_HOST:-deploy@your-host}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -81,6 +81,8 @@ rsync -avz --progress \
     --exclude='venv' \
     --exclude='backtest_reports' \
     --exclude='.cursor' \
+    --exclude='kbtc-backups' \
+    --exclude='*.dump' \
     . "${REMOTE}:${PROJECT_DIR}/"
 
 echo "=== Fixing ports for production ==="

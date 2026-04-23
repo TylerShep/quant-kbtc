@@ -6,8 +6,8 @@ set -euo pipefail
 #
 # Usage: bash scripts/canary_up.sh [user@host]
 
-REMOTE="${1:-botuser@167.71.247.154}"
-PROJECT_DIR="/home/botuser/kbtc"
+REMOTE="${1:-${KBTC_DEPLOY_HOST:-deploy@your-host}}"
+PROJECT_DIR="${KBTC_PROJECT_DIR:-/home/botuser/kbtc}"
 
 echo "=== Canary Stack Launch ==="
 echo "  Remote: ${REMOTE}"
@@ -70,8 +70,9 @@ echo ""
 echo "=== Canary stack is UP ==="
 ssh "${REMOTE}" "cd ${PROJECT_DIR} && docker compose -f docker-compose.canary.yml ps"
 echo ""
-echo "  Dashboard: http://167.71.247.154:8100"
-echo "  API:       http://167.71.247.154:8100/api/status"
+REMOTE_HOST="${REMOTE#*@}"
+echo "  Dashboard: http://${REMOTE_HOST}:8100"
+echo "  API:       http://${REMOTE_HOST}:8100/api/status"
 echo "  DB:        port 5434 (kbtc_canary)"
 echo ""
 echo "  Run 'bash scripts/canary_status.sh' to check health"

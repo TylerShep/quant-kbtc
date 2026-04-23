@@ -1,9 +1,17 @@
 ---
 name: incident-response-runbook
-description: Step-by-step playbooks for the most likely failure scenarios on the Kalshi BTC 15min trading bot. Use this skill when responding to an active incident, building incident response automation, or preparing runbooks for new failure modes. Covers WebSocket disconnect, stuck positions, bad fills, database outages, circuit breaker triggers, and API auth failures.
+description: Step-by-step playbooks for the most likely failure scenarios on the Kalshi BTC 15min trading bot. Use this skill when responding to an active incident, building incident response automation, or preparing runbooks for new failure modes. Covers WebSocket disconnect, stuck positions, circuit breaker triggers, bot crashes, database outages, and API auth failures.
 ---
 
 # Incident Response Runbook
+
+> **Source of truth.** Every command in this runbook references real code in this repo. If a command no longer matches the codebase, fix it here before the next incident — outdated runbooks are worse than no runbook.
+>
+> **Common prerequisites for any operator action:**
+> - SSH: `ssh "$KBTC_DEPLOY_HOST"` (export `KBTC_DEPLOY_HOST=user@host` first)
+> - Auth'd dashboard calls require: `export DASHBOARD_API_TOKEN=$(grep ^DASHBOARD_API_TOKEN /home/botuser/kbtc/.env | cut -d= -f2)`
+> - Containers: `kbtc-bot` (the bot) and `kbtc-db` (Postgres + TimescaleDB) — see [docker-compose.yml](docker-compose.yml)
+> - Dashboard is served from `http://localhost:8000` on the droplet (also reachable as `http://<DEPLOY_HOST>:8000` from anywhere)
 
 ## Incident Severity Levels
 ```
@@ -16,14 +24,14 @@ SEV-1 (Immediate — wake up for this):
 SEV-2 (Urgent — respond within 15 min):
   - Circuit breaker triggered (daily/weekly/drawdown)
   - WebSocket disconnected and not auto-recovering
-  - Bot process crashed and watchdog failing to restart
+  - Bot process crashed and not auto-restarting
   - Data pipeline stale > 10 minutes with open position
 
 SEV-3 (Same day — respond within 4 hours):
   - Win rate significantly below expected for 24h+
   - Latency P99 consistently above budget
   - Disk usage > 85%
-  - Backup failures
+  - Backup failures (see docs/runbooks/database-backups.md)
 
 SEV-4 (Monitor — no immediate action):
   - Single trade behaved unexpectedly
@@ -33,238 +41,284 @@ SEV-4 (Monitor — no immediate action):
 
 ---
 
+## Recording the Incident
+
+Every runbook below ends with **Record**, which means all three of:
+
+1. **Trade-impact rows** → confirm any bad trades landed in `errored_trades` (BUG-025 quarantine wiring in [backend/execution/position_manager.py](backend/execution/position_manager.py) does this automatically for fill drift; for manual entries use `error_reason='INCIDENT_<SEV>_<YYYYMMDD>'`).
+2. **Narrative timeline** → append one line to `/home/botuser/kbtc/logs/incidents.log`. Run `mkdir -p /home/botuser/kbtc/logs` once on first use.
+   ```bash
+   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  SEV-2  WS disconnect; auto-reconnect failed; restarted kbtc-bot at HH:MM" \
+     >> /home/botuser/kbtc/logs/incidents.log
+   ```
+3. **Discord** → SEV-1 and SEV-2 require a manual post in `#kbtc-errors` summarizing what fired, what was done, and current status. SEV-3/SEV-4 are optional.
+
+These three records together are the audit trail. None replaces the others.
+
+---
+
 ## Runbook 1: WebSocket Disconnect / Stale Order Book
 
-**Symptoms**: Bot not receiving book updates, OBI readings unchanged for > 60s, WS error in logs
+**Symptoms**: Bot not receiving book updates, OBI readings unchanged for > 60s, `kalshi_ws.disconnected` in logs, `/api/status.fill_stream.last_message_age_sec` climbing
 
+### Diagnose
 ```bash
-# Step 1: Check WS connection status in logs
-docker logs kalshi-bot --tail=100 | grep -E "websocket|WS|disconnect|reconnect"
+# Check WS reconnect state in structured logs
+docker logs kbtc-bot --tail=200 2>&1 | rg -i 'kalshi_ws|websocket|reconnect|disconnect'
 
-# Step 2: Check if auto-reconnect is running
-docker logs kalshi-bot --tail=50 | grep -E "Retry|reconnect attempt"
-
-# If auto-reconnect appears stuck (same error > 5 minutes):
-# Step 3: Restart just the bot container (preserves DB state)
-docker restart kalshi-bot
-sleep 30
-docker logs kalshi-bot --tail=30 | grep "WebSocket connected"
-
-# Step 4: If still failing, check Kalshi exchange status
-curl -s "https://trading-api.kalshi.com/trade-api/v2/exchange/status" | python3 -m json.tool
-
-# Step 5: If exchange is down, set bot to PAUSE_ENTRIES mode
-docker exec kalshi-bot python -c "
-from tools.admin_cli import bot_control
-bot_control.set_mode('PAUSE_ENTRIES')
-print('Bot paused — will resume when WS reconnects')
-"
-
-# Step 6: Log the incident
-echo "[$(date -u)] SEV-2: WS disconnect. Auto-reconnect failed. Manual restart at $(date -u). Exchange status: [OK/DOWN]" >> /var/log/kalshi/incidents.log
+# Confirm the bot considers itself connected vs the fill-stream
+curl -s -H "Authorization: Bearer $DASHBOARD_API_TOKEN" http://localhost:8000/api/status \
+  | jq '{trading_mode, trading_paused, fill_stream, market_states}'
 ```
+
+### Act
+```bash
+# If auto-reconnect is stuck (same error > 5 min), pause new entries first
+curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"paused":true}' \
+  http://localhost:8000/api/trading-pause
+
+# Then bounce just the bot container (preserves DB state)
+docker restart kbtc-bot
+sleep 30
+docker logs kbtc-bot --tail=50 2>&1 | rg -i 'kalshi_ws.started|kalshi_ws.subscribed'
+
+# Once reconnected, resume
+curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"paused":false}' \
+  http://localhost:8000/api/trading-pause
+```
+
+If reconnect still fails after a restart, check the Kalshi status page (https://status.kalshi.com) before further intervention. If the exchange is degraded, leave the bot paused and wait it out.
+
+### Record
+See **Recording the Incident** above. SEV-2 → Discord post required.
 
 ---
 
 ## Runbook 2: Stuck Open Position (Cannot Close)
 
-**Symptoms**: Exit order submitted but not filling, position open past expected hold time, fill errors in logs
+**Symptoms**: Exit order submitted but not filling, position open past expected hold time, orphan or rejection messages in logs, `/api/status.live.has_position == true` long after the contract should have exited
 
+### Diagnose
 ```bash
-# Step 1: Identify the stuck position
-docker exec kalshi-bot python -c "
-from kalshi.client import KalshiClient
-from kalshi.auth import KalshiAuth
-import os
-client = KalshiClient(KalshiAuth(os.getenv('KALSHI_API_KEY_ID'), os.getenv('KALSHI_PRIVATE_KEY_PATH')))
-positions = client.get_positions()
-print(positions)
-"
+# Read current live position state and any orphans
+curl -s -H "Authorization: Bearer $DASHBOARD_API_TOKEN" http://localhost:8000/api/status \
+  | jq '{live, orphaned_positions, live_decision}'
 
-# Step 2: Cancel any pending exit orders
-docker exec kalshi-bot python -c "
-from tools.admin_cli import order_manager
-order_manager.cancel_all_open()
-print('All pending orders canceled')
-"
-
-# Step 3: Check contract expiry — if < 5 min, do nothing and let it settle
-# Kalshi will settle the contract and PnL will resolve automatically
-
-# Step 4: If contract has time remaining, force close with aggressive (taker) pricing
-docker exec kalshi-bot python -c "
-from tools.admin_cli import position_manager
-position_manager.force_close(reason='INCIDENT_MANUAL_CLOSE', aggressive=True)
-"
-
-# Step 5: If API rejects all close attempts, check for:
-#   - INSUFFICIENT_FUNDS (can't buy back at current price)
-#   - MARKET_CLOSED (contract expired — settlement will handle it)
-#   - RATE_LIMITED (wait 30s, retry)
-docker logs kalshi-bot --tail=50 | grep -E "rejection|REJECTED|error"
-
-# Step 6: Record outcome
-echo "[$(date -u)] SEV-1: Stuck position on [TICKER]. Closed via [method] at [price]. PnL: [amount]" >> /var/log/kalshi/incidents.log
+# Check the last 200 lines for fill or rejection events
+docker logs kbtc-bot --tail=200 2>&1 | rg -i 'orphan|reject|fill_stream|emergency|exit_failed'
 ```
+
+### Act
+```bash
+# Step A — close everything Kalshi reports we hold (reads exchange state, not local cache)
+# This pauses trading, calls KalshiOrderClient.close_all_exchange_positions(), then re-syncs the wallet.
+curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  http://localhost:8000/api/close-all-exchange-positions
+
+# Step B — if Step A fails or partially succeeds, escalate to the kill switch
+# (force-closes via PositionManager; converts unfillable positions to orphans)
+curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  http://localhost:8000/api/emergency-stop
+
+# Step C — if contract has < 5 min to expiry, do nothing further
+# Kalshi will settle the contract and the wallet will resolve automatically.
+# Run sync_live_bankroll on next bot restart to reconcile recorded vs wallet PnL.
+```
+
+If both endpoints fail (e.g. `INSUFFICIENT_FUNDS`, `MARKET_CLOSED`, persistent `RATE_LIMITED`), grep the live logs for the underlying API error and decide whether to wait for settlement or open a Kalshi support ticket.
+
+### Record
+See **Recording the Incident** above. SEV-1 → Discord post required.
 
 ---
 
 ## Runbook 3: Circuit Breaker Triggered
 
-**Symptoms**: Alert fires "CIRCUIT BREAKER TRIGGERED", bot stops entering trades
+**Symptoms**: Discord notification "circuit breaker triggered", `/api/status.live_risk.can_trade == false`, bot stops entering trades
+
+### Diagnose
+```bash
+# Identify which breaker fired and the current sizer state
+curl -s -H "Authorization: Bearer $DASHBOARD_API_TOKEN" http://localhost:8000/api/status \
+  | jq '{trading_mode, live_risk, paper_risk, live_bankroll, wallet_balance}'
+
+# halt_reason is one of: DAILY_LOSS_LIMIT, WEEKLY_LOSS_LIMIT, MAX_DRAWDOWN_HALT
+# (see backend/risk/circuit_breaker.py:24-31 — these are the only three reasons returned)
+
+# Review today's live trades to understand WHY
+ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+SELECT exit_reason, COUNT(*), SUM(pnl)::NUMERIC(12,2) AS pnl_dollars
+FROM trades
+WHERE timestamp >= NOW() - INTERVAL '24 hours' AND trading_mode='live'
+GROUP BY exit_reason
+ORDER BY pnl_dollars
+\""
+```
+
+### Decision tree
+- `DAILY_LOSS_LIMIT` → wait until next calendar day. Review trades, generally no override.
+- `WEEKLY_LOSS_LIMIT` → wait until Monday. Requires team review before resuming.
+- `MAX_DRAWDOWN_HALT` → full review required. Do **not** reset without sign-off.
+
+### Act
+There is **no** breaker-bypass switch by design. The only reset path is `/api/reset-drawdown`, which moves the drawdown peak down to current bankroll (so `current_drawdown` becomes 0) and also resets the daily/weekly start-of-period bankroll. Use it only after the trades-review above and only when you have a documented reason.
 
 ```bash
-# Step 1: Identify which circuit breaker fired
-docker exec kalshi-bot python -c "
-import json, psycopg2, os
-conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-cur = conn.cursor()
-cur.execute(\"SELECT value FROM bot_state WHERE key = 'circuit_breaker'\")
-row = cur.fetchone()
-print(json.dumps(json.loads(row[0]), indent=2))
-"
+# Resets peak + daily + weekly start bankrolls for the given mode (default = current trading_mode).
+curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" \
+  "http://localhost:8000/api/reset-drawdown?mode=live"
 
-# Step 2: Review today's trades to understand why
-docker exec kalshi-bot python -c "
-import psycopg2, os
-conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-cur = conn.cursor()
-cur.execute('''
-    SELECT exit_reason, COUNT(*), SUM(pnl_cents)/100.0 as pnl
-    FROM trades
-    WHERE entry_timestamp >= NOW() - INTERVAL '24 hours'
-    GROUP BY exit_reason
-    ORDER BY pnl
-''')
-for row in cur.fetchall():
-    print(row)
-"
-
-# Step 3: Decision tree
-# DAILY_LOSS_LIMIT → Wait until next calendar day. Review trades, no override today.
-# WEEKLY_LOSS_LIMIT → Wait until Monday. Requires QR + PM review before resuming.
-# MAX_DRAWDOWN → Full review required. Do NOT resume without team sign-off.
-
-# Step 4: If DAILY_LOSS and reason is clearly explainable (e.g., one bad fill, news event):
-# QT can override with documented reason
-docker exec kalshi-bot python -c "
-from tools.admin_cli import bot_control
-bot_control.override_circuit_breaker(
-    reason='DAILY_LOSS: Major news event caused 3 consecutive stop-outs. Anomalous — not signal failure.',
-    approved_by='QT'
-)
-"
-
-# Step 5: Log everything
-echo "[$(date -u)] Circuit breaker: [TYPE]. Trades reviewed: [N]. Decision: [WAIT/OVERRIDE]. Reason: [...]" >> /var/log/kalshi/incidents.log
+# Then verify can_trade flipped back to true
+curl -s -H "Authorization: Bearer $DASHBOARD_API_TOKEN" http://localhost:8000/api/status \
+  | jq '.live_risk'
 ```
+
+If `MAX_DRAWDOWN_HALT` fired, prefer leaving the bot halted and investigating. Resetting the peak without explanation just hides the underlying signal failure.
+
+### Record
+See **Recording the Incident** above. SEV-2 → Discord post required, including the `halt_reason`, the trades-review query output, the documented reason for the reset (or "no reset; investigating"), and approver.
 
 ---
 
 ## Runbook 4: Bot Process Crashed / Won't Restart
 
-**Symptoms**: Watchdog alert fires, container not running, heartbeat stale
+**Symptoms**: Discord notification "bot stopped", `docker ps` shows `kbtc-bot` exited or unhealthy, `/api/status` returns connection errors
 
+### Diagnose
 ```bash
-# Step 1: Check container status and exit code
-docker ps -a | grep kalshi-bot
-docker inspect kalshi-bot --format='{{.State.ExitCode}} {{.State.Error}}'
+# Container status and exit code
+docker ps -a | rg kbtc-bot
+docker inspect kbtc-bot --format='exit={{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}}'
 
-# Step 2: Check for OOM kill (out of memory)
-docker inspect kalshi-bot --format='{{.State.OOMKilled}}'
-# If true → memory issue. Check usage before restart:
-free -h && docker stats --no-stream
+# Memory pressure check (if OOMKilled=true)
+free -h && docker stats --no-stream kbtc-bot kbtc-db
 
-# Step 3: Check last logs before crash
-docker logs kalshi-bot --tail=100 2>&1 | tail -50
+# Last 200 lines before the crash
+docker logs kbtc-bot --tail=200 2>&1 | tail -100
+```
 
-# Step 4: Restart the container
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d bot
+### Act
+```bash
+# Standard restart (compose service name in docker-compose.yml is `bot`)
+docker restart kbtc-bot
 sleep 30
 
-# Step 5: Verify health
-docker inspect --format='{{.State.Health.Status}}' kalshi-bot
-docker logs kalshi-bot --tail=30
-
-# Step 6: If crash is repeating (3+ times in 30 min):
-# STOP and investigate before restarting again
-# Pull most recent logs to local for analysis
-docker logs kalshi-bot > /tmp/crash_$(date +%Y%m%d_%H%M%S).log 2>&1
-# DO NOT keep force-restarting a repeatedly crashing bot — it may be in a bad state
-
-echo "[$(date -u)] Bot crash. Exit code: [N]. OOM: [Y/N]. Restarted at: [time]. Status: [OK/INVESTIGATING]" >> /var/log/kalshi/incidents.log
+# Verify health and that the bot reconnected to Kalshi + DB
+docker inspect --format='{{.State.Health.Status}}' kbtc-bot
+docker logs kbtc-bot --tail=50 2>&1 | rg -i 'started|coordinator|kalshi_ws.started|database'
 ```
+
+**If the crash is repeating (3+ times in 30 min) STOP.** Do not keep restarting:
+```bash
+# Dump full logs locally for investigation, then leave the container down
+docker logs kbtc-bot > /tmp/kbtc_crash_$(date +%Y%m%d_%H%M%S).log 2>&1
+
+# If a clean rebuild is needed, use the standard deploy path
+# (rsyncs current local tree, rebuilds, restarts — see scripts/deploy.sh)
+bash scripts/deploy.sh
+```
+
+### Record
+See **Recording the Incident** above. SEV-2 → Discord post required, including exit code, OOM flag, restart count, and root-cause hypothesis.
 
 ---
 
 ## Runbook 5: Database Outage With Open Position
 
-**Symptoms**: DB connection errors in logs, bot cannot write trades or read state
+**Symptoms**: `psycopg`/connection errors in `kbtc-bot` logs, bot cannot persist trades or read state, `/api/status` may still answer (it caches recent state in memory)
+
+### Diagnose
+```bash
+# Is the DB container running?
+docker ps | rg kbtc-db
+
+# Is Postgres ready?
+docker exec kbtc-db pg_isready -U kalshi
+
+# Last 100 lines of DB logs
+docker logs kbtc-db --tail=100
+
+# What does the bot see?
+docker logs kbtc-bot --tail=100 2>&1 | rg -i 'database|psycopg|connection refused'
+```
+
+### Act
+**If a position is open:** do **not** kill `kbtc-bot`. The bot can still close positions using in-memory state via the WebSocket; killing it would leave the position uncovered. Only restart the DB:
 
 ```bash
-# Step 1: Check if it's the managed DB or PgBouncer
-psql $DATABASE_URL -c "SELECT 1" 2>&1
+docker restart kbtc-db
+sleep 10
+docker exec kbtc-db pg_isready -U kalshi
 
-# Step 2: Check DO Managed DB status
-# → DigitalOcean console → Databases → check status
-
-# Step 3: If DB is down with an open position:
-# The bot will attempt to close the position using cached state
-# DO NOT kill the bot — it needs to run to close the position
-# Monitor: docker logs kalshi-bot -f | grep -E "position|close|exit"
-
-# Step 4: Once position is closed (or contract expires), restart DB connection
-docker restart kalshi-bot   # Will reconnect to DB on startup
-
-# Step 5: Validate data integrity after recovery
-docker exec kalshi-bot python -c "
-import psycopg2, os
-conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-cur = conn.cursor()
-# Check for any trades that may have been lost during outage
-cur.execute('''
-    SELECT COUNT(*) FROM trades
-    WHERE entry_timestamp >= NOW() - INTERVAL '2 hours'
-''')
-print('Recent trades in DB:', cur.fetchone()[0])
-"
-
-echo "[$(date -u)] DB outage. Duration: [N min]. Open position during outage: [Y/N]. Data loss: [Y/N]." >> /var/log/kalshi/incidents.log
+# Once DB is healthy, restart the bot so backend/database/connection.py
+# rebuilds its connection pool and resumes writing trades + state.
+docker restart kbtc-bot
+sleep 30
 ```
+
+### Validate after recovery
+```bash
+# Check for trades that should have been recorded during the outage window
+ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+SELECT COUNT(*) AS recent_trades, MAX(timestamp) AS most_recent
+FROM trades
+WHERE timestamp >= NOW() - INTERVAL '2 hours'
+\""
+
+# If trades were lost or the DB is suspect, see the restore drill in
+# docs/runbooks/database-backups.md (point-in-time restore from pg_dump)
+```
+
+### Record
+See **Recording the Incident** above. SEV-1 → Discord post required, including DB downtime window, whether a position was open, and any data-loss assessment.
 
 ---
 
 ## Runbook 6: API Auth Failure
 
-**Symptoms**: All API calls returning 401, "Invalid credentials" in logs
+**Symptoms**: All Kalshi REST calls returning 401, structured log events like `kalshi_ws.refresh_error` with `error="auth"`, `/api/status.wallet_balance == null`
 
+### Diagnose
 ```bash
-# Step 1: Verify key file exists and permissions
-ls -la /run/secrets/kalshi_key.pem
-# Should be: -rw------- 1 botuser botuser
+# Verify the env vars are set inside the container
+docker exec kbtc-bot env | rg -E '^KALSHI_(API_KEY_ID|PRIVATE_KEY_PATH)='
 
-# Step 2: Test auth manually
-docker exec kalshi-bot python -c "
-from kalshi.auth import KalshiAuth
-from kalshi.client import KalshiClient
-import os
-try:
-    c = KalshiClient(KalshiAuth(os.getenv('KALSHI_API_KEY_ID'), '/run/secrets/kalshi_key.pem'))
-    print('Balance:', c.get_balance())
-except Exception as e:
-    print('Auth failed:', e)
+# Verify the key file exists, is readable, and has tight permissions
+docker exec kbtc-bot sh -c 'ls -la $KALSHI_PRIVATE_KEY_PATH'
+# Should be -rw------- (0600), owned by the container's user
+
+# One-shot auth test using the exact same client the bot uses
+docker exec kbtc-bot python -c "
+import asyncio
+from data.kalshi_ws import KalshiOrderClient
+
+async def main():
+    c = KalshiOrderClient()
+    try:
+        bal = await c.get_balance()
+        print('OK balance=', bal)
+    except Exception as e:
+        print('AUTH FAIL:', type(e).__name__, e)
+
+asyncio.run(main())
 "
-
-# Step 3: If auth is failing — IMMEDIATE: check for key compromise
-# Review Kalshi dashboard for unauthorized activity
-# If compromise suspected → follow devops-security-specialist incident response
-
-# Step 4: If key simply needs rotation (expired per Kalshi policy)
-# Run key rotation script
-/opt/kalshi/scripts/rotate_api_key.sh
-
-echo "[$(date -u)] Auth failure. Cause: [expired/compromised/config]. Resolved: [Y/N]. Key rotated: [Y/N]." >> /var/log/kalshi/incidents.log
 ```
+
+### Act
+- **If auth is failing AND you suspect compromise** (unauthorized trades on Kalshi dashboard, key in a leaked log, etc.): treat as SEV-1.
+  1. Pause trading: `curl -X POST -H "Authorization: Bearer $DASHBOARD_API_TOKEN" -H "Content-Type: application/json" -d '{"paused":true}' http://localhost:8000/api/trading-pause`
+  2. Revoke the key on the Kalshi dashboard immediately.
+  3. Follow the rotation procedure in [.cursor/rules/devops-security-specialist.mdc](.cursor/rules/devops-security-specialist.mdc) (regenerate key on Kalshi → scp the new `.pem` to the droplet → update `KALSHI_API_KEY_ID` in `.env` → `bash scripts/deploy.sh`).
+- **If auth is failing because the key was simply rotated/expired:** same procedure as the third bullet above, no key revocation needed.
+
+> There is no automated rotation script in this repo. Rotation is a manual procedure documented in the devops-security-specialist skill.
+
+### Record
+See **Recording the Incident** above. Auth failures are SEV-1 → Discord post required, including suspected cause (rotation vs compromise), revocation timestamp, and new-key deploy timestamp.
 
 ---
 
@@ -274,7 +328,7 @@ echo "[$(date -u)] Auth failure. Cause: [expired/compromised/config]. Resolved: 
 
 **Severity**: SEV-[1/2/3/4]
 **Duration**: [start] → [resolved] (X minutes)
-**Detected By**: [watchdog alert / QT observation / user report]
+**Detected By**: [Discord alert / dashboard / user report]
 
 **What Happened**:
 [Plain English description]
@@ -297,7 +351,8 @@ echo "[$(date -u)] Auth failure. Cause: [expired/compromised/config]. Resolved: 
 
 ## Guardrails
 - Never restart a crashing bot more than 3 times in 30 minutes without investigating root cause first
-- Never override a circuit breaker without logging the reason and approver
-- Always check for open positions before taking any remediation action — position safety first
-- Every SEV-1 and SEV-2 requires a post-incident report, no exceptions
-- Incident logs are compliance records — never delete them
+- Never reset the drawdown peak (`/api/reset-drawdown`) without logging the reason and approver in `incidents.log`
+- Always check `/api/status.live` for an open position before taking any remediation action — position safety first
+- Every SEV-1 and SEV-2 requires a Discord post in `#kbtc-errors` and a line in `/home/botuser/kbtc/logs/incidents.log`, no exceptions
+- Incident logs (`errored_trades`, `incidents.log`, Discord history) are compliance records — never delete them
+- If you find a command in this runbook that no longer matches the codebase, fix it here in the same change — outdated runbooks are worse than no runbook

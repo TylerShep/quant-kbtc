@@ -174,6 +174,9 @@ class BotConfig:
     cors_origins: str = field(
         default_factory=lambda: _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
     )
+    dashboard_api_token: str = field(
+        default_factory=lambda: _env("DASHBOARD_API_TOKEN", "")
+    )
     roc_low_conviction_paper_enabled: bool = field(
         default_factory=lambda: _env_bool("ROC_LOW_CONVICTION_PAPER_ENABLED", False)
     )
@@ -242,7 +245,10 @@ class EdgeProfileConfig:
     allowed_drivers: str = field(
         default_factory=lambda: _env(
             "EDGE_LIVE_ALLOWED_DRIVERS",
-            "OBI,OBI+ROC,ROC,ROC/TIGHT",
+            # ROC/TIGHT removed 2026-04-21 after 9-day paper counterfactual showed
+            # decay: 1d -$618, 3d -$284, 7d +$61, shorts 22% WR (9 trades).
+            # Re-add only after a walk-forward backtest clears it.
+            "OBI,OBI+ROC,ROC",
         )
     )
     blocked_hours_utc: str = field(

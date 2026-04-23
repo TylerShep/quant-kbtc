@@ -7,8 +7,8 @@ set -euo pipefail
 # Usage: bash scripts/canary_report.sh [user@host]
 # Exit code: 0 = all gates pass, 1 = one or more gates fail
 
-REMOTE="${1:-botuser@167.71.247.154}"
-PROJECT_DIR="/home/botuser/kbtc"
+REMOTE="${1:-${KBTC_DEPLOY_HOST:-deploy@your-host}}"
+PROJECT_DIR="${KBTC_PROJECT_DIR:-/home/botuser/kbtc}"
 CANARY_DB="kbtc-db-canary"
 DB_NAME="kbtc_canary"
 DB_USER="kalshi"

@@ -165,6 +165,12 @@ async def lifespan(app: FastAPI):
 
     notifier = init_notifier()
 
+    if settings.bot.is_production and not settings.bot.dashboard_api_token:
+        logger.warning(
+            "kbtc.auth_disabled_in_production",
+            message="DASHBOARD_API_TOKEN is not set; mutating endpoints are open. SET THIS NOW.",
+        )
+
     from ml.inference import load_model
     load_model()
 
@@ -189,9 +195,13 @@ async def lifespan(app: FastAPI):
         _summary_task.cancel()
 
     uptime = _format_uptime(time.monotonic() - _start_time)
+    final_bankroll = (
+        coordinator.live_sizer.bankroll if coordinator.live_enabled
+        else coordinator.paper_sizer.bankroll
+    )
     await notifier.bot_stopped(
         uptime_str=uptime,
-        bankroll=coordinator.position_sizer.bankroll,
+        bankroll=final_bankroll,
     )
     await coordinator.stop()
 

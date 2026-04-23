@@ -15,7 +15,7 @@ Usage:
         python3 scripts/backfill_attribution.py
 
     # Remote (run inside the bot container so it sees DATABASE_URL):
-    ssh botuser@167.71.247.154 "docker exec kbtc-bot python3 /app/scripts/backfill_attribution.py"
+    ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-bot python3 /app/scripts/backfill_attribution.py"
 
     # Restrict to one mode:
     python3 scripts/backfill_attribution.py --mode paper

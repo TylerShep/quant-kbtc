@@ -69,7 +69,7 @@ modifier. No new signal may go live-LIVE until it has cleared both.
 Run against the remote DB before merging any SD threshold change:
 
 ```bash
-ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
 SELECT
   percentile_cont(0.10) WITHIN GROUP (ORDER BY spread_cents) AS p10,
   percentile_cont(0.25) WITHIN GROUP (ORDER BY spread_cents) AS p25,
@@ -88,7 +88,7 @@ WHERE timestamp > NOW() - INTERVAL '14 days' AND spread_cents IS NOT NULL;\""
 And the hour-of-day profile:
 
 ```bash
-ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
+ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc -c \"
 SELECT
   EXTRACT(HOUR FROM timestamp) AS hour,
   percentile_cont(0.50) WITHIN GROUP (ORDER BY spread_cents) AS median_spread,
@@ -142,7 +142,7 @@ existing Gate Set A (replay) + B (canary, when execution path is touched).
 1. PR opened. Run Gate Set C (C1 + C2) BEFORE review.
 2. Merge to main.
 3. Apply migration:
-     ssh botuser@167.71.247.154 \
+     ssh "$KBTC_DEPLOY_HOST" \
        "docker exec kbtc-db psql -U kalshi -d kbtc -f /tmp/003_spread_state.sql"
    (rsync the migration via scripts/deploy.sh first, then run the above)
 4. Deploy with:

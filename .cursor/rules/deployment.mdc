@@ -5,22 +5,23 @@ alwaysApply: true
 
 # Deployment
 
-The bot runs in production on a DigitalOcean droplet at `botuser@167.71.247.154`.
+The bot runs in production on a DigitalOcean droplet. The host is configured via
+the `KBTC_DEPLOY_HOST` environment variable (e.g. `export KBTC_DEPLOY_HOST=user@host`).
 
 ## After any code or config change:
 
 1. If frontend files were modified, rebuild first: `cd frontend && npm run build` then `cp -r dist/* ../backend/static/`
 2. Deploy to remote: `bash scripts/deploy.sh` (rsyncs files, rebuilds Docker image, restarts container)
-3. If database schema changed or a data wipe is needed, run SQL via the remote DB container: `ssh botuser@167.71.247.154 "docker exec kbtc-db psql -U kalshi -d kbtc -c '<SQL>'"`
+3. If database schema changed or a data wipe is needed, run SQL via the remote DB container: `ssh "$KBTC_DEPLOY_HOST" "docker exec kbtc-db psql -U kalshi -d kbtc -c '<SQL>'"`
 
 ## Key details
 
-- The dashboard is served from `167.71.247.154:8000`, NOT localhost
+- The dashboard is served from `<DEPLOY_HOST>:8000`, NOT localhost
 - `backend/static/` contains the built frontend — this is what the bot serves
 - `scripts/deploy.sh` handles rsync, port remapping, and `docker compose up --build`
 - The remote server does NOT have `pip3` — run DB operations via `docker exec kbtc-db psql` instead of Python scripts
 - Local Docker (`localhost:8001`) is for dev only; the user sees the remote instance
-- Always verify the remote API after deploy: `ssh botuser@167.71.247.154 "curl -s 'http://localhost:8000/api/status'"`
+- Always verify the remote API after deploy: `ssh "$KBTC_DEPLOY_HOST" "curl -s 'http://localhost:8000/api/status'"`
 
 ## CRITICAL: Paper vs Live data separation
 
