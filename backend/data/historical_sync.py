@@ -24,6 +24,126 @@ logger = structlog.get_logger(__name__)
 BATCH_SIZE = 500
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a SQL script on top-level ``;`` while respecting:
+
+    * ``--`` line comments (ignored to end of line).
+    * ``/* ... */`` block comments.
+    * Single-quoted string literals, including the ``''`` escape.
+    * Dollar-quoted string literals (``$$ ... $$`` or ``$tag$ ... $tag$``)
+      so that PL/pgSQL ``DO`` blocks are kept intact.
+
+    Returned statements have the trailing ``;`` stripped and surrounding
+    whitespace removed. Pure-comment / blank statements are dropped.
+
+    The naive ``sql.split(";\\n")`` we used to do choked on PL/pgSQL
+    blocks because it would chop them at the first ``END IF;`` line --
+    leaving the trailing ``END $$;`` to fail standalone. See the
+    ``test_split_sql_statements_*`` cases for the canonical edges.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+    in_squote = False
+    dollar_tag: str | None = None  # current $tag$ open, or None
+
+    def _strip_leading_comments(text: str) -> str:
+        """Drop leading blank / ``--`` comment lines from a chunk so the
+        resulting SQL string starts with executable code. Block comments
+        and comments later in the statement are left alone (PostgreSQL
+        handles them; our migration logger just wants a useful prefix)."""
+        lines = text.splitlines()
+        idx = 0
+        while idx < len(lines):
+            stripped = lines[idx].strip()
+            if not stripped or stripped.startswith("--"):
+                idx += 1
+                continue
+            break
+        return "\n".join(lines[idx:]).strip()
+
+    def flush() -> None:
+        raw = "".join(buf).strip().rstrip(";").strip()
+        s = _strip_leading_comments(raw)
+        if s:
+            out.append(s)
+        buf.clear()
+
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if dollar_tag is not None:
+            close = f"${dollar_tag}$"
+            if sql.startswith(close, i):
+                buf.append(close)
+                i += len(close)
+                dollar_tag = None
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_squote:
+            buf.append(ch)
+            i += 1
+            if ch == "'":
+                if nxt == "'":
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    in_squote = False
+            continue
+
+        if ch == "-" and nxt == "-":
+            j = sql.find("\n", i)
+            if j == -1:
+                i = n
+            else:
+                buf.append(sql[i:j + 1])
+                i = j + 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            j = sql.find("*/", i + 2)
+            if j == -1:
+                i = n
+            else:
+                buf.append(sql[i:j + 2])
+                i = j + 2
+            continue
+
+        if ch == "'":
+            in_squote = True
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "$":
+            j = sql.find("$", i + 1)
+            if j != -1:
+                tag = sql[i + 1:j]
+                if tag == "" or tag.isidentifier():
+                    open_lit = f"${tag}$"
+                    buf.append(open_lit)
+                    i += len(open_lit)
+                    dollar_tag = tag
+                    continue
+
+        if ch == ";":
+            buf.append(ch)
+            flush()
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    flush()
+    return out
+
+
 class HistoricalSync:
     """
     Manages all three historical data pipelines.
@@ -58,8 +178,7 @@ class HistoricalSync:
             logger.warning("historical_sync.migration_sql_missing", path=str(sql_path))
             return
         sql = sql_path.read_text()
-        raw = [s.strip() for s in sql.split(";\n") if s.strip() and not s.strip().startswith("--")]
-        statements = [s.rstrip(";") for s in raw]
+        statements = _split_sql_statements(sql)
         errors = 0
         for stmt in statements:
             try:

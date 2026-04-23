@@ -36,8 +36,29 @@ ALTER TABLE trade_features
     ADD COLUMN IF NOT EXISTS taker_buy_vol  NUMERIC(20,2),
     ADD COLUMN IF NOT EXISTS taker_sell_vol NUMERIC(20,2);
 
-DELETE FROM ob_snapshots a USING ob_snapshots b
-    WHERE a.ctid < b.ctid AND a.ticker = b.ticker AND a.timestamp = b.timestamp;
+-- One-time dedup of ob_snapshots before we put a UNIQUE constraint on
+-- (ticker, timestamp). The self-join below is O(N^2) on the chunk and
+-- runs in tens of seconds once the table grows past a few hundred
+-- thousand rows, which starves the connection pool on every restart
+-- (see the ops follow-up to BUG-027). We therefore guard it on the
+-- absence of the unique index it ultimately enables: once the index
+-- exists the table is by definition deduped, so there is nothing left
+-- for the DELETE to do.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = 'idx_ob_snapshots_ticker_ts'
+    ) THEN
+        DELETE FROM ob_snapshots a USING ob_snapshots b
+            WHERE a.ctid < b.ctid
+              AND a.ticker = b.ticker
+              AND a.timestamp = b.timestamp;
+    END IF;
+END
+$do$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ob_snapshots_ticker_ts
     ON ob_snapshots (ticker, timestamp);
