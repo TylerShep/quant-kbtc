@@ -29,18 +29,22 @@ def extract_features(
     All inputs come from objects already available in the coordinator at
     entry time. Returns a flat dict ready for DB insertion.
     """
-    recent_candles = candle_aggregator.recent(10)
+    # `calculate_roc(closes, lookback)` requires `len(closes) >= lookback + 1`
+    # (it takes a return between `closes[-1]` and `closes[-(lookback+1)]`).
+    # We need to request at least 11 candles so the longest lookback (10)
+    # can populate; otherwise `roc_10` is silently `None` on every entry.
+    recent_candles = candle_aggregator.recent(11)
     closes = [c.close for c in recent_candles]
 
     roc_3 = calculate_roc(closes, 3)
     roc_5 = calculate_roc(closes, 5)
     roc_10 = calculate_roc(closes, 10)
 
-    # Green candle count (last 3 completed candles)
+    # Green candle count (last 3 completed candles).
     last3 = recent_candles[-3:] if len(recent_candles) >= 3 else recent_candles
     green_candles_3 = sum(1 for c in last3 if c.close > c.open)
 
-    # Candle body as pct of high-low range
+    # Candle body as pct of high-low range.
     candle_body_pct = None
     if recent_candles:
         c = recent_candles[-1]
@@ -48,15 +52,22 @@ def extract_features(
         if hl_range > 0:
             candle_body_pct = abs(c.close - c.open) / hl_range
 
-    # Volume ratio: latest candle volume / avg of prior 5
+    # Activity ratio: tick count on the latest completed candle vs the
+    # average of the prior 5. We use tick count rather than spot volume
+    # because the spot WS only exposes a 24h cumulative volume snapshot
+    # (not per-tick increments), which can decrease between ticks as old
+    # volume rolls off the back. Tick rate is a standard market-micro
+    # proxy for trade-arrival intensity. The DB column stays
+    # `volume_ratio` to avoid a schema migration / breaking historical
+    # rows; the semantic is now "activity ratio". See ml-quant.mdc.
     volume_ratio = None
     if len(recent_candles) >= 2:
-        latest_vol = getattr(recent_candles[-1], "volume", None)
+        latest_ticks = getattr(recent_candles[-1], "tick_count", 0) or 0
         prior = recent_candles[-6:-1] if len(recent_candles) >= 6 else recent_candles[:-1]
-        prior_vols = [getattr(c, "volume", 0) or 0 for c in prior]
-        avg_prior = sum(prior_vols) / len(prior_vols) if prior_vols else 0
-        if latest_vol and avg_prior > 0:
-            volume_ratio = latest_vol / avg_prior
+        prior_ticks = [getattr(c, "tick_count", 0) or 0 for c in prior]
+        avg_prior = sum(prior_ticks) / len(prior_ticks) if prior_ticks else 0
+        if latest_ticks > 0 and avg_prior > 0:
+            volume_ratio = latest_ticks / avg_prior
 
     # ATR as pct
     atr_pct = None

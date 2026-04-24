@@ -17,6 +17,14 @@ class Candle:
     low: float
     close: float
     volume: float = 0.0
+    # Per-candle tick count. Used by ml.feature_capture as an "activity"
+    # proxy when real per-tick spot volume isn't available (the spot WS
+    # only exposes a rolling 24h cumulative figure, which can decrease
+    # between ticks and so isn't a clean per-tick increment). Tick rate
+    # is a standard market-microstructure proxy for trade-arrival
+    # intensity. Always populated; defaults to 0 only on the first tick
+    # of a brand-new candle (which immediately becomes 1 below).
+    tick_count: int = 0
 
 
 class CandleAggregator:
@@ -43,6 +51,7 @@ class CandleAggregator:
                 low=price,
                 close=price,
                 volume=volume,
+                tick_count=1,
             )
             self._current_boundary = boundary
             if completed is not None:
@@ -54,6 +63,7 @@ class CandleAggregator:
         self._current.low = min(self._current.low, price)
         self._current.close = price
         self._current.volume += volume
+        self._current.tick_count += 1
         return None
 
     @property

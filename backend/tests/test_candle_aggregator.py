@@ -35,6 +35,27 @@ def test_ohlc_values_correct_within_interval():
     assert c.volume == 2.0
 
 
+def test_tick_count_increments_within_candle():
+    agg = CandleAggregator(interval_sec=900, max_candles=50)
+    base = 0.0
+    agg.on_tick(base + 0.0, 10.0)
+    agg.on_tick(base + 1.0, 11.0)
+    agg.on_tick(base + 2.0, 12.0)
+    agg.on_tick(base + 3.0, 13.0)
+    assert agg.current.tick_count == 4
+
+
+def test_tick_count_resets_on_new_candle():
+    agg = CandleAggregator(interval_sec=900, max_candles=50)
+    agg.on_tick(0.0, 10.0)
+    agg.on_tick(100.0, 11.0)
+    agg.on_tick(200.0, 12.0)
+    completed = agg.on_tick(900.0, 20.0)
+    assert completed is not None
+    assert completed.tick_count == 3
+    assert agg.current.tick_count == 1
+
+
 def test_deque_max_size_enforced():
     max_candles = 5
     agg = CandleAggregator(interval_sec=10, max_candles=max_candles)
