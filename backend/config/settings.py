@@ -184,6 +184,26 @@ class BotConfig:
         default_factory=lambda: _env_bool("ROC_LOW_CONVICTION_LIVE_ENABLED", False)
     )
 
+    # BUG-028 expiry-race guard. Refuse to evaluate or place an entry when
+    # the active contract is within this many seconds of close. Also treats
+    # ``time_remaining_sec is None`` as too-close (the case that produced
+    # every observed EXPIRY_409_SETTLED -- ticker rotated but no ``ticker``
+    # WS event had populated ``state.expiry_time`` yet).
+    min_seconds_to_expiry: int = field(
+        default_factory=lambda: _env_int("MIN_SECONDS_TO_EXPIRY", 120)
+    )
+    # BUG-028 layer-2 backstop. Right before ``client.create_order`` in
+    # ``position_manager.enter()``, fetch the market and abort if Kalshi
+    # reports anything other than ``open``. Catches the residual race where
+    # the coordinator's time guard passed (book was open, ticker was the
+    # right one, time was >120s away) but Kalshi closed the book in the
+    # ~10-50ms between decision and order placement. Default ON; can be
+    # disabled via env if the extra REST hop is ever shown to add latency
+    # that costs more than the EXPIRY_409 trades it prevents.
+    expiry_market_status_check_enabled: bool = field(
+        default_factory=lambda: _env_bool("EXPIRY_MARKET_STATUS_CHECK_ENABLED", True)
+    )
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"

@@ -111,6 +111,7 @@ async def diagnostics():
         "can_trade": coordinator.circuit_breaker.can_trade(),
         "book_healthy": book_healthy,
         "dashboard_ws_clients": len(dm._listeners),
+        "near_expiry_skips": dict(coordinator._near_expiry_skip_count),
     }
 
 

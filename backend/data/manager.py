@@ -264,7 +264,39 @@ class DataManager:
         if self._kalshi_ws:
             tk = self._kalshi_ws.active_tickers.get(symbol)
             if tk:
+                # BUG-028 layer-4. Detect a *true* ticker rotation here --
+                # going from one non-None ticker to a different one means the
+                # previous contract closed and the bot has rolled forward, so
+                # the stale ``expiry_time`` (now in the past) must be cleared
+                # to let the REST fallback below re-seed for the new contract.
+                # The None -> ticker transition (first ever assignment) is
+                # *not* a rotation and must NOT clear an ``expiry_time`` that
+                # was already populated by an earlier ``ticker`` WS event --
+                # otherwise we'd repeatedly clobber fresh WS values with
+                # potentially staler REST cache.
+                if state.kalshi_ticker is not None and state.kalshi_ticker != tk:
+                    state.expiry_time = None
                 state.kalshi_ticker = tk
+
+            # BUG-028 layer-4 (root cause). Seed ``state.expiry_time`` from the
+            # REST ``close_time`` that ``_resolve_tickers`` has already
+            # retrieved, instead of waiting for a ``ticker`` channel WS event
+            # that may never arrive (the Kalshi ticker channel is best-effort
+            # for the active contract, and the post-restart window observed in
+            # production sometimes sees no ticker event at all). Only seed
+            # when ``expiry_time`` is unset so a fresher ticker-WS value is
+            # never overwritten by stale REST data.
+            if state.expiry_time is None:
+                close_times = getattr(self._kalshi_ws, "_active_close_times", {})
+                close_time_str = close_times.get(symbol) if isinstance(close_times, dict) else None
+                if close_time_str:
+                    try:
+                        state.expiry_time = datetime.fromisoformat(
+                            close_time_str.replace("Z", "+00:00")
+                        )
+                        state.update_time_remaining()
+                    except Exception:
+                        pass
 
         for cb in self._listeners:
             try:

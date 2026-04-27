@@ -94,6 +94,12 @@ class Coordinator:
         self._live_entry_in_flight = False
         self._live_exit_in_flight = False
 
+        # BUG-028 telemetry: counts how many ticks were skipped because the
+        # active contract was within `min_seconds_to_expiry` (or its
+        # remaining time was unknown). Surfaced on /api/diagnostics so we
+        # can spot rotation-window regressions without grepping logs.
+        self._near_expiry_skip_count: dict[str, int] = {"paper": 0, "live": 0}
+
         # ML feature snapshots: keyed by ticker, captured at entry, consumed at exit
         self._pending_features: dict[str, dict] = {}
 
@@ -418,7 +424,15 @@ class Coordinator:
                     if trade:
                         self._on_trade_exit(trade, symbol, "paper")
 
-        near_expiry = state.time_remaining_sec is not None and state.time_remaining_sec < 120
+        # BUG-028: refuse entry when the time-to-expiry is unknown or below
+        # the configured threshold. Previous version (`time_remaining_sec is
+        # not None and ... < 120`) let `None` pass, which is exactly the
+        # state we observed every time an EXPIRY_409_SETTLED fired: ticker
+        # rotated but no `ticker` WS event had populated `expiry_time` for
+        # the new contract yet. With this guard, a missing remaining-time
+        # value is treated as too-close-to-expiry rather than as
+        # signal-quality-clean.
+        near_expiry = self._is_near_expiry(state.time_remaining_sec)
         if not trader.has_position and not near_expiry:
             ticks_since_exit = self._tick_count - self._last_paper_exit_tick
             book_healthy = self._is_book_healthy(state)
@@ -427,6 +441,8 @@ class Coordinator:
                     symbol, state, features, regime,
                     trader, sizer, breaker, "paper",
                 )
+        elif not trader.has_position and self._tick_count % 60 == 0:
+            self._log_near_expiry_skip(state, "paper")
 
     # ── Live lane ──────────────────────────────────────────────────────
 
@@ -449,7 +465,8 @@ class Coordinator:
                         exit_price=exit_price,
                     ))
 
-        near_expiry = state.time_remaining_sec is not None and state.time_remaining_sec < 120
+        # BUG-028: see _run_paper_lane for rationale on the None-case fix.
+        near_expiry = self._is_near_expiry(state.time_remaining_sec)
         if (pm.can_enter
                 and self.trading_paused == "off"
                 and not near_expiry
@@ -461,6 +478,11 @@ class Coordinator:
                     symbol, state, features, regime,
                     trader, sizer, breaker, "live",
                 )
+        elif (pm.can_enter
+                and self.trading_paused == "off"
+                and not self._live_entry_in_flight
+                and self._tick_count % 60 == 0):
+            self._log_near_expiry_skip(state, "live")
 
     # ── Trade exit / entry callbacks ───────────────────────────────────
 
@@ -1326,6 +1348,46 @@ class Coordinator:
             candles_held=pos.candles_held,
         )
         return exit_reason
+
+    def _is_near_expiry(self, time_remaining_sec: Optional[int]) -> bool:
+        """BUG-028: True when the contract is within the configured expiry
+        buffer or the remaining time is unknown.
+
+        The ``None`` case is the one that produced every observed
+        EXPIRY_409_SETTLED trade: ``state.expiry_time`` had not been
+        populated yet because no ``ticker`` WS event had arrived for the
+        active ticker. The previous guard (``time_remaining_sec is not
+        None and ... < 120``) silently passed in that case, so the entry
+        path proceeded against a contract whose actual close time was
+        unknown to the bot. Treating ``None`` as ``near_expiry`` is the
+        safer default -- we cannot prove the contract has time to round-
+        trip in, so we abstain.
+        """
+        threshold = settings.bot.min_seconds_to_expiry
+        if time_remaining_sec is None:
+            return True
+        return time_remaining_sec < threshold
+
+    def _log_near_expiry_skip(self, state, mode: str) -> None:
+        """Telemetry helper for BUG-028: emit a structured log line and
+        bump the diagnostics counter on a 1-per-60-tick cadence so the
+        skip is visible without spamming. Persistence to ``signal_log``
+        happens via the regular ``_persist_signal`` path inside
+        ``_evaluate_entry_for``; we don't write a row here because we
+        haven't computed any features (the goal is to be cheap on every
+        tick during the close window, not to amplify load)."""
+        self._near_expiry_skip_count[mode] = (
+            self._near_expiry_skip_count.get(mode, 0) + 1
+        )
+        ticker = getattr(state, "kalshi_ticker", None)
+        logger.info(
+            "coordinator.entry_skipped_near_expiry",
+            mode=mode,
+            ticker=ticker,
+            time_remaining_sec=state.time_remaining_sec,
+            threshold_sec=settings.bot.min_seconds_to_expiry,
+            cumulative_skips=self._near_expiry_skip_count[mode],
+        )
 
     def _is_book_healthy(self, state) -> bool:
         """Reject entries when the order book is empty or data feeds are stale."""

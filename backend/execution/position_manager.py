@@ -560,6 +560,36 @@ class PositionManager:
             return False
         return True
 
+    async def _market_open_for_entry(self, ticker: str) -> bool:
+        """BUG-028: confirm Kalshi reports the market as ``open`` right
+        before placing an entry order.
+
+        Returns True if the market is confirmed open. Returns True (fail-
+        open) if the recheck call itself errors -- the coordinator's
+        time-to-expiry guard is the primary defense and we don't want a
+        transient REST blip to convert into a missed signal. Returns
+        False only when Kalshi explicitly reports a non-open status
+        (``closing``, ``closed``, ``settled``, ``finalized``,
+        ``determined``).
+        """
+        try:
+            data = await self.client.get_market(ticker)
+            market = data.get("market", data)
+            status = (market.get("status") or "").lower()
+            if status and status != "open":
+                logger.info(
+                    "position_manager.market_not_open_pre_entry",
+                    ticker=ticker, status=status,
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning(
+                "position_manager.market_status_recheck_failed",
+                ticker=ticker, error=str(e),
+            )
+            return True
+
     async def _recover_order_after_failure(self, client_order_id: str) -> Optional[dict]:
         """After create_order throws, check if the order actually went through."""
         try:
@@ -631,6 +661,31 @@ class PositionManager:
             # Pre-order: confirm exchange is flat
             if not await self._check_flat_on_exchange(ticker):
                 self._transition(PositionState.DESYNC)
+                return None
+
+            # BUG-028 layer-2: refuse to place an entry order against a
+            # market that Kalshi reports as anything other than ``open``.
+            # The coordinator's pre-evaluation expiry guard is the primary
+            # defense, but this is a cheap (~25ms) backstop against the
+            # ~10-100ms race between "decide to enter" and
+            # "create_order hits the wire". When the time guard above let
+            # us pass because ``state.expiry_time`` was None (e.g. the
+            # ticker just rotated and no ``ticker`` WS event has populated
+            # it yet) this REST recheck is the only thing standing
+            # between us and an EXPIRY_409_SETTLED trade.
+            #
+            # Fail-open: if the recheck call itself errors (Kalshi 5xx,
+            # network blip), we log and proceed. Treating a transient REST
+            # failure as ``status != open`` would convert one class of
+            # rare race into a different class of avoidable miss; the
+            # primary time guard already caught the common case.
+            if (settings.bot.expiry_market_status_check_enabled
+                    and not await self._market_open_for_entry(ticker)):
+                logger.warning(
+                    "position_manager.enter_blocked_market_not_open",
+                    ticker=ticker,
+                )
+                self._transition(PositionState.FLAT)
                 return None
 
             # BUG-025/BUG-027: capture the wallet balance *before* placing
