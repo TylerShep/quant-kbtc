@@ -55,6 +55,7 @@ kbtc-backups/
 *.sqlite
 *.sqlite3
 *.db
+trade_features_export.csv
 
 # ML model artifacts (keep .gitkeep)
 backend/ml/models/*
