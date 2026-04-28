@@ -1845,6 +1845,22 @@ class Coordinator:
         non-zero drift now indicates a real reconciliation problem
         (missed fee, ledger lag, partial settlement) rather than a
         formula bug.
+
+        Historical drift on rows 702/716/750/788 (2026-04-20 -- 2026-04-22)
+        is an EXPECTED artifact, not a current bug. Those trades were
+        captured by the pre-BUG-027 code path that snapshotted
+        ``wallet_at_entry`` *after* the entry order had already debited
+        the wallet, so their persisted ``wallet_pnl`` reconstructs as
+        ``pnl + entry_cost + entry_fees`` -- which is exactly what the
+        data shows to the cent on all four rows. The
+        ``scripts/backfill_pnl_bug027.py`` backfill rewrote ``pnl`` to
+        the correct cash-flow value but intentionally did not touch
+        ``wallet_pnl`` because the historical capture timing isn't
+        recoverable from the row alone (see the script's docstring).
+        Trades from 2026-04-23 12:34 onward (commit ``0ce407e``) have
+        correct wallet capture and zero drift -- those are the canonical
+        post-fix records. Do not re-investigate this drift; see the
+        2026-04-28 Tier 0 findings doc for the full diagnosis.
         """
         WALLET_DRIFT_QUARANTINE_DOLLARS = 0.05
 
