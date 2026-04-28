@@ -14,6 +14,13 @@ from strategies.roc import calculate_roc
 
 logger = structlog.get_logger()
 
+# Half-width (cents) used by ``book_thickness_at_offer``. Matches the
+# ladder window the live execution path tends to walk through during a
+# medium-sized fill. Tightening this would understate available liquidity
+# in wider-spread Kalshi contracts; loosening it would dilute the signal
+# with depth that we'll never actually consume on a single trade.
+BOOK_THICKNESS_HALF_WIDTH_CENTS = 5.0
+
 
 def extract_features(
     *,
@@ -88,6 +95,47 @@ def extract_features(
         tfi = historical_sync.get_tfi(state.kalshi_ticker)
         taker_buy_vol, taker_sell_vol = historical_sync.get_tfi_volumes(state.kalshi_ticker)
 
+    # ── Execution-quality features (Tier 1.b, 2026-04-28) ──────────────
+    # These describe HOW the trade is likely to fill, not WHAT the market
+    # state looks like. See backend/migrations/008_execution_quality_features.sql.
+
+    minutes_to_contract_close = None
+    if state.time_remaining_sec is not None:
+        minutes_to_contract_close = round(state.time_remaining_sec / 60.0, 3)
+
+    quoted_spread_at_entry_bps = None
+    if (features.spread_cents is not None
+            and features.mid_price is not None
+            and features.mid_price > 0):
+        # mid_price is in cents (Kalshi quotes are 0-100c). bps = (spread / mid) * 10000.
+        # Example: spread=2c, mid=20c -> 1000bps. Yes, Kalshi spreads are wide.
+        quoted_spread_at_entry_bps = int(round(
+            (features.spread_cents / features.mid_price) * 10000
+        ))
+
+    book_thickness_at_offer = None
+    book = getattr(state, "order_book", None)
+    if book is not None and features.mid_price is not None:
+        try:
+            book_thickness_at_offer = book.book_thickness_within(
+                features.mid_price, BOOK_THICKNESS_HALF_WIDTH_CENTS
+            )
+        except (AttributeError, TypeError):
+            # Defensive: a stub state.order_book in tests may not implement
+            # book_thickness_within. Treat as missing rather than raise.
+            book_thickness_at_offer = None
+
+    # recent_trade_count_60s: use the latest 1m candle's tick_count as a
+    # direct proxy for "how active is this contract right now". The
+    # existing ``volume_ratio`` is a *change* signal (now vs. recent avg);
+    # this one is the absolute level, which matters separately for fill
+    # quality reasoning.
+    recent_trade_count_60s = None
+    if recent_candles:
+        latest_ticks = getattr(recent_candles[-1], "tick_count", None)
+        if latest_ticks is not None:
+            recent_trade_count_60s = int(latest_ticks)
+
     return {
         "obi": round(getattr(features, "obi_raw", features.obi), 4) if features.obi is not None else None,
         "roc_3": round(roc_3, 4) if roc_3 is not None else None,
@@ -106,6 +154,11 @@ def extract_features(
         "tfi": round(tfi, 4) if tfi is not None else None,
         "taker_buy_vol": taker_buy_vol,
         "taker_sell_vol": taker_sell_vol,
+        # v2 execution-quality features
+        "minutes_to_contract_close": minutes_to_contract_close,
+        "quoted_spread_at_entry_bps": quoted_spread_at_entry_bps,
+        "book_thickness_at_offer": book_thickness_at_offer,
+        "recent_trade_count_60s": recent_trade_count_60s,
     }
 
 
@@ -126,6 +179,8 @@ async def save_features(
             "green_candles_3", "candle_body_pct", "volume_ratio",
             "time_remaining_sec", "hour_of_day", "day_of_week",
             "taker_buy_vol", "taker_sell_vol",
+            "minutes_to_contract_close", "quoted_spread_at_entry_bps",
+            "book_thickness_at_offer", "recent_trade_count_60s",
         ]
         vals = [
             trade_id, trading_mode, ticker,
@@ -145,6 +200,10 @@ async def save_features(
             feature_dict.get("day_of_week"),
             feature_dict.get("taker_buy_vol"),
             feature_dict.get("taker_sell_vol"),
+            feature_dict.get("minutes_to_contract_close"),
+            feature_dict.get("quoted_spread_at_entry_bps"),
+            feature_dict.get("book_thickness_at_offer"),
+            feature_dict.get("recent_trade_count_60s"),
         ]
         placeholders = ", ".join(f"%s" for _ in cols)
         col_str = ", ".join(cols)

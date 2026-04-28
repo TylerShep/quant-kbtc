@@ -176,6 +176,11 @@ CREATE TABLE IF NOT EXISTS trade_features (
     time_remaining_sec INTEGER,
     hour_of_day     INTEGER,
     day_of_week     INTEGER,
+    -- Execution-quality features (added 2026-04-28, migration 008)
+    minutes_to_contract_close   NUMERIC(8,3),
+    quoted_spread_at_entry_bps  INTEGER,
+    book_thickness_at_offer     NUMERIC(20,2),
+    recent_trade_count_60s      INTEGER,
     -- Label (filled at exit)
     label           SMALLINT,
     pnl             NUMERIC(14,4),

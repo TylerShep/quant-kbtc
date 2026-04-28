@@ -45,6 +45,15 @@ ENTRY_FEATURES = [
     "atr_pct", "spread_pct", "bid_depth", "ask_depth",
     "green_candles_3", "candle_body_pct", "volume_ratio",
     "time_remaining_sec", "hour_of_day", "day_of_week",
+    # v2 execution-quality features (Tier 1.b, 2026-04-28). They go live
+    # as soon as ENTRY_FEATURES references them, but the ML model in
+    # production was trained without them and so will treat them as zero
+    # at inference time (fail-open via ml_gate's feature_dict.get(f, 0)).
+    # The next retrain after enough rows accumulate (~7 days) will
+    # produce xgb_entry_v2 that actually uses them. See migration 008
+    # and docs/runbooks/ml-retraining.md.
+    "minutes_to_contract_close", "quoted_spread_at_entry_bps",
+    "book_thickness_at_offer", "recent_trade_count_60s",
 ]
 
 

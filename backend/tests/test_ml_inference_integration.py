@@ -95,6 +95,12 @@ def _make_synthetic_training_df(n_rows: int = 200, seed: int = 42) -> pd.DataFra
             "time_remaining_sec": int(rng.integers(60, 3600)),
             "hour_of_day": int(rng.integers(0, 24)),
             "day_of_week": int(rng.integers(0, 7)),
+            # v2 execution-quality features (added 2026-04-28).
+            # Synthetic noise — the test's signal lives in obi + roc_3 only.
+            "minutes_to_contract_close": float(rng.uniform(1.0, 60.0)),
+            "quoted_spread_at_entry_bps": int(rng.integers(50, 2000)),
+            "book_thickness_at_offer": float(rng.uniform(10, 5000)),
+            "recent_trade_count_60s": int(rng.integers(0, 50)),
             "label": label,
         }
         rows.append(row)

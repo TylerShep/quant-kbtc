@@ -60,6 +60,24 @@ class OrderBookState:
         total = bid_vol + ask_vol
         return bid_vol / total if total > 0 else 0.5
 
+    def book_thickness_within(self, center_price: float, half_width_cents: float) -> float:
+        """Sum of contracts available on both sides within ``half_width_cents``
+        of ``center_price``. Used as an entry-time execution-quality feature:
+        a thicker book at the price we're about to trade at means we'll fill
+        with less adverse selection. Direction-agnostic by design — we capture
+        this BEFORE the entry direction is finalized so it can't accidentally
+        bias toward one side. See ml-quant.mdc."""
+        lo = center_price - half_width_cents
+        hi = center_price + half_width_cents
+        thickness = 0.0
+        for price, size in self.bids.items():
+            if lo <= price <= hi:
+                thickness += size
+        for price, size in self.asks.items():
+            if lo <= price <= hi:
+                thickness += size
+        return thickness
+
     def apply_snapshot(self, yes_rows: list, no_rows: list):
         self.bids.clear()
         self.asks.clear()
