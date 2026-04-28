@@ -135,9 +135,17 @@ def test_load_model_no_file_is_safe(reset_artifact, tmp_path, monkeypatch):
     assert p_win == pytest.approx(0.5)
 
 
-def test_ml_config_defaults_off():
-    """The gate must ship disabled. Operator must explicitly opt in via env."""
+def test_ml_config_defaults_off(monkeypatch):
+    """The gate must ship disabled. Operator must explicitly opt in via env.
+
+    We strip any ambient ML_* vars so the test asserts the *default* behavior
+    of MLConfig regardless of which environment runs the test (some prod
+    containers now have ML_GATE_ENABLED=true set in .env after shadow-mode
+    rollout — that's correct for prod, but this test pins the code default).
+    """
     from config.settings import MLConfig
+    for var in ("ML_GATE_ENABLED", "ML_GATE_PAPER", "ML_GATE_LIVE", "ML_MIN_P_WIN"):
+        monkeypatch.delenv(var, raising=False)
     cfg = MLConfig()
     assert cfg.gate_enabled is False, (
         "ML_GATE_ENABLED must default to False so deploys don't accidentally "
