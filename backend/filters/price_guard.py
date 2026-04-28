@@ -48,6 +48,20 @@ class PriceGuard:
 
         cfg = settings.risk
 
+        # Short-specific late-cycle block. Paper attribution on 21d of trades
+        # showed shorts entered with <13 min to close had 0-30% WR and lost
+        # $6.6k net across 27 trades, while shorts entered with >=13 min were
+        # 59% WR / +$1k net. The settlement-time gamma on Kalshi 15-min
+        # contracts blows up underwater shorts long before SHORT_SETTLEMENT_GUARD
+        # at the exit layer can save them. Block on entry instead.
+        if (direction == "short"
+                and time_remaining_sec is not None
+                and time_remaining_sec < cfg.short_min_seconds_to_expiry):
+            return False, (
+                f"SHORT_ENTRY_TOO_CLOSE_TO_EXPIRY_{time_remaining_sec}s"
+                f"<{cfg.short_min_seconds_to_expiry}s"
+            )
+
         if direction == "long":
             bounds = LONG_BOUNDS.get(atr_regime, LONG_BOUNDS["MEDIUM"])
             min_p = bounds["min_price"]
@@ -66,8 +80,13 @@ class PriceGuard:
             short_floor = max(bounds["min_price"], cfg.short_min_entry_price)
             max_p = bounds["max_price"]
 
-            if time_remaining_sec is not None and time_remaining_sec < 300:
-                max_p = min(max_p + 5, 95)
+            # NOTE: previously this branch widened short max_p by 5c when
+            # ``time_remaining_sec < 300``, i.e. became MORE permissive
+            # exactly inside the gamma blow-up window. Removed 2026-04-28
+            # because the new ``short_min_seconds_to_expiry`` guard above
+            # now hard-blocks the same window, and even outside the block
+            # there's no empirical reason to loosen the upper price bound
+            # late in a contract's life -- if anything the opposite.
 
             if entry_price < short_floor:
                 return False, f"SHORT_ENTRY_TOO_CHEAP_{entry_price}c<{short_floor}c"

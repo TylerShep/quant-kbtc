@@ -148,6 +148,14 @@ class RiskConfig:
     long_max_entry_price: float = field(default_factory=lambda: _env_float("LONG_MAX_ENTRY_PRICE", 60.0))
     short_size_mult: float = field(default_factory=lambda: _env_float("SHORT_SIZE_MULT", 0.7))
     short_settlement_guard_sec: int = field(default_factory=lambda: _env_int("SHORT_SETTLEMENT_GUARD_SEC", 300))
+    # Short entries inside the contract's final ``short_min_seconds_to_expiry``
+    # window are blocked at the price-guard layer. Paper-trading attribution on
+    # 2026-04-07 -- 2026-04-28 (231 short trades) showed shorts entered with
+    # >=13 min remaining were 59% WR / +$1,010 net, while shorts entered with
+    # <13 min were 0-30% WR / -$6,619 net across 27 trades. The 5-min cohort
+    # exited 13/14 via SHORT_SETTLEMENT_GUARD with 0% win rate. Block on entry
+    # rather than panic-exit. See docs/runbooks/live-edge-filters.md.
+    short_min_seconds_to_expiry: int = field(default_factory=lambda: _env_int("SHORT_MIN_SECONDS_TO_EXPIRY", 780))
     short_stop_loss_mult: float = field(default_factory=lambda: _env_float("SHORT_STOP_LOSS_MULT", 1.5))
     short_trend_lookback_candles: int = field(default_factory=lambda: _env_int("SHORT_TREND_LOOKBACK_CANDLES", 4))
     short_trend_soften_rise_pct: float = field(default_factory=lambda: _env_float("SHORT_TREND_SOFTEN_RISE_PCT", 0.20))
