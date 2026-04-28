@@ -57,7 +57,38 @@ ENTRY_FEATURES = [
 ]
 
 
-def load_data(csv_path: str | None = None, db_url: str | None = None) -> pd.DataFrame:
+# Minimum rows required when training a LIVE-only model. Below this, the
+# 5-fold CV used in train() will produce wildly unstable metrics and any
+# precision claim from the resulting model is noise. The number is
+# deliberately conservative — increase as the live tail grows. Tracked
+# alongside the >=200 MIN_ROWS used by retrain_promote for the default
+# (both-mode) trainer.
+MIN_LIVE_ROWS_FOR_LIVE_MODE = 50
+
+
+def load_data(
+    csv_path: str | None = None,
+    db_url: str | None = None,
+    mode: str = "both",
+) -> pd.DataFrame:
+    """Load labeled feature rows.
+
+    Args:
+        csv_path: Path to a pre-exported CSV.
+        db_url: Postgres URL.
+        mode: One of ``"paper"``, ``"live"``, or ``"both"``. The latter
+            is the historical default and trains on the full mixed
+            dataset. ``"paper"`` and ``"live"`` filter by
+            ``trading_mode``, which lets us A/B paper-trained vs
+            live-trained models against each other once the live tail
+            has enough rows. ``"live"`` raises if the resulting frame has
+            fewer than ``MIN_LIVE_ROWS_FOR_LIVE_MODE`` rows so an
+            operator doesn't accidentally ship a model trained on
+            ten samples.
+    """
+    if mode not in ("paper", "live", "both"):
+        raise ValueError(f"mode must be 'paper', 'live', or 'both' (got {mode!r})")
+
     if csv_path:
         df = pd.read_csv(csv_path)
     elif db_url:
@@ -71,6 +102,25 @@ def load_data(csv_path: str | None = None, db_url: str | None = None) -> pd.Data
         raise ValueError("Provide either --csv or --db-url")
 
     df = df[df["label"].notna()].copy()
+
+    if mode != "both":
+        if "trading_mode" not in df.columns:
+            raise ValueError(
+                f"mode={mode!r} requires a 'trading_mode' column in the source. "
+                "Re-export from trade_features (the column is included by default)."
+            )
+        before = len(df)
+        df = df[df["trading_mode"] == mode].copy()
+        print(f"  mode filter: {mode!r} -> {len(df)} rows (from {before})")
+        if mode == "live" and len(df) < MIN_LIVE_ROWS_FOR_LIVE_MODE:
+            raise ValueError(
+                f"--mode live requires at least {MIN_LIVE_ROWS_FOR_LIVE_MODE} "
+                f"labeled rows, but only {len(df)} are available. The live tail "
+                "is too small for a stable 5-fold CV. Run "
+                "scripts/backfill_live_trade_features.py and let more live trades "
+                "accumulate before retrying."
+            )
+
     required = ["label"] + ENTRY_FEATURES
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -78,7 +128,20 @@ def load_data(csv_path: str | None = None, db_url: str | None = None) -> pd.Data
     return df
 
 
-def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
+def train(
+    df: pd.DataFrame,
+    output_name: str = "xgb_entry_v1.pkl",
+    *,
+    training_mode: str = "both",
+) -> dict:
+    """Train an XGBoost entry-gate model on ``df``.
+
+    ``training_mode`` is recorded in the artifact and in the meta JSON for
+    downstream visibility (so retrain_promote can compare like-for-like
+    incumbent vs candidate, and so the bot can log which mode the loaded
+    model was trained on at startup). Defaults to ``"both"`` for backward
+    compatibility with the existing cron / promotion pipeline.
+    """
     df["binary_label"] = (df["label"] == 1).astype(int)
 
     missing = [f for f in ENTRY_FEATURES if f not in df.columns]
@@ -159,6 +222,7 @@ def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
             "model": model,
             "features": available_features,
             "threshold": best_threshold,
+            "training_mode": training_mode,
         }
         joblib.dump(artifact, output_path)
     except ImportError:
@@ -167,6 +231,7 @@ def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
             "model": model,
             "features": available_features,
             "threshold": best_threshold,
+            "training_mode": training_mode,
         }
         with open(output_path, "wb") as f:
             pickle.dump(artifact, f)
@@ -177,6 +242,7 @@ def train(df: pd.DataFrame, output_name: str = "xgb_entry_v1.pkl") -> dict:
         "rows": len(df),
         "features": available_features,
         "threshold": best_threshold,
+        "training_mode": training_mode,
         "oos_precision": round(oos_precision, 4),
         "oos_recall": round(report.get("1", {}).get("recall", 0), 4),
         "win_rate": round(float(y.mean()), 4),
@@ -195,17 +261,30 @@ def main():
     parser.add_argument("--csv", help="Path to trade_features CSV export")
     parser.add_argument("--db-url", help="Database connection URL")
     parser.add_argument("--output", default="xgb_entry_v1.pkl", help="Output model filename")
+    parser.add_argument(
+        "--mode",
+        choices=("paper", "live", "both"),
+        default="both",
+        help=(
+            "Filter trade_features by trading_mode before training. "
+            "'both' (default) preserves the historical behaviour and trains on "
+            "the full mixed dataset. 'paper' / 'live' enable A/B comparison "
+            "between paper-trained and live-trained models. 'live' enforces a "
+            f"minimum of {MIN_LIVE_ROWS_FOR_LIVE_MODE} labeled rows so an "
+            "operator can't accidentally ship a model trained on noise."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.csv and not args.db_url:
         print("ERROR: Provide either --csv or --db-url", file=sys.stderr)
         sys.exit(1)
 
-    df = load_data(csv_path=args.csv, db_url=args.db_url)
+    df = load_data(csv_path=args.csv, db_url=args.db_url, mode=args.mode)
     if len(df) < 100:
         print(f"WARNING: Only {len(df)} labeled rows. Recommended minimum is 500.", file=sys.stderr)
 
-    train(df, output_name=args.output)
+    train(df, output_name=args.output, training_mode=args.mode)
 
 
 if __name__ == "__main__":

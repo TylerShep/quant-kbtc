@@ -34,7 +34,8 @@ def load_model() -> None:
                 _artifact = pickle.load(f)
         logger.info("ml.model_loaded", path=str(_MODEL_PATH),
                      features=len(_artifact.get("features", [])),
-                     threshold=_artifact.get("threshold", 0.55))
+                     threshold=_artifact.get("threshold", 0.55),
+                     training_mode=_artifact.get("training_mode", "unknown"))
     except Exception as e:
         logger.error("ml.model_load_failed", error=str(e))
         _artifact = None

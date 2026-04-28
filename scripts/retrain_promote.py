@@ -103,6 +103,18 @@ def _decide_promotion(candidate_meta: dict, incumbent_meta: dict | None) -> tupl
         reasons.append("OK: no incumbent — first deploy")
         return True, reasons
 
+    # Surface a training_mode swap so the operator notices when a "live"
+    # model is about to overwrite a "both" incumbent (or vice versa).
+    # Don't auto-fail — sometimes the swap is intentional — but log it
+    # prominently so a human reviewing the cron output catches it.
+    inc_mode = incumbent_meta.get("training_mode", "unknown")
+    cand_mode = candidate_meta.get("training_mode", "unknown")
+    if inc_mode != cand_mode:
+        reasons.append(
+            f"WARN: training_mode mismatch (incumbent={inc_mode!r}, candidate={cand_mode!r}). "
+            "If this was unintentional, abort the promotion and re-run with the matching --mode."
+        )
+
     inc_p = float(incumbent_meta.get("oos_precision", 0))
     delta = cand_p - inc_p
     if cand_p + REGRESSION_TOLERANCE < inc_p:
@@ -116,7 +128,10 @@ def _decide_promotion(candidate_meta: dict, incumbent_meta: dict | None) -> tupl
     )
 
     inc_rows = int(incumbent_meta.get("rows", 0))
-    if rows < inc_rows * 0.95:
+    # The 0.95 floor only applies for like-for-like training_mode comparisons.
+    # When we deliberately swap modes (e.g. paper -> live), the row counts
+    # are not comparable and this check would always fail.
+    if inc_mode == cand_mode and rows < inc_rows * 0.95:
         reasons.append(
             f"FAIL: candidate has fewer rows than incumbent ({rows} < {inc_rows}); "
             "data may have been wiped"
@@ -172,6 +187,20 @@ def main() -> int:
         help="Postgres URL (defaults to $DATABASE_URL)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Train + report only; never promote")
+    parser.add_argument(
+        "--mode",
+        choices=("paper", "live", "both"),
+        default="both",
+        help=(
+            "Filter trade_features by trading_mode before training. "
+            "'both' (default) preserves the historical cron behaviour. "
+            "'live' / 'paper' produce focused models for A/B comparison; "
+            "the promotion gate then compares like-for-like against the "
+            "incumbent's recorded training_mode. Avoid mixing modes across "
+            "promotion runs unless you intentionally want to swap the "
+            "production model's training population."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.csv and not args.db_url:
@@ -179,7 +208,7 @@ def main() -> int:
         return 1
 
     try:
-        df = train_xgb.load_data(csv_path=args.csv, db_url=args.db_url)
+        df = train_xgb.load_data(csv_path=args.csv, db_url=args.db_url, mode=args.mode)
     except Exception as exc:
         print(f"ERROR: load_data failed: {exc}", file=sys.stderr)
         return 1
@@ -190,7 +219,7 @@ def main() -> int:
 
     candidate_name = f"xgb_entry_v1_candidate_{_utc_stamp()}.pkl"
     try:
-        candidate_meta = train_xgb.train(df, output_name=candidate_name)
+        candidate_meta = train_xgb.train(df, output_name=candidate_name, training_mode=args.mode)
     except Exception as exc:
         print(f"ERROR: training failed: {exc}", file=sys.stderr)
         return 1
