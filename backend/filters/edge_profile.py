@@ -2,20 +2,30 @@
 Live-lane edge profile filter.
 
 Restricts the LIVE trading lane to the subset of trade setups that showed
-statistically significant positive expectancy in 7 days of paper trading
-(2026-04-13 → 2026-04-19, 245 clean trades after the bankroll-sizing fix).
+statistically significant positive expectancy in paper trading.
 
-Findings the defaults encode:
-  * Long side: t=3.31 significant (+$33.13/trade avg over 148 trades)
-  * Short side: t=-2.17 significant (-$15.17/trade avg over 97 trades) → block
-  * Entry price ≤ $25: 59.3% WR vs 48% baseline → cap
-  * OBI+ROC agreement: 88.9% WR (8/9, p≈0.020) → exempt from price cap
-  * OBI/TIGHT driver: net -$329 across 10 trades → block
-  * ROC LOW: profit dominated by single $1 settlement windfall → block
-  * Asia overnight (0-7 UTC): +$1.83/trade, near-zero edge → block
+Re-calibrated 2026-04-29 against 14-day paper window (2026-04-15 →
+2026-04-29, 522 clean trades). Findings the new defaults encode:
+
+  * Long side: 309 trades, +$114,197 net, 53% WR. Edge is robust across
+    every UTC hour. Original 0-7 UTC block was costing +$36,313 of long
+    PnL — hours 03/05/06 alone produced +$28,513. Block list cleared.
+  * Short side: 213 trades, -$6,021 net overall, BUT cleanly bimodal:
+      - Cheap (<$40) NORMAL conviction: 89 trades @ $30 bucket lost
+        -$12,893 (37% WR). This is the entire short anti-edge.
+      - HIGH conviction shorts: 12 trades, +$1,799 net, 75% WR.
+      - Shorts at $50+: 56 trades, +$6,400 net, 70%+ WR.
+    Replace ``EDGE_LIVE_LONG_ONLY=true`` blanket block with two targeted
+    gates: ``short_min_price`` and ``short_min_conviction``.
+  * Cheap entries (<$25) carry positive long expectancy still; the
+    ``max_entry_price`` cap stays in place.
+  * OBI+ROC agreement: 92.3% WR for longs, 72.7% WR for HIGH shorts.
+    Stays exempt from the price cap.
+  * OBI/TIGHT, ROC/TIGHT drivers and LOW conviction trades remain blocked
+    per the prior calibrations (still negative or noisy in 14-day window).
 
 Paper lane is NEVER affected by this filter — it continues to take the full
-strategy for ongoing data collection and ML model training.
+strategy for ongoing data collection and ML training.
 
 The filter is a pure function of (decision, entry_price, now_utc, config),
 so it is easy to test in isolation. It is the LAST filter in the entry
@@ -36,6 +46,14 @@ from strategies.spread_div import SpreadState
 logger = structlog.get_logger()
 
 
+_CONVICTION_RANK = {
+    Conviction.NONE: 0,
+    Conviction.LOW: 1,
+    Conviction.NORMAL: 2,
+    Conviction.HIGH: 3,
+}
+
+
 def _driver_base(decision: TradeDecision) -> str:
     """Return the canonical driver label as it appears in allowed_drivers.
 
@@ -45,6 +63,19 @@ def _driver_base(decision: TradeDecision) -> str:
     OBI/TIGHT is not.
     """
     return decision.signal_driver
+
+
+def _meets_short_min_conviction(decision_conviction: Conviction, min_label: str) -> bool:
+    """True when the decision's conviction is >= the configured minimum.
+
+    Unknown labels fail closed (return False) to avoid silently bypassing
+    the gate when an operator typos the env var.
+    """
+    try:
+        min_conv = Conviction(min_label.upper())
+    except ValueError:
+        return False
+    return _CONVICTION_RANK[decision_conviction] >= _CONVICTION_RANK[min_conv]
 
 
 def evaluate(
@@ -59,6 +90,14 @@ def evaluate(
     when ``settings.edge_profile.enabled`` is True. When ``enabled`` is
     False this function still works (returns allowed=True) but the
     coordinator should short-circuit before calling for zero overhead.
+
+    Short-side gate (when ``long_only=False``):
+      A short trade is allowed when EITHER ``entry_price >= short_min_price``
+      OR ``conviction >= short_min_conviction``. Either gate alone is
+      sufficient. The price branch is deferred until ``entry_price`` is
+      known — a pre-filter call (``entry_price=None``) on a short with
+      sub-threshold conviction passes through and gets re-evaluated once
+      the coordinator looks up the live entry price.
     """
     cfg = settings.edge_profile
 
@@ -66,11 +105,25 @@ def evaluate(
         return True, None
 
     if decision.direction is None or decision.conviction == Conviction.NONE:
-        # Nothing to filter — there's no trade.
         return True, None
 
     if cfg.long_only and decision.direction != Direction.LONG:
         return False, "EDGE_SHORT_BLOCKED"
+
+    if (
+        not cfg.long_only
+        and decision.direction == Direction.SHORT
+    ):
+        conv_ok = _meets_short_min_conviction(
+            decision.conviction, cfg.short_min_conviction,
+        )
+        if not conv_ok:
+            if entry_price is None:
+                pass
+            elif cfg.short_min_price > 0 and entry_price < cfg.short_min_price:
+                return False, (
+                    f"EDGE_SHORT_PRICE_LOW_{entry_price:.0f}c<{cfg.short_min_price:.0f}c"
+                )
 
     if cfg.block_low_conviction and decision.conviction == Conviction.LOW:
         return False, "EDGE_LOW_CONVICTION_BLOCKED"
@@ -93,7 +146,11 @@ def evaluate(
             and decision.obi_dir == decision.roc_dir
         )
         exempt = cfg.agreement_overrides_price_cap and is_agreement
-        if not exempt and entry_price > cfg.max_entry_price:
+        if (
+            not exempt
+            and decision.direction == Direction.LONG
+            and entry_price > cfg.max_entry_price
+        ):
             return False, f"EDGE_PRICE_CAP_{entry_price:.0f}c>{cfg.max_entry_price:.0f}c"
 
     return True, None

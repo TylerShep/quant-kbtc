@@ -253,18 +253,41 @@ class HistoricalSyncConfig:
 class EdgeProfileConfig:
     """Live-lane-only filter profile derived from paper trading attribution.
 
-    Empirical 7-day analysis (2026-04-13 → 2026-04-19, 245 clean trades)
-    showed a statistically significant long-side edge (t=3.31), short-side
-    anti-edge (t=-2.17), and that cheap entries (<$25) and OBI+ROC agreement
-    setups carry the bulk of expectancy. This config restricts the LIVE
-    lane to that validated subset while paper continues unfiltered for
-    ongoing data collection and ML training.
+    Re-calibrated 2026-04-29 against 14-day paper window (2026-04-15 →
+    2026-04-29, 522 clean trades). Findings that the new defaults encode:
+
+      * Long side: 309 trades, +$114,197 net, 53% WR. Edge is robust across
+        every UTC hour. The original 0-7 UTC block (calibrated on the
+        2026-04-13 → 04-19 window) was costing +$36,313 of long PnL —
+        hours 03/05/06 alone produced +$28,513. Block list cleared.
+      * Short side: 213 trades, -$6,021 net overall, BUT cleanly bimodal:
+          - Cheap (<$40) NORMAL conviction: 89 trades @ $30 bucket lost
+            -$12,893 (37% WR). This is the entire short anti-edge.
+          - HIGH conviction shorts: 12 trades, +$1,799 net, 75% WR.
+          - Shorts at $50+: 56 trades, +$6,400 net, 70%+ WR.
+        Replace ``EDGE_LIVE_LONG_ONLY=true`` blanket block with two
+        targeted gates: ``short_min_price`` and ``short_min_conviction``.
+      * Cheap entries (<$25) carry positive long expectancy still; the
+        ``max_entry_price`` cap stays in place.
+      * OBI+ROC agreement: 92.3% WR for longs, 72.7% WR for HIGH shorts.
+        Stays exempt from the price cap.
+
+    Paper lane is NEVER affected by this profile — it continues to take
+    the full strategy for ongoing data collection and ML training.
 
     Default OFF — flip ``EDGE_LIVE_PROFILE_ENABLED=true`` to activate.
-    Paper lane is never affected by this profile.
     """
     enabled: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_PROFILE_ENABLED", False))
-    long_only: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_LONG_ONLY", True))
+    # Hard kill switch for shorts. Default False after 2026-04-29 re-calibration
+    # that showed HIGH-conviction shorts and $50+ shorts have positive
+    # expectancy. Set to True to revert to the pre-2026-04-29 behavior of
+    # blocking every short.
+    long_only: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_LONG_ONLY", False))
+    # Targeted short-side gates (only consulted when long_only=False).
+    # A short trade is allowed if entry_price >= short_min_price OR
+    # conviction >= short_min_conviction. Either gate alone is sufficient.
+    short_min_price: float = field(default_factory=lambda: _env_float("EDGE_LIVE_SHORT_MIN_PRICE", 40.0))
+    short_min_conviction: str = field(default_factory=lambda: _env("EDGE_LIVE_SHORT_MIN_CONVICTION", "HIGH"))
     block_low_conviction: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_BLOCK_LOW_CONVICTION", True))
     max_entry_price: float = field(default_factory=lambda: _env_float("EDGE_LIVE_MAX_ENTRY_PRICE", 25.0))
     agreement_overrides_price_cap: bool = field(
@@ -279,11 +302,10 @@ class EdgeProfileConfig:
             "OBI,OBI+ROC,ROC",
         )
     )
+    # Hour list cleared 2026-04-29: 14-day window showed hours 03/05/06
+    # were among the strongest long-PnL hours of the day. See class docstring.
     blocked_hours_utc: str = field(
-        default_factory=lambda: _env(
-            "EDGE_LIVE_BLOCKED_HOURS_UTC",
-            "0,1,2,3,4,5,6,7",
-        )
+        default_factory=lambda: _env("EDGE_LIVE_BLOCKED_HOURS_UTC", "")
     )
 
     @property

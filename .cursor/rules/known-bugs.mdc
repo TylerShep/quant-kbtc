@@ -299,3 +299,28 @@ After deploying the BUG-022 fixes, the very next live trade (ID 691, ticker `KXB
   - Two new tests added to `test_candle_aggregator.py` (`test_tick_count_increments_within_candle`, `test_tick_count_resets_on_new_candle`) pin the source-of-truth on the new `tick_count` field. All 19 tests in this batch pass on the post-fix code; both `test_all_entry_features_non_null_on_healthy_inputs` and `test_roc_10_populated_when_eleven_candles_available` would have failed the pre-fix code.
 - **Operator action item (NOT in this fix):** Existing `trade_features` rows continue to have NULL `roc_10` and `volume_ratio`. Backfill is not feasible -- per-tick `tick_count` data wasn't recorded, and the candle close history isn't stored at the resolution needed to recompute `roc_10` retroactively. Plan: let new paper trades accumulate for ~1-2 weeks under the fix (~100+ rows expected), then retrain `xgb_entry_v1.pkl` once the new feature columns have meaningful coverage. Until then, the ML gate stays fail-open (returns `(True, 0.5)` when the model artifact is absent or stale).
 - **Files:** `backend/data/candle_aggregator.py`, `backend/ml/feature_capture.py`, `backend/tests/test_candle_aggregator.py`, `backend/tests/test_feature_capture.py` (new)
+
+## EDGE-PROFILE-2026-04-29: Live-lane filter re-calibration after 5-day live trade drought
+- **Date:** 2026-04-29
+- **Symptom:** Live trading was active for ~5 days (last live trade 2026-04-24 22:30 UTC) and produced zero new live trades despite paper firing 130+ times in the same window. Investigation showed `signal_log` had 7,786 `EDGE_SHORT_BLOCKED` rejections and 605 `EDGE_HOUR_BLOCKED_*` rejections (hours 00-07 UTC). The live lane was correctly evaluating signals; the edge profile filter was rejecting essentially every one.
+- **Root cause:** The original `EdgeProfileConfig` defaults were calibrated against a 7-day paper window (2026-04-13 → 2026-04-19, 245 trades). By 2026-04-29 the calibration was 10+ days stale. A fresh 14-day window (2026-04-15 → 2026-04-29, 522 trades) showed:
+  1. **The 0-7 UTC hour block is now actively harmful.** Hours 03/05/06 alone produced +$28,513 of long PnL; the full 0-7 window produced +$36,313 (27% of all 14-day long PnL). The original "Asia overnight = near-zero edge" finding had inverted.
+  2. **Blanket `long_only=true` left +$1,799 of HIGH-conviction short edge on the table** (12 trades, 75% WR). The toxic short cohort is concentrated in *cheap NORMAL* shorts: 89 trades in the $30 bucket lost -$12,893 at 37% WR. Shorts at $50+ produced +$6,400 across 56 trades at 70%+ WR.
+- **Fix:** Replaced the blanket short block with two targeted gates:
+  - `EDGE_LIVE_SHORT_MIN_PRICE` (default $40) — block any short whose entry price is below this
+  - `EDGE_LIVE_SHORT_MIN_CONVICTION` (default `HIGH`) — only allow shorts at this conviction or higher
+  - Gates are OR'd: a short is allowed when EITHER gate passes. HIGH-conviction shorts at any price pass; NORMAL shorts at $40+ pass; cheap NORMAL shorts (the toxic cohort) are blocked.
+  - `EDGE_LIVE_LONG_ONLY` defaults to `false`. Keeps the legacy hard kill switch available for instant rollback to the prior behavior with no code redeploy.
+  - `EDGE_LIVE_BLOCKED_HOURS_UTC` defaults to `""` (empty). Kept as an env knob for future hour-specific blocks if a regime change re-introduces hour-of-day anti-edge.
+  - Long-side `max_entry_price` cap unchanged at $25 (the cheap-long edge persists in the new window).
+  - Implemented as a pure addition to the filter — no changes to the coordinator wiring; the new skip reason `EDGE_SHORT_PRICE_LOW_<price>c<<min>c` flows through the existing `_persist_signal` path.
+- **Tests:** `backend/tests/test_edge_profile.py` extended from 26 to 35 tests:
+  - `test_blocks_cheap_normal_short` / `test_allows_high_conviction_cheap_short` / `test_allows_expensive_normal_short` pin the OR-gate semantics
+  - `test_short_price_gate_boundary_inclusive` pins the strict-less-than at the price boundary (matches the long-side cap convention)
+  - `test_short_filter_deferred_to_priced_call` pins the deferred-evaluation contract (pre-filter call with `entry_price=None` must not reject a sub-threshold-conviction short — coordinator's second call will make the final decision)
+  - `test_unknown_short_min_conviction_fails_closed` pins fail-closed behavior on operator typo of the env value
+  - `test_short_gate_does_not_affect_longs` and `test_long_only_overrides_short_gates` pin the precedence and direction-specificity
+  - `test_short_min_conviction_normal_lets_normal_through` documents how the operator can loosen the gate to NORMAL if the data later supports it
+  - `test_defaults_off_until_explicitly_enabled` updated to assert the new defaults with inline rationale comments citing the 14-day numbers
+- **Operator note for future re-calibration:** The 14-day attribution that justified these defaults is reproducible via `psql` queries documented in the chat that produced this fix. Re-run quarterly or whenever live trading goes >7 days without an entry. Do NOT loosen `short_min_price` below $40 or `short_min_conviction` below `HIGH` without a fresh attribution run that shows the toxic NORMAL/cheap short cohort has either disappeared or flipped sign.
+- **Files:** `backend/config/settings.py` (defaults + new fields), `backend/filters/edge_profile.py` (OR-gate logic), `backend/tests/test_edge_profile.py` (9 new tests + defaults assertion update), remote `~/kbtc/.env` (live values).
