@@ -258,6 +258,133 @@ class BotConfig:
         default_factory=lambda: _env_float("EXPIRY_GUARD_FILL_POLL_TIMEOUT_SEC", 5.0)
     )
 
+    # ── Phase 2 (Expiry Exit Reliability, 2026-05-04): live retry widening
+    # for EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD only. The existing live
+    # exit path sends market sells with ``yes_price=1`` (or ``no_price=1``)
+    # which means "I'll accept any price ≥ 1 cent" -- maximally aggressive
+    # but also maximally exposed to a thin pre-close book. The widening
+    # config lets attempt 0 try a tighter floor (closer to mid) and step
+    # down toward the existing max-aggressive behavior on the final attempt.
+    #
+    # Defaults preserve the legacy behavior exactly: attempt 0 already
+    # uses the 1-cent floor so retries never change order prices unless
+    # the operator opts in. To enable: set the first-attempt floor below
+    # 99 (long) / above 1 (short) and pick a positive widen step.
+    #
+    # Mechanics for a long exit (sell YES) at attempt N:
+    #   floor_cents = max(1, first_attempt_yes_floor_cents
+    #                        - widen_step_cents * N)
+    # On the FINAL attempt we always force the 1-cent floor regardless
+    # of computed value when ``final_attempt_max_aggressive`` is True.
+    # Short exits mirror with NO floors.
+    expiry_retry_max_attempts: int = field(
+        default_factory=lambda: _env_int("EXPIRY_RETRY_MAX_ATTEMPTS", 3)
+    )
+    expiry_retry_backoff_base_sec: float = field(
+        default_factory=lambda: _env_float("EXPIRY_RETRY_BACKOFF_BASE_SEC", 2.0)
+    )
+    expiry_retry_max_backoff_sec: float = field(
+        default_factory=lambda: _env_float("EXPIRY_RETRY_MAX_BACKOFF_SEC", 8.0)
+    )
+    # Per-attempt floor for the YES leg of a long exit (cents). Default 1
+    # = current behavior (no widening). Operators wanting to harvest
+    # better fills on attempt 0 set this to e.g. 30 and the bot will
+    # only fill if the book has a YES bid at ≥30c on the first try.
+    expiry_retry_first_attempt_yes_floor_cents: int = field(
+        default_factory=lambda: _env_int(
+            "EXPIRY_RETRY_FIRST_ATTEMPT_YES_FLOOR_CENTS", 1)
+    )
+    # Per-attempt floor for the NO leg of a short exit (cents). Default 1
+    # = current behavior. Mirror of the YES floor above.
+    expiry_retry_first_attempt_no_floor_cents: int = field(
+        default_factory=lambda: _env_int(
+            "EXPIRY_RETRY_FIRST_ATTEMPT_NO_FLOOR_CENTS", 1)
+    )
+    # Cents to widen (lower for long, raise for short) per retry attempt.
+    # 0 = no widening, all attempts use the same floor.
+    expiry_retry_widen_step_cents: int = field(
+        default_factory=lambda: _env_int("EXPIRY_RETRY_WIDEN_STEP_CENTS", 0)
+    )
+    # When True, the FINAL attempt always uses the 1-cent floor (max
+    # aggressive) regardless of the computed widen schedule. This is the
+    # explicit safety rail required by BUG-032 -- we MUST be able to fall
+    # through to current behavior if widening fails to harvest.
+    expiry_retry_final_attempt_max_aggressive: bool = field(
+        default_factory=lambda: _env_bool(
+            "EXPIRY_RETRY_FINAL_ATTEMPT_MAX_AGGRESSIVE", True)
+    )
+
+    # ── Phase 3 (Expiry Exit Reliability, 2026-05-04): pre-expiry passive
+    # limit ladder. OPT-IN, default OFF. When enabled, just before the
+    # EXPIRY_GUARD trigger fires the coordinator places a passive limit
+    # exit order at a tighter price than the EXPIRY_GUARD aggressive
+    # exit, polls for fills briefly, cancels and steps to a more
+    # aggressive rung if no fill, and unconditionally falls back to the
+    # standard EXPIRY_GUARD path when the time budget runs out.
+    #
+    # The ladder is a quality-of-fill optimization. It MUST NEVER extend
+    # the orphan window: ``ladder_total_budget_sec`` is bounded by
+    # ``expiry_guard_trigger_sec`` and the fallback path runs after the
+    # budget regardless of fill state.
+    #
+    # Rollout discipline: enable in paper first (LADDER_ENABLED_PAPER),
+    # validate diagnostics for at least one full week, then enable the
+    # live flag (LADDER_ENABLED_LIVE) under a tight live_trade_limit.
+    ladder_enabled_paper: bool = field(
+        default_factory=lambda: _env_bool("LADDER_ENABLED_PAPER", False)
+    )
+    ladder_enabled_live: bool = field(
+        default_factory=lambda: _env_bool("LADDER_ENABLED_LIVE", False)
+    )
+    # When the contract has this many seconds to expiry, the ladder
+    # is allowed to start. Must be greater than expiry_guard_trigger_sec
+    # by at least ``ladder_total_budget_sec`` so the ladder runs
+    # completely before EXPIRY_GUARD fires. Default 240s = 60s of
+    # headroom over the 180s EXPIRY_GUARD trigger.
+    ladder_start_trigger_sec: int = field(
+        default_factory=lambda: _env_int("LADDER_START_TRIGGER_SEC", 240)
+    )
+    # Total time budget across all rungs. After this many seconds, the
+    # ladder ALWAYS yields to the EXPIRY_GUARD path even if no fills
+    # occurred. Bounded above to prevent the ladder from racing the close.
+    ladder_total_budget_sec: int = field(
+        default_factory=lambda: _env_int("LADDER_TOTAL_BUDGET_SEC", 50)
+    )
+    # Number of progressively-aggressive rungs. Each rung is a passive
+    # limit order placed N cents off the current best ask (long) /
+    # best bid (short). Rung 0 is the tightest (most operator-favorable),
+    # subsequent rungs widen by ``ladder_rung_step_cents``.
+    ladder_rung_count: int = field(
+        default_factory=lambda: _env_int("LADDER_RUNG_COUNT", 3)
+    )
+    # Initial rung offset off the executable side, in cents. For a long
+    # exit we sell YES; rung 0 places yes_price = best_yes_bid +
+    # rung_first_offset_cents (i.e. inside the spread, asking for a
+    # higher price). For a short exit it mirrors with the NO side.
+    ladder_rung_first_offset_cents: int = field(
+        default_factory=lambda: _env_int("LADDER_RUNG_FIRST_OFFSET_CENTS", 5)
+    )
+    # Cents to widen per rung. After ladder_rung_count rungs the ladder
+    # is at offset = first_offset + step * (count - 1) cents wide.
+    ladder_rung_step_cents: int = field(
+        default_factory=lambda: _env_int("LADDER_RUNG_STEP_CENTS", 3)
+    )
+    # Per-rung poll/cancel timeout. After this many seconds with no fill,
+    # cancel the rung and step to the next.
+    ladder_rung_timeout_sec: float = field(
+        default_factory=lambda: _env_float("LADDER_RUNG_TIMEOUT_SEC", 8.0)
+    )
+    # If True, on bot restart while a ladder order is in flight the
+    # PositionManager attempts to cancel any resting ladder-tagged
+    # orders and falls back to the regular guard path. False = trust
+    # the existing reconciliation logic to surface stale orders. Only
+    # set to True when the operator has verified the cancel-on-restart
+    # path against demo. Default False = fail-closed to standard
+    # reconciliation flow.
+    ladder_cancel_on_restart: bool = field(
+        default_factory=lambda: _env_bool("LADDER_CANCEL_ON_RESTART", False)
+    )
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"

@@ -176,6 +176,33 @@ async def diagnostics():
     except Exception:
         edge_health = {"error": "unavailable"}
 
+    # Phase 3 (Expiry Exit Reliability, 2026-05-04): expose pre-expiry
+    # ladder telemetry so operators can monitor adoption during the
+    # paper soak and live canary phases. Counters are process-local
+    # and reset on restart by design.
+    from config.settings import settings as _live_settings
+    ladder_telemetry: dict[str, Any] = {}
+    phase4_telemetry: dict[str, Any] = {}
+    try:
+        pm = coordinator.live_trader.position_manager
+        if hasattr(pm, "get_ladder_telemetry"):
+            ladder_telemetry = pm.get_ladder_telemetry()
+        if hasattr(pm, "get_phase4_telemetry"):
+            phase4_telemetry = pm.get_phase4_telemetry()
+    except Exception:
+        ladder_telemetry = {"error": "unavailable"}
+        phase4_telemetry = {"error": "unavailable"}
+    ladder_config = {
+        "enabled_paper": _live_settings.bot.ladder_enabled_paper,
+        "enabled_live": _live_settings.bot.ladder_enabled_live,
+        "start_trigger_sec": _live_settings.bot.ladder_start_trigger_sec,
+        "total_budget_sec": _live_settings.bot.ladder_total_budget_sec,
+        "rung_count": _live_settings.bot.ladder_rung_count,
+        "rung_first_offset_cents": _live_settings.bot.ladder_rung_first_offset_cents,
+        "rung_step_cents": _live_settings.bot.ladder_rung_step_cents,
+        "rung_timeout_sec": _live_settings.bot.ladder_rung_timeout_sec,
+    }
+
     return {
         "tick_count": coordinator._tick_count,
         "kalshi_ws": kalshi_info,
@@ -197,6 +224,18 @@ async def diagnostics():
             "queued": len(coordinator._bg_persist_tasks),
             "max": coordinator._bg_persist_max,
             "dropped_total": coordinator._bg_persist_dropped,
+        },
+        "expiry_ladder": {
+            "telemetry": ladder_telemetry,
+            "config": ladder_config,
+        },
+        "phase4_deferred_gates": {
+            "telemetry": phase4_telemetry,
+            "note": (
+                "Telemetry-only counters; gates are deferred. See "
+                "docs/runbooks/live-edge-filters.md for the activation "
+                "rubric."
+            ),
         },
     }
 
@@ -263,6 +302,17 @@ async def status():
     except Exception:
         edge_health = {"error": "unavailable"}
 
+    # Phase 3 (Expiry Exit Reliability, 2026-05-04): lightweight ladder
+    # telemetry on /api/status -- the dashboard polls this endpoint
+    # frequently. Full config block lives on /api/diagnostics.
+    ladder_status: dict[str, Any] = {}
+    try:
+        pm = coordinator.live_trader.position_manager
+        if hasattr(pm, "get_ladder_telemetry"):
+            ladder_status = pm.get_ladder_telemetry()
+    except Exception:
+        ladder_status = {}
+
     return {
         "market_states": states,
         "atr": coordinator.atr_filter.get_state(),
@@ -282,6 +332,7 @@ async def status():
         "fill_stream": fill_stream_status,
         "edge_profile_health": edge_health,
         "db_pool": db_pool_stats(),
+        "expiry_ladder": ladder_status,
     }
 
 

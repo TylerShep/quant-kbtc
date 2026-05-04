@@ -1,5 +1,5 @@
 """Unit tests for PaperTrader."""
-from execution.paper_trader import PaperTrader
+from execution.paper_trader import PaperTrade, PaperTrader
 from risk.position_sizer import PositionSizer
 from risk.fee_engine import FeeEngine
 
@@ -93,3 +93,68 @@ def test_paper_trade_preserves_entry_obi_and_roc_bug030():
         "PaperTrade.entry_roc must equal PaperPosition.entry_roc or the "
         "trades.entry_roc column will silently store zero (BUG-030)."
     )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Phase 1 (Expiry Exit Reliability): paper guard exits must stamp a
+# `fill_source` so analytics can separate realistic taker fills from
+# legacy synthetic mid-price fills. Default behavior (no fill_source
+# passed) must remain identical to pre-Phase 1 to avoid invalidating
+# existing paper trades.
+# ════════════════════════════════════════════════════════════════════════
+
+
+def _enter_long(trader: PaperTrader, price: float = 50.0) -> None:
+    trader.enter(
+        ticker="KXBTC-T",
+        direction="long",
+        price=price,
+        conviction="HIGH",
+        regime="MEDIUM",
+    )
+
+
+def test_exit_default_fill_source_is_none_for_backward_compat():
+    """Non-guard paper exits do not pass `fill_source`. The default must
+    remain None so existing call sites and snapshot tests don't change
+    behavior. Coordinator persistence layer maps None -> "paper_mid_mark"
+    when writing to the trades table."""
+    sizer = PositionSizer(50_000.0)
+    trader = PaperTrader(sizer)
+    _enter_long(trader)
+    trade = trader.exit(55.0, reason="STOP_LOSS")
+    assert trade is not None
+    assert trade.fill_source is None
+
+
+def test_exit_records_explicit_fill_source_on_guard_exit():
+    """Realistic paper guard exits MUST be labeled so analytics can
+    distinguish them from the legacy synthetic mid-price baseline.
+    Without this label there is no post-rollout way to confirm the
+    fix shifted paper EXPIRY_GUARD outcomes."""
+    sizer = PositionSizer(50_000.0)
+    trader = PaperTrader(sizer)
+    _enter_long(trader)
+    trade = trader.exit(
+        47.0,
+        reason="EXPIRY_GUARD",
+        fill_source="paper_guard_taker_bidask",
+    )
+    assert trade is not None
+    assert trade.fill_source == "paper_guard_taker_bidask"
+    assert trade.exit_price == 47.0
+    assert isinstance(trade, PaperTrade)
+
+
+def test_exit_no_position_returns_none_with_explicit_fill_source():
+    """Calling exit() with no open position must remain a safe no-op
+    even when a fill_source is provided -- the new kwarg must NOT
+    accidentally transform the no-op path into something that touches
+    sizer state."""
+    sizer = PositionSizer(50_000.0)
+    trader = PaperTrader(sizer)
+    initial_bankroll = sizer.bankroll
+    trade = trader.exit(99.0, reason="EXPIRY_GUARD",
+                        fill_source="paper_guard_taker_bidask")
+    assert trade is None
+    assert sizer.bankroll == initial_bankroll

@@ -296,3 +296,258 @@ class TestExitInnerNormalReasonDefaultTimeout:
             await pm._exit_inner(price=99.0, reason="STOP_LOSS")
         # None means "use module default FILL_POLL_TIMEOUT".
         assert captured_kwargs.get("timeout_sec") is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SHORT_SETTLEMENT_GUARD parity: same fast-fail timeout as EXPIRY_GUARD
+# (BUG-032 covered both reasons; this regression pins the parity.)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestShortSettlementGuardParity:
+
+    @pytest.mark.asyncio
+    async def test_short_settlement_guard_uses_short_timeout(self):
+        """SHORT_SETTLEMENT_GUARD must inherit the same short timeout as
+        EXPIRY_GUARD. They race the close in different ways (long vs
+        short) but both must fail fast and retry within the wider 180s
+        window."""
+        from execution.position_manager import ManagedPosition
+
+        client = MagicMock()
+        client.create_order = AsyncMock(return_value={"order": {"order_id": "ssg"}})
+        client.get_order = AsyncMock(return_value={
+            "order": {"status": "executed", "yes_price": 50, "filled_quantity": 5}
+        })
+        client.get_positions = AsyncMock(return_value={"market_positions": []})
+        pm = PositionManager(client)
+        pm.position = ManagedPosition(
+            ticker="KXBTC-T", direction="short", contracts=5,
+            entry_price=30.0, entry_time="2026-05-04T00:00:00+00:00",
+            conviction="HIGH", regime_at_entry="MEDIUM",
+        )
+        pm.state = PositionState.OPEN
+
+        captured_kwargs = {}
+
+        async def spy(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return {"status": "executed", "yes_price": 99, "filled_quantity": 5}
+
+        pm._poll_order_fill = spy
+
+        async def _verify(*_a, **_kw):
+            return 0
+        pm.verify_position_on_exchange = _verify
+        with patch("execution.position_manager.asyncio.sleep", AsyncMock()):
+            await pm._exit_inner(
+                price=70.0, reason="SHORT_SETTLEMENT_GUARD",
+            )
+        assert captured_kwargs.get("timeout_sec") is not None
+        assert captured_kwargs["timeout_sec"] < FILL_POLL_TIMEOUT
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Phase 2 (Expiry Exit Reliability): _compute_expiry_retry_floor and
+# _exit_inner attempt-aware order pricing.
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestExpiryRetryFloorMath:
+    """Pure-logic tests for the retry-floor helper. No async, no mocks."""
+
+    def _cfg(self, **kwargs):
+        """Build a fake BotConfig-shaped object with sensible defaults."""
+        from types import SimpleNamespace
+        defaults = dict(
+            expiry_retry_max_attempts=3,
+            expiry_retry_widen_step_cents=0,
+            expiry_retry_first_attempt_yes_floor_cents=1,
+            expiry_retry_first_attempt_no_floor_cents=1,
+            expiry_retry_final_attempt_max_aggressive=True,
+        )
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
+
+    def test_default_config_keeps_legacy_one_cent_floor(self):
+        """Defaults must reproduce the pre-Phase 2 behavior exactly --
+        attempt 0 already at 1c floor, no widening on retries."""
+        cfg = self._cfg()
+        for attempt in (0, 1, 2):
+            assert PositionManager._compute_expiry_retry_floor(
+                "yes", attempt, cfg) == 1
+            assert PositionManager._compute_expiry_retry_floor(
+                "no", attempt, cfg) == 1
+
+    def test_widening_steps_down_per_attempt(self):
+        """With first-floor 30 and widen-step 10, attempt 0 → 30c,
+        attempt 1 → 20c, attempt 2 → 10c (clipped by safety pin if
+        on the final attempt with the pin enabled)."""
+        cfg = self._cfg(
+            expiry_retry_first_attempt_yes_floor_cents=30,
+            expiry_retry_widen_step_cents=10,
+            expiry_retry_max_attempts=3,
+            expiry_retry_final_attempt_max_aggressive=False,
+        )
+        assert PositionManager._compute_expiry_retry_floor("yes", 0, cfg) == 30
+        assert PositionManager._compute_expiry_retry_floor("yes", 1, cfg) == 20
+        assert PositionManager._compute_expiry_retry_floor("yes", 2, cfg) == 10
+
+    def test_final_attempt_pins_to_one_cent_when_safety_enabled(self):
+        """With safety-pin enabled, the FINAL attempt index
+        (max_attempts - 1) must always return 1 regardless of the
+        widening schedule. This is the BUG-032 safety rail."""
+        cfg = self._cfg(
+            expiry_retry_first_attempt_yes_floor_cents=80,
+            expiry_retry_widen_step_cents=5,
+            expiry_retry_max_attempts=3,
+            expiry_retry_final_attempt_max_aggressive=True,
+        )
+        # Attempts 0 and 1 follow the widening schedule.
+        assert PositionManager._compute_expiry_retry_floor("yes", 0, cfg) == 80
+        assert PositionManager._compute_expiry_retry_floor("yes", 1, cfg) == 75
+        # Attempt 2 is the FINAL attempt → pinned to 1.
+        assert PositionManager._compute_expiry_retry_floor("yes", 2, cfg) == 1
+
+    def test_floor_never_drops_below_one_cent(self):
+        """Even with aggressive widening, the floor is clamped to ≥ 1c
+        because Kalshi rejects orders with price=0."""
+        cfg = self._cfg(
+            expiry_retry_first_attempt_yes_floor_cents=10,
+            expiry_retry_widen_step_cents=20,
+            expiry_retry_max_attempts=5,
+            expiry_retry_final_attempt_max_aggressive=False,
+        )
+        for attempt in range(5):
+            f = PositionManager._compute_expiry_retry_floor("yes", attempt, cfg)
+            assert 1 <= f <= 99
+
+    def test_short_side_uses_no_floor_config(self):
+        """Short exits (sell NO) must read the NO-side floor config so
+        operators can tune long and short widening independently."""
+        cfg = self._cfg(
+            expiry_retry_first_attempt_yes_floor_cents=30,
+            expiry_retry_first_attempt_no_floor_cents=20,
+            expiry_retry_widen_step_cents=5,
+            expiry_retry_max_attempts=4,
+            expiry_retry_final_attempt_max_aggressive=False,
+        )
+        assert PositionManager._compute_expiry_retry_floor("yes", 0, cfg) == 30
+        assert PositionManager._compute_expiry_retry_floor("no", 0, cfg) == 20
+
+    def test_max_attempts_one_means_first_attempt_is_final(self):
+        """Edge case: max_attempts=1 → there is only the original try,
+        no retries; the first attempt IS the final attempt and the
+        safety pin must fire on it."""
+        cfg = self._cfg(
+            expiry_retry_first_attempt_yes_floor_cents=50,
+            expiry_retry_widen_step_cents=10,
+            expiry_retry_max_attempts=1,
+            expiry_retry_final_attempt_max_aggressive=True,
+        )
+        assert PositionManager._compute_expiry_retry_floor("yes", 0, cfg) == 1
+
+
+class TestExitInnerExpiryWideningPricing:
+    """Verify _exit_inner actually passes the computed floor to
+    Kalshi's create_order and that non-expiry reasons are unaffected."""
+
+    def _build_pm_long(self):
+        from execution.position_manager import ManagedPosition
+
+        client = MagicMock()
+        client.create_order = AsyncMock(return_value={"order": {"order_id": "o"}})
+        client.get_order = AsyncMock(return_value={
+            "order": {"status": "executed", "yes_price": 50, "filled_quantity": 5}
+        })
+        client.get_positions = AsyncMock(return_value={"market_positions": []})
+        pm = PositionManager(client)
+        pm.position = ManagedPosition(
+            ticker="KXBTC-T", direction="long", contracts=5,
+            entry_price=20.0, entry_time="2026-05-04T00:00:00+00:00",
+            conviction="NORMAL", regime_at_entry="MEDIUM",
+        )
+        pm.state = PositionState.OPEN
+
+        async def _verify(*_a, **_kw):
+            return 0
+        pm.verify_position_on_exchange = _verify
+
+        async def spy(*args, **kwargs):
+            return {"status": "executed", "yes_price": 99, "filled_quantity": 5}
+
+        pm._poll_order_fill = spy
+        return client, pm
+
+    @pytest.mark.asyncio
+    async def test_expiry_guard_attempt0_uses_widening_floor(self):
+        """When the widening config sets a 30c first-attempt floor with
+        a 10c step and the safety pin OFF, attempt 0 of an
+        EXPIRY_GUARD long exit must send yes_price=30 to create_order,
+        NOT yes_price=1."""
+        from config.settings import settings as live_settings
+        bot = live_settings.bot
+        # Stash and overwrite the relevant frozen-dataclass fields via
+        # object.__setattr__ for the duration of the test. Frozen
+        # dataclasses still permit __setattr__ via object.__setattr__.
+        original = {
+            "expiry_retry_first_attempt_yes_floor_cents": bot.expiry_retry_first_attempt_yes_floor_cents,
+            "expiry_retry_widen_step_cents": bot.expiry_retry_widen_step_cents,
+            "expiry_retry_final_attempt_max_aggressive": bot.expiry_retry_final_attempt_max_aggressive,
+            "expiry_retry_max_attempts": bot.expiry_retry_max_attempts,
+        }
+        try:
+            object.__setattr__(bot, "expiry_retry_first_attempt_yes_floor_cents", 30)
+            object.__setattr__(bot, "expiry_retry_widen_step_cents", 10)
+            object.__setattr__(bot, "expiry_retry_final_attempt_max_aggressive", False)
+            object.__setattr__(bot, "expiry_retry_max_attempts", 3)
+            client, pm = self._build_pm_long()
+            with patch("execution.position_manager.asyncio.sleep",
+                       AsyncMock()):
+                await pm._exit_inner(
+                    price=99.0, reason="EXPIRY_GUARD", attempt=0,
+                )
+            kwargs = client.create_order.call_args.kwargs
+            assert kwargs.get("yes_price") == 30, (
+                f"Expected yes_price=30 for attempt 0 with widening "
+                f"config; got {kwargs}."
+            )
+        finally:
+            for k, v in original.items():
+                object.__setattr__(bot, k, v)
+
+    @pytest.mark.asyncio
+    async def test_default_config_preserves_legacy_one_cent_floor(self):
+        """Defaults (all widening config at zero/one) must keep the
+        existing yes_price=1 behavior so deploying Phase 2 without an
+        operator opt-in is a no-op."""
+        client, pm = self._build_pm_long()
+        with patch("execution.position_manager.asyncio.sleep", AsyncMock()):
+            await pm._exit_inner(price=99.0, reason="EXPIRY_GUARD", attempt=0)
+        kwargs = client.create_order.call_args.kwargs
+        assert kwargs.get("yes_price") == 1
+
+    @pytest.mark.asyncio
+    async def test_non_expiry_reason_always_uses_one_cent_floor(self):
+        """Even with widening config set, STOP_LOSS / TAKE_PROFIT etc
+        must keep the legacy 1-cent floor. Phase 2 must not change
+        non-guard exit behavior."""
+        from config.settings import settings as live_settings
+        bot = live_settings.bot
+        original = bot.expiry_retry_first_attempt_yes_floor_cents
+        try:
+            object.__setattr__(bot, "expiry_retry_first_attempt_yes_floor_cents", 75)
+            client, pm = self._build_pm_long()
+            with patch("execution.position_manager.asyncio.sleep",
+                       AsyncMock()):
+                await pm._exit_inner(
+                    price=99.0, reason="STOP_LOSS", attempt=0,
+                )
+            kwargs = client.create_order.call_args.kwargs
+            assert kwargs.get("yes_price") == 1, (
+                "Non-expiry reasons must NEVER inherit the widening "
+                "schedule -- only EXPIRY_GUARD/SHORT_SETTLEMENT_GUARD "
+                "use it."
+            )
+        finally:
+            object.__setattr__(bot, "expiry_retry_first_attempt_yes_floor_cents", original)

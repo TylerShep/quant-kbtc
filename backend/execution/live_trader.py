@@ -152,8 +152,23 @@ class LiveTrader:
 
     # ── Exit (delegates to PositionManager, records trade) ────────────
 
-    async def exit(self, price: float, reason: str) -> Optional[LiveTrade]:
-        trade_result = await self.position_manager.exit(price, reason)
+    async def exit(
+        self,
+        price: float,
+        reason: str,
+        attempt: int = 0,
+    ) -> Optional[LiveTrade]:
+        """Exit the live position via PositionManager.
+
+        Phase 2 (Expiry Exit Reliability): ``attempt`` is forwarded to
+        the position manager so the EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD
+        retry-widening logic can pick the right order-side floor.
+        Defaults to 0 to preserve legacy behavior for all non-coordinator
+        callers.
+        """
+        trade_result = await self.position_manager.exit(
+            price, reason, attempt=attempt,
+        )
         if trade_result is None:
             return None
 

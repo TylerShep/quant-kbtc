@@ -488,13 +488,13 @@ class Coordinator:
                     and state.time_remaining_sec is not None
                     and state.time_remaining_sec < guard_sec
                     and state.time_remaining_sec >= 60):
-                current_price = self._get_exit_price_for(state, trader)
-                if current_price is not None and current_price > pos.entry_price:
-                    logger.info("coordinator.short_settlement_guard",
-                                ticker=pos.ticker, entry=pos.entry_price,
-                                current=current_price, remaining_sec=state.time_remaining_sec,
-                                mode=mode)
-                    if is_live:
+                if is_live:
+                    current_price = self._get_exit_price_for(state, trader)
+                    if current_price is not None and current_price > pos.entry_price:
+                        logger.info("coordinator.short_settlement_guard",
+                                    ticker=pos.ticker, entry=pos.entry_price,
+                                    current=current_price, remaining_sec=state.time_remaining_sec,
+                                    mode=mode)
                         if not self._live_exit_in_flight:
                             self._live_exit_in_flight = True
                             asyncio.create_task(self._handle_live_exit(
@@ -503,10 +503,51 @@ class Coordinator:
                                 original_reason="SHORT_SETTLEMENT_GUARD",
                                 exit_price=current_price,
                             ))
-                    else:
-                        trade = trader.exit(current_price, "SHORT_SETTLEMENT_GUARD")
+                else:
+                    # Paper guards must use the executable side to avoid
+                    # inflating PnL with mid-price synthetic fills when the
+                    # book is one-sided near close. If the executable side
+                    # is missing, decline the guard fill -- settlement will
+                    # close the trade through the normal settlement path.
+                    exec_price = self._get_executable_exit_price_for(state, trader)
+                    if exec_price is None:
+                        logger.info("coordinator.short_settlement_guard.skip_no_liquidity",
+                                    ticker=pos.ticker, entry=pos.entry_price,
+                                    remaining_sec=state.time_remaining_sec, mode=mode)
+                    elif exec_price > pos.entry_price:
+                        logger.info("coordinator.short_settlement_guard",
+                                    ticker=pos.ticker, entry=pos.entry_price,
+                                    current=exec_price, remaining_sec=state.time_remaining_sec,
+                                    mode=mode, fill_source="paper_guard_taker_bidask")
+                        trade = trader.exit(
+                            exec_price,
+                            "SHORT_SETTLEMENT_GUARD",
+                            fill_source="paper_guard_taker_bidask",
+                        )
                         if trade:
                             self._on_trade_exit(trade, symbol, mode)
+
+            # Phase 3 (Expiry Exit Reliability, 2026-05-04): pre-expiry
+            # passive limit ladder. Feature-flagged per mode; default OFF.
+            # Runs in the window [expiry_guard_trigger_sec, ladder_start_trigger_sec]
+            # so the ladder ALWAYS yields to EXPIRY_GUARD before the close.
+            # Live ladder is invoked via the lock-acquiring ``try_passive_limit_ladder``
+            # method; paper trades skip the ladder entirely (paper exits
+            # are deterministic and the ladder buys nothing in simulation).
+            ladder_start = settings.bot.ladder_start_trigger_sec
+            ladder_enabled = (
+                settings.bot.ladder_enabled_live if is_live
+                else settings.bot.ladder_enabled_paper
+            )
+            if (is_live and ladder_enabled and pos
+                    and state.time_remaining_sec is not None
+                    and state.time_remaining_sec < ladder_start
+                    and state.time_remaining_sec >= settings.bot.expiry_guard_trigger_sec
+                    and not pm_busy and not self._live_exit_in_flight):
+                self._live_exit_in_flight = True
+                asyncio.create_task(self._run_pre_expiry_ladder(
+                    symbol, state,
+                ))
 
             # BUG-032: trigger EXPIRY_GUARD at T-``expiry_guard_trigger_sec``
             # (default 180s), not the historical T-60s. A single failed
@@ -518,8 +559,11 @@ class Coordinator:
             expiry_trigger = settings.bot.expiry_guard_trigger_sec
             if (pos and state.time_remaining_sec is not None
                     and state.time_remaining_sec < expiry_trigger):
-                exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
                 if is_live:
+                    # Live retains the entry-price fallback because the
+                    # exchange order will be aggressively re-priced inside
+                    # _exit_inner. We only need a non-None marker here.
+                    exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
                     if not pm_busy and not self._live_exit_in_flight:
                         self._live_exit_in_flight = True
                         asyncio.create_task(self._handle_live_exit(
@@ -529,9 +573,22 @@ class Coordinator:
                             exit_price=exit_price,
                         ))
                 else:
-                    trade = trader.exit(exit_price, "EXPIRY_GUARD")
-                    if trade:
-                        self._on_trade_exit(trade, symbol, mode)
+                    # Paper EXPIRY_GUARD must reflect realistic taker exit
+                    # prices. If executable side is missing, decline the
+                    # synthetic fill and let settlement resolve the trade.
+                    exec_price = self._get_executable_exit_price_for(state, trader)
+                    if exec_price is None:
+                        logger.info("coordinator.expiry_guard.skip_no_liquidity",
+                                    ticker=pos.ticker, entry=pos.entry_price,
+                                    remaining_sec=state.time_remaining_sec, mode=mode)
+                    else:
+                        trade = trader.exit(
+                            exec_price,
+                            "EXPIRY_GUARD",
+                            fill_source="paper_guard_taker_bidask",
+                        )
+                        if trade:
+                            self._on_trade_exit(trade, symbol, mode)
 
     # ── Paper lane ─────────────────────────────────────────────────────
 
@@ -975,6 +1032,54 @@ class Coordinator:
         except Exception as e:
             logger.error("coordinator.settlement_failed", error=str(e))
 
+    async def _run_pre_expiry_ladder(self, symbol: str, state) -> None:
+        """Phase 3: drive the pre-expiry passive limit ladder for the
+        live position. Always falls back to a normal trade-exit
+        completion path so partial-or-no-fill simply lets EXPIRY_GUARD
+        run on the next tick.
+
+        The ``_live_exit_in_flight`` flag is set by the caller and
+        cleared here to ensure no double-fire even if the ladder
+        produces a partial residual.
+        """
+        try:
+            pos = self.live_trader.position
+            if pos is None:
+                return
+            ob = state.order_book
+            try:
+                result = await self.live_trader.position_manager.try_passive_limit_ladder(
+                    best_yes_bid=ob.best_yes_bid,
+                    best_yes_ask=ob.best_yes_ask,
+                    time_remaining_sec=state.time_remaining_sec,
+                )
+            except Exception as e:
+                logger.warning(
+                    "coordinator.pre_expiry_ladder_failed",
+                    error=str(e), ticker=getattr(pos, "ticker", None),
+                )
+                return
+
+            if result is None:
+                logger.info(
+                    "coordinator.pre_expiry_ladder_no_fill",
+                    ticker=getattr(pos, "ticker", None),
+                )
+                return
+
+            try:
+                trade = self.live_trader._build_trade(result)
+                self.live_trader.sizer.record_trade(trade.pnl)
+                self.live_trader.trades.append(trade)
+                self._on_trade_exit(trade, symbol, "live")
+            except Exception as e:
+                logger.error(
+                    "coordinator.pre_expiry_ladder_post_fill_failed",
+                    error=str(e),
+                )
+        finally:
+            self._live_exit_in_flight = False
+
     async def _handle_live_exit(
         self,
         trade_future,
@@ -987,6 +1092,14 @@ class Coordinator:
         PositionManager handles retries, orphan conversion, and locking
         internally. This wrapper just processes the result. On retries,
         the original exit reason and price are preserved.
+
+        Phase 2 (Expiry Exit Reliability, 2026-05-04): retries pass
+        ``attempt`` (1-based for the retry loop, mapped to the
+        position manager's 0-based ``attempt`` arg) so EXPIRY_GUARD
+        / SHORT_SETTLEMENT_GUARD retries can use the widening
+        order-side floor schedule. Backoff and max attempts are now
+        configurable via ``BotConfig.expiry_retry_*``; existing
+        defaults preserve the legacy 2s + 4s sequence.
         """
         try:
             trade = await trade_future
@@ -999,23 +1112,36 @@ class Coordinator:
 
             retry_price = exit_price or self.live_trader.position.entry_price
 
-            MAX_RETRIES = 2
-            for attempt in range(1, MAX_RETRIES + 1):
+            cfg = settings.bot
+            # Total attempts INCLUDING the original attempt that just
+            # failed. The retry loop runs (max_attempts - 1) extra
+            # tries. Default 3 = original + 2 retries (legacy behavior).
+            max_attempts = max(1, cfg.expiry_retry_max_attempts)
+            backoff_base = max(0.0, cfg.expiry_retry_backoff_base_sec)
+            max_backoff = max(backoff_base, cfg.expiry_retry_max_backoff_sec)
+            for retry_num in range(1, max_attempts):
                 if not self.live_trader.has_position:
                     return
-                delay = 2 ** attempt
+                # Exponential backoff capped at max_backoff. Using
+                # base ** retry_num so retry_num=1 → 2s, retry_num=2
+                # → 4s with the default base 2.0 (matches the legacy
+                # hardcoded schedule).
+                delay = min(max_backoff, backoff_base ** retry_num) if backoff_base > 0 else 0.0
                 logger.warning("coordinator.live_exit_retry",
-                               attempt=attempt, delay=delay,
-                               reason=original_reason)
+                               attempt=retry_num, delay=delay,
+                               reason=original_reason,
+                               max_attempts=max_attempts)
                 await asyncio.sleep(delay)
                 try:
-                    trade = await self.live_trader.exit(retry_price, original_reason)
+                    trade = await self.live_trader.exit(
+                        retry_price, original_reason, attempt=retry_num,
+                    )
                     if trade:
                         self._on_trade_exit(trade, symbol, "live")
                         return
                 except Exception as e:
                     logger.error("coordinator.live_exit_retry_failed",
-                                 attempt=attempt, error=str(e))
+                                 attempt=retry_num, error=str(e))
 
             if self.live_trader.has_position:
                 pos = self.live_trader.position
@@ -1627,7 +1753,16 @@ class Coordinator:
             return state.order_book.best_yes_bid
 
     def _get_exit_price_for(self, state, trader) -> Optional[float]:
-        """Get exit price based on a specific trader's position direction."""
+        """Get exit price based on a specific trader's position direction.
+
+        Default uses the order-book mid because mid is the unbiased
+        estimator for non-guard exits where the position is being
+        unwound on a normal candle. For settlement-window guards
+        (EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD) this overestimates
+        achievable paper PnL because the book is one-sided or empty
+        right before close; use ``_get_executable_exit_price_for``
+        in that path instead.
+        """
         pos = trader.position
         if pos is None:
             return None
@@ -1637,6 +1772,32 @@ class Coordinator:
         if pos.direction == "long":
             return state.order_book.best_yes_bid
         return state.order_book.best_yes_ask
+
+    def _get_executable_exit_price_for(self, state, trader) -> Optional[float]:
+        """Reason-aware exit price for paper guards near contract close.
+
+        Uses the executable side of the book rather than mid:
+          * long  -> sell YES at best YES bid    (cross the spread)
+          * short -> buy back NO at best NO bid  (== 100 - best YES ask)
+
+        Returns None when the executable side is missing -- callers
+        must NOT fall back to entry_price or any synthetic value here.
+        Synthetic mid fills during the settlement window were
+        producing 91% paper EXPIRY_GUARD win rates with no live
+        counterpart (see findings 2026-05-04). When the executable
+        side is empty in paper, do NOT record a fictional fill --
+        let the contract settle through the normal settlement path.
+        """
+        pos = trader.position
+        if pos is None:
+            return None
+        ob = state.order_book
+        if pos.direction == "long":
+            return ob.best_yes_bid
+        ask = ob.best_yes_ask
+        if ask is None:
+            return None
+        return 100 - ask
 
     def _serialize_decision(self, mode: str = "paper") -> Optional[dict]:
         d = self._last_paper_decision if mode == "paper" else self._last_live_decision
@@ -2272,6 +2433,11 @@ class Coordinator:
             wallet_pre = getattr(trade, "wallet_at_entry", None)
             entry_fill_source = getattr(trade, "entry_fill_source", "order_response") or "order_response"
             exit_fill_source = getattr(trade, "exit_fill_source", "order_response") or "order_response"
+            # Paper trades use a new optional ``fill_source`` field (Phase 1)
+            # to distinguish realistic taker guard exits from legacy
+            # synthetic mid-price fills. Fall back to the legacy default
+            # when the trade did not carry an explicit label.
+            paper_fill_source = getattr(trade, "fill_source", None)
             entry_cost_dollars = getattr(trade, "entry_cost_dollars", None)
             exit_cost_dollars = getattr(trade, "exit_cost_dollars", None)
             if mode == "live" and wallet_pre is not None:
@@ -2412,10 +2578,15 @@ class Coordinator:
                         mode,
                         entry_cost_dollars, exit_cost_dollars,
                         wallet_pnl, pnl_drift,
-                        # Pick the most informative source: prefer the
-                        # exit leg, fall back to entry, default to the
-                        # legacy label.
-                        exit_fill_source if exit_fill_source != "settlement" else entry_fill_source,
+                        # Pick the most informative source. For live trades
+                        # prefer the exit leg's fill source, falling back
+                        # to entry when settlement-driven. For paper
+                        # trades use the explicit ``fill_source`` field
+                        # added in Phase 1 if present, otherwise default
+                        # to ``paper_mid_mark`` so legacy synthetic fills
+                        # remain identifiable in analytics.
+                        (paper_fill_source or "paper_mid_mark") if mode == "paper"
+                        else (exit_fill_source if exit_fill_source != "settlement" else entry_fill_source),
                     ),
                 )
                 result = await row.fetchone()

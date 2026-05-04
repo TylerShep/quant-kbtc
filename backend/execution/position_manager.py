@@ -174,6 +174,41 @@ class PositionManager:
         self._entry_phantom_cooldowns: dict[str, float] = {}
         self.PHANTOM_ENTRY_COOLDOWN_SEC = 30.0
 
+        # Phase 3 (Expiry Exit Reliability, 2026-05-04): pre-expiry passive
+        # limit ladder telemetry. Counters are process-local; survive
+        # neither restart nor a manual state wipe by design (telemetry,
+        # not authoritative state).
+        self._ladder_runs: int = 0
+        self._ladder_full_fills: int = 0
+        self._ladder_partial_fills: int = 0
+        self._ladder_no_fills: int = 0
+        self._ladder_fallbacks: int = 0
+        self._ladder_in_flight_ticker: Optional[str] = None
+
+        # Phase 4 (Expiry Exit Reliability, 2026-05-04): TELEMETRY-ONLY
+        # counters for the deferred orphan-cadence and entry-depth-gating
+        # workstream. These do NOT change execution behavior. Their job
+        # is to inform the activation rubric in
+        # docs/runbooks/live-edge-filters.md so we can decide later
+        # whether to flip the gate. Each counter is accompanied by an
+        # ``observed`` total so the ratio (blocked / observed) is
+        # interpretable.
+        #
+        # ``orphan_break_even_observed``: every iteration where we have
+        #   an orphan and a fresh market quote.
+        # ``orphan_break_even_blocked``: subset where the bid was below
+        #   the orphan's avg_entry_price (recovery would have crystalized
+        #   a loss). The deferred-tolerance proposal would let us widen
+        #   this gate if blocked / observed exceeds the documented
+        #   threshold over the documented window.
+        self._orphan_break_even_observed: int = 0
+        self._orphan_break_even_blocked: int = 0
+        # Hypothetical entry-depth rejects near expiry. Computed at
+        # decision time via ``record_entry_depth_observation`` from the
+        # coordinator; never enforced. Pure observation hook.
+        self._near_expiry_depth_observed: int = 0
+        self._near_expiry_depth_would_block: int = 0
+
     # ── Public properties ─────────────────────────────────────────────
 
     @property
@@ -933,16 +968,29 @@ class PositionManager:
 
     # ── EXIT ──────────────────────────────────────────────────────────
 
-    async def exit(self, price: float, reason: str) -> Optional[dict]:
+    async def exit(
+        self,
+        price: float,
+        reason: str,
+        attempt: int = 0,
+    ) -> Optional[dict]:
         """Place an exit order with full exchange verification.
 
         Returns a dict with trade details on success, None on failure.
         If a 409 Conflict reveals the market settled, delegates to
         handle_settlement automatically.
         Acquires the position lock.
+
+        Phase 2 (Expiry Exit Reliability, 2026-05-04): ``attempt`` is
+        the 0-based retry index supplied by the coordinator's retry
+        loop. Used by ``_compute_expiry_retry_floor`` to widen the
+        order-side floor on EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD
+        retries. Defaults to 0 so all non-coordinator callers (manual
+        close, emergency_close, etc.) keep the legacy max-aggressive
+        behavior.
         """
         async with self._lock:
-            result = await self._exit_inner(price, reason)
+            result = await self._exit_inner(price, reason, attempt=attempt)
             if result and result.get("_settled"):
                 settled_result = result["_result"]
                 via_409 = result.get("_via_409", False)
@@ -953,8 +1001,440 @@ class PositionManager:
                 )
             return result
 
-    async def _exit_inner(self, price: float, reason: str) -> Optional[dict]:
-        """Exit logic without acquiring the lock (caller must hold it)."""
+    # ── Phase 3: pre-expiry passive limit ladder ────────────────────────
+
+    async def try_passive_limit_ladder(
+        self,
+        *,
+        best_yes_bid: Optional[float],
+        best_yes_ask: Optional[float],
+        time_remaining_sec: Optional[float],
+    ) -> Optional[dict]:
+        """Attempt a pre-expiry passive limit ladder and return a fill dict
+        on success, or None to fall through to the EXPIRY_GUARD path.
+
+        Ladder mechanics (long exit, mirror for short):
+          1. Place a passive limit sell at ``yes_price = best_yes_bid +
+             rung_first_offset_cents`` (we ask for a higher price than
+             the executable bid; the order rests on the ask side).
+          2. Poll for fill up to ``ladder_rung_timeout_sec``.
+          3. If filled fully, recover and return fill data (the trade
+             completion handler will run via the standard exit flow).
+          4. If partially filled, cancel the remainder and step to the
+             next rung with the residual count. Aggregate fills across
+             rungs.
+          5. If no fill, cancel and step to the next (more aggressive)
+             rung.
+          6. Out of rungs OR out of time budget -> cancel any open
+             rung and return None. The caller MUST then fall through
+             to the EXPIRY_GUARD path for the residual.
+
+        Safety:
+          * Acquires self._lock for the whole ladder run; coordinator
+            must check ``is_busy`` before calling.
+          * The total budget is bounded by config; the ladder is
+            guaranteed to release the lock before EXPIRY_GUARD fires.
+          * If the time-remaining-sec drops below the ladder's
+            absolute floor (start_trigger - total_budget) mid-ladder,
+            we abort immediately so the guard path has its full window.
+
+        Returns the same dict shape as ``_exit_inner`` on a complete
+        fill so the caller can route through ``_handle_settlement_inner``
+        if the contract resolved during the ladder. None means
+        "ladder did not complete a full exit; please run EXPIRY_GUARD".
+        """
+        if self.position is None:
+            return None
+        cfg = settings.bot
+        side = "yes" if self.position.direction == "long" else "no"
+
+        # Front-door safety check. The ladder must finish within
+        # start_trigger - guard_trigger seconds; if there's not enough
+        # time left, refuse to start so we don't burn the guard window.
+        if time_remaining_sec is None:
+            return None
+        absolute_floor_sec = (
+            cfg.expiry_guard_trigger_sec + 5  # 5s margin for cancel/step
+        )
+        if time_remaining_sec <= absolute_floor_sec:
+            return None
+        if cfg.ladder_total_budget_sec >= (
+            time_remaining_sec - absolute_floor_sec
+        ):
+            return None
+
+        # Need at least one executable side to compute a rung price.
+        if side == "yes" and best_yes_bid is None:
+            return None
+        if side == "no" and best_yes_ask is None:
+            return None
+
+        async with self._lock:
+            # Re-check after acquiring the lock; another path may
+            # have completed an exit while we were waiting.
+            if self.position is None:
+                return None
+            self._ladder_runs += 1
+            self._ladder_in_flight_ticker = self.position.ticker
+
+            try:
+                result = await self._run_ladder_rungs(
+                    side=side,
+                    best_yes_bid=best_yes_bid,
+                    best_yes_ask=best_yes_ask,
+                    cfg=cfg,
+                )
+            finally:
+                self._ladder_in_flight_ticker = None
+
+            if result is None:
+                # No-fill outcome -- caller will fall back to EXPIRY_GUARD.
+                self._ladder_no_fills += 1
+                self._ladder_fallbacks += 1
+                return None
+
+            # Whole-position fill via the ladder. Use the same exit
+            # bookkeeping as _exit_inner via _build_trade_result.
+            self._ladder_full_fills += 1
+            return result
+
+    async def _run_ladder_rungs(
+        self,
+        *,
+        side: str,
+        best_yes_bid: Optional[float],
+        best_yes_ask: Optional[float],
+        cfg,
+    ) -> Optional[dict]:
+        """Inner ladder loop. Caller MUST hold self._lock."""
+        if self.position is None:
+            return None
+
+        rung_count = max(1, cfg.ladder_rung_count)
+        first_offset = max(1, cfg.ladder_rung_first_offset_cents)
+        step = max(0, cfg.ladder_rung_step_cents)
+        rung_timeout = max(1.0, float(cfg.ladder_rung_timeout_sec))
+        total_budget = max(rung_timeout, float(cfg.ladder_total_budget_sec))
+
+        ladder_started = time.monotonic()
+        cumulative_fills: list[Fill] = []
+        cumulative_filled = 0
+        original_contracts = self.position.contracts
+        rung_orders: list[str] = []
+
+        for rung in range(rung_count):
+            elapsed = time.monotonic() - ladder_started
+            if elapsed >= total_budget:
+                logger.info(
+                    "position_manager.ladder_budget_exhausted",
+                    ticker=self.position.ticker, rung=rung,
+                    elapsed_sec=round(elapsed, 2),
+                )
+                break
+
+            remaining_contracts = original_contracts - cumulative_filled
+            if remaining_contracts <= 0:
+                break
+
+            # Compute rung price. For a long exit (sell YES) we set
+            # yes_price = best_yes_bid + offset. The order rests on
+            # the ask side at that price. Each rung WIDENS by ``step``
+            # toward the bid, becoming more crossable.
+            offset = max(1, first_offset - step * rung)
+            if side == "yes":
+                # Need the bid as the anchor.
+                if best_yes_bid is None:
+                    break
+                rung_price = max(1, min(99, int(best_yes_bid) + offset))
+            else:
+                # Closing a short = sell NO. Use 100 - best_yes_ask
+                # as the executable NO bid, then add offset.
+                if best_yes_ask is None:
+                    break
+                no_anchor = max(0, 100 - int(best_yes_ask))
+                rung_price = max(1, min(99, no_anchor + offset))
+
+            client_order_id = self._generate_client_order_id(
+                self.position.ticker, f"ladder-{rung}",
+            )
+            try:
+                resp = await self.client.create_order(
+                    ticker=self.position.ticker,
+                    side=side,
+                    action="sell",
+                    count=remaining_contracts,
+                    type="limit",
+                    client_order_id=client_order_id,
+                    **(
+                        {"yes_price": rung_price}
+                        if side == "yes" else {"no_price": rung_price}
+                    ),
+                )
+                order_id = resp.get("order", {}).get("order_id")
+                if order_id:
+                    rung_orders.append(order_id)
+                logger.info(
+                    "position_manager.ladder_rung_placed",
+                    ticker=self.position.ticker, rung=rung,
+                    price=rung_price, side=side, order_id=order_id,
+                    remaining_contracts=remaining_contracts,
+                )
+            except Exception as e:
+                logger.warning(
+                    "position_manager.ladder_rung_failed",
+                    ticker=self.position.ticker, rung=rung,
+                    error=str(e),
+                )
+                continue
+
+            # Poll briefly for fills, then cancel and step.
+            order_data = await self._poll_order_fill(
+                order_id, timeout_sec=rung_timeout,
+            )
+            status = order_data.get("status", "")
+            filled = self._parse_fill_count(order_data)
+            if filled > 0:
+                cumulative_filled += filled
+                ws_fills, _src = await self._drain_fill_stream(
+                    order_id, min_count=filled, leg="exit",
+                )
+                if ws_fills:
+                    cumulative_fills.extend(ws_fills)
+
+            if status not in ("executed", "canceled"):
+                # Order is still resting -- cancel before stepping so
+                # we don't leave duplicate sells on the book.
+                try:
+                    await self.client.cancel_order(order_id)
+                except httpx.HTTPStatusError as e:
+                    code = getattr(e.response, "status_code", None)
+                    if code in (404, 410):
+                        logger.info(
+                            "position_manager.ladder_cancel_already_terminal",
+                            ticker=self.position.ticker,
+                            order_id=order_id, http_status=code,
+                        )
+                    else:
+                        logger.warning(
+                            "position_manager.ladder_cancel_failed",
+                            ticker=self.position.ticker,
+                            order_id=order_id, error=str(e),
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "position_manager.ladder_cancel_failed",
+                        ticker=self.position.ticker,
+                        order_id=order_id, error=str(e),
+                    )
+
+            if cumulative_filled >= original_contracts:
+                # Fully filled across rungs; break out and build trade.
+                break
+
+            if filled > 0 and filled < remaining_contracts:
+                # Partial fill at this rung -- step to widen on residual.
+                self._ladder_partial_fills += 1
+
+        if cumulative_filled <= 0:
+            return None
+
+        # We have at least one fill. Compute the trade result. Use the
+        # WS VWAP if available, otherwise the last poll's parsed price.
+        if cumulative_fills:
+            exit_price = FillStream.vwap_yes_cents(cumulative_fills)
+            exit_cost = FillStream.total_cost_dollars(cumulative_fills)
+            actual_fees = FillStream.total_fees_dollars(cumulative_fills)
+            exit_fill_source = "fill_ws"
+        else:
+            exit_price = float(self.position.entry_price)
+            exit_cost = None
+            actual_fees = None
+            exit_fill_source = "order_response"
+
+        if cumulative_filled < original_contracts:
+            # Partial-only ladder run -- abandon the residual and let
+            # the caller (coordinator) run EXPIRY_GUARD on what's left.
+            # We do NOT clear self.position; the residual lives on.
+            self.position.contracts = original_contracts - cumulative_filled
+            logger.info(
+                "position_manager.ladder_partial_residual_to_guard",
+                ticker=self.position.ticker,
+                filled=cumulative_filled,
+                residual=self.position.contracts,
+            )
+            return None
+
+        # Full fill: build a trade result and clear position. We re-use
+        # the same shape as _exit_inner's success path.
+        return self._build_ladder_trade_result(
+            exit_price=exit_price or 1.0,
+            exit_cost_dollars=exit_cost,
+            actual_fees=actual_fees,
+            exit_fill_source=exit_fill_source,
+            exited_contracts=cumulative_filled,
+        )
+
+    def _build_ladder_trade_result(
+        self,
+        *,
+        exit_price: float,
+        exit_cost_dollars: Optional[float],
+        actual_fees: Optional[float],
+        exit_fill_source: str,
+        exited_contracts: int,
+    ) -> dict:
+        """Build the same dict shape as _exit_inner returns, then clear
+        position. Caller must already hold the lock."""
+        pos = self.position
+        if pos is None:
+            return {}
+        # Compute cost-based PnL identical to _exit_inner.
+        d = 1 if pos.direction == "long" else -1
+        entry_cost = (
+            pos.entry_cost_dollars
+            if pos.entry_cost_dollars is not None
+            else pos.entry_price * exited_contracts / 100.0
+        )
+        if exit_cost_dollars is None:
+            exit_cost_dollars = exit_price * exited_contracts / 100.0
+        if actual_fees is None:
+            from risk.fee_engine import FeeEngine
+            actual_fees = FeeEngine().compute_round_trip_fee(
+                contracts=exited_contracts,
+                entry_price_cents=pos.entry_price,
+                exit_price_cents=exit_price,
+                entry_type="taker",
+                exit_type="maker",  # ladder fills as maker
+            )
+        gross = d * (exit_cost_dollars - entry_cost)
+        net_pnl = gross - actual_fees
+        notional = exited_contracts * pos.entry_price / 100.0
+        pnl_pct = (net_pnl / notional) if notional > 0 else 0.0
+
+        result = {
+            "ticker": pos.ticker,
+            "direction": pos.direction,
+            "contracts": exited_contracts,
+            "entry_price": pos.entry_price,
+            "exit_price": exit_price,
+            "pnl": round(net_pnl, 4),
+            "pnl_pct": round(pnl_pct, 4),
+            "fees": round(actual_fees, 4),
+            "exit_reason": "EXPIRY_LADDER",
+            "conviction": pos.conviction,
+            "regime_at_entry": pos.regime_at_entry,
+            "candles_held": pos.candles_held,
+            "entry_time": pos.entry_time,
+            "exit_time": datetime.now(timezone.utc).isoformat(),
+            "entry_obi": pos.entry_obi,
+            "entry_roc": pos.entry_roc,
+            "signal_driver": pos.signal_driver,
+            "entry_cost_dollars": entry_cost,
+            "exit_cost_dollars": exit_cost_dollars,
+            "entry_fill_source": pos.entry_fill_source,
+            "exit_fill_source": exit_fill_source,
+            "wallet_at_entry": getattr(pos, "wallet_at_entry", None),
+            "max_favorable_excursion": pos.max_favorable_excursion,
+            "max_adverse_excursion": pos.max_adverse_excursion,
+        }
+        # Clear position on a complete exit.
+        self.position = None
+        self._transition(PositionState.FLAT)
+        self._completed_live_trades += 1
+        self._exit_cooldowns[result["ticker"]] = time.monotonic()
+        return result
+
+    def get_ladder_telemetry(self) -> dict:
+        """Read-only telemetry snapshot for /api/diagnostics."""
+        return {
+            "runs": self._ladder_runs,
+            "full_fills": self._ladder_full_fills,
+            "partial_fills": self._ladder_partial_fills,
+            "no_fills": self._ladder_no_fills,
+            "fallbacks": self._ladder_fallbacks,
+            "in_flight_ticker": self._ladder_in_flight_ticker,
+        }
+
+    def record_entry_depth_observation(
+        self, *, would_block: bool,
+    ) -> None:
+        """Phase 4 telemetry hook: record a hypothetical entry-depth
+        rejection near expiry.
+
+        ``would_block`` is True when the book thickness at the entry
+        price was below the documented activation threshold. This is
+        called at decision time by the coordinator; the entry itself
+        proceeds regardless. Recording these helps decide whether
+        actual gating would have prevented losses without sacrificing
+        winners.
+        """
+        self._near_expiry_depth_observed += 1
+        if would_block:
+            self._near_expiry_depth_would_block += 1
+
+    def get_phase4_telemetry(self) -> dict:
+        """Read-only snapshot for the deferred-gate workstream."""
+        return {
+            "orphan_break_even_observed": self._orphan_break_even_observed,
+            "orphan_break_even_blocked": self._orphan_break_even_blocked,
+            "near_expiry_depth_observed": self._near_expiry_depth_observed,
+            "near_expiry_depth_would_block": self._near_expiry_depth_would_block,
+        }
+
+    @staticmethod
+    def _compute_expiry_retry_floor(
+        side: str,
+        attempt: int,
+        cfg,
+    ) -> int:
+        """Compute the order-side floor (in cents) for an EXPIRY_GUARD
+        / SHORT_SETTLEMENT_GUARD retry attempt.
+
+        Defaults preserve legacy behavior (attempt 0 already uses the
+        1-cent floor). Mechanics:
+
+          * For a long exit (side == "yes" → sell YES) the floor STARTS
+            at ``first_attempt_yes_floor_cents`` and steps DOWN by
+            ``widen_step_cents`` each retry, clamped to [1, 99].
+          * For a short exit (side == "no" → sell NO) the floor STARTS
+            at ``first_attempt_no_floor_cents`` and steps DOWN the same
+            way (lower floor = more aggressive on the NO side as well,
+            since the order is also a sell with a price floor).
+          * On the FINAL attempt (attempt == max_attempts - 1; i.e.
+            the 0-based index of the last try in a sequence of
+            ``max_attempts`` total) the floor collapses to 1 when
+            ``final_attempt_max_aggressive`` is True. This is the
+            BUG-032 safety rail -- we MUST be able to fall back to
+            the existing aggressive behavior or we risk extending the
+            orphan window beyond the contract close.
+        """
+        max_attempts = max(1, cfg.expiry_retry_max_attempts)
+        widen = max(0, cfg.expiry_retry_widen_step_cents)
+        if side == "yes":
+            base = max(1, min(99, cfg.expiry_retry_first_attempt_yes_floor_cents))
+        else:
+            base = max(1, min(99, cfg.expiry_retry_first_attempt_no_floor_cents))
+        # ``attempt`` is the 0-based retry index from the coordinator
+        # loop; the final attempt is ``max_attempts - 1``.
+        if (cfg.expiry_retry_final_attempt_max_aggressive
+                and attempt >= max_attempts - 1):
+            return 1
+        floor = base - widen * max(0, attempt)
+        return max(1, min(99, floor))
+
+    async def _exit_inner(
+        self,
+        price: float,
+        reason: str,
+        attempt: int = 0,
+    ) -> Optional[dict]:
+        """Exit logic without acquiring the lock (caller must hold it).
+
+        Phase 2: ``attempt`` selects the order-side floor for
+        EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD retries via
+        ``_compute_expiry_retry_floor``. All other reasons use the
+        legacy 1-cent floor unconditionally.
+        """
         if self.position is None:
             return None
 
@@ -963,6 +1443,22 @@ class PositionManager:
 
         side = "yes" if pos.direction == "long" else "no"
         client_order_id = self._generate_client_order_id(pos.ticker, "sell")
+
+        # Phase 2: only widen for the two close-race reasons. Every
+        # other exit (STOP_LOSS, TAKE_PROFIT, MOMENTUM_STALL, manual,
+        # emergency_close, ...) must keep the legacy 1-cent floor so
+        # we don't accidentally turn a normal exit into a partial fill.
+        expiry_reasons = ("EXPIRY_GUARD", "SHORT_SETTLEMENT_GUARD")
+        if reason in expiry_reasons:
+            floor_cents = self._compute_expiry_retry_floor(
+                side=side, attempt=attempt, cfg=settings.bot,
+            )
+        else:
+            floor_cents = 1
+        price_kwargs = (
+            {"yes_price": floor_cents} if side == "yes"
+            else {"no_price": floor_cents}
+        )
 
         exit_order_id = None
         try:
@@ -973,8 +1469,14 @@ class PositionManager:
                 count=pos.contracts,
                 type="market",
                 client_order_id=client_order_id,
-                **({"yes_price": 1} if side == "yes" else {"no_price": 1}),
+                **price_kwargs,
             )
+            if reason in expiry_reasons:
+                logger.info(
+                    "position_manager.expiry_retry_floor",
+                    ticker=pos.ticker, side=side, attempt=attempt,
+                    floor_cents=floor_cents, reason=reason,
+                )
             exit_order_id = result.get("order", {}).get("order_id")
             logger.info("position_manager.exit_order_placed",
                         ticker=pos.ticker, order_id=exit_order_id)
@@ -1518,6 +2020,15 @@ class PositionManager:
                     bid = market.get("yes_bid")
                 else:
                     bid = market.get("no_bid")
+
+                # Phase 4: telemetry-only break-even-gate observation.
+                # Increment ``observed`` whenever we have a usable bid,
+                # ``blocked`` when the bid is under entry. Never changes
+                # behavior; we still only act on bid >= entry below.
+                if bid is not None:
+                    self._orphan_break_even_observed += 1
+                    if bid < orphan.avg_entry_price:
+                        self._orphan_break_even_blocked += 1
 
                 if bid is not None and bid >= orphan.avg_entry_price:
                     side = "yes" if orphan.direction == "long" else "no"

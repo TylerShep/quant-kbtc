@@ -279,6 +279,135 @@ rule would have prevented both.
 5. Wait at least one weekly attribution cycle before deciding whether the change
    is sticking.
 
+---
+
+## Expiry Exit Reliability (2026-05-04 program)
+
+This four-phase program addresses the divergence between paper EXPIRY_GUARD wins
+and live EXPIRY_GUARD orphan losses observed on 2026-05-04. **Phases 1-3 ship
+with code; Phase 4 ships with telemetry only and remains deferred behind an
+explicit operator activation.**
+
+### Phase 1 — Realistic paper guard fills (LIVE)
+
+| | |
+|---|---|
+| What changed | Paper EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD now use the executable side of the book (`best_yes_bid` for long, `100 - best_yes_ask` for short) instead of `OrderBookState.mid`. Missing executable side → no synthetic fill is recorded; settlement closes the trade. |
+| Source | `backend/coordinator.py::_get_executable_exit_price_for`, `_run_settlement_guards` paper branch |
+| Telemetry | `paper.exit` log events carry `fill_source="paper_guard_taker_bidask"` for the new path. Legacy synthetic fills get `fill_source="paper_mid_mark"`. The `trades.fill_source` column distinguishes the two. |
+| Verification SQL | `SELECT fill_source, COUNT(*), AVG(pnl), AVG(exit_price - entry_price) FROM trades WHERE trading_mode='paper' AND exit_reason IN ('EXPIRY_GUARD','SHORT_SETTLEMENT_GUARD') AND timestamp > NOW() - INTERVAL '7 days' GROUP BY fill_source;` |
+| Expected effect | Paper EXPIRY_GUARD win rate drops from ~91% (synthetic mid) to within ±10% of live (executable side). PnL drops accordingly; this is the correct counterfactual for live. |
+
+### Phase 2 — Live retry widening (LIVE, but disabled by default)
+
+| | |
+|---|---|
+| What changed | The coordinator now passes a 1-based retry attempt index into `LiveTrader.exit(price, reason, attempt=N)`, which threads it into `PositionManager._exit_inner`. For `EXPIRY_GUARD` / `SHORT_SETTLEMENT_GUARD` only, `_compute_expiry_retry_floor` picks an attempt-specific `yes_price` / `no_price` order-side floor. Backoff and max-attempts are configurable. |
+| Source | `backend/coordinator.py::_handle_live_exit`, `backend/execution/{live_trader.py,position_manager.py}`, `BotConfig.expiry_retry_*` |
+| Defaults | `EXPIRY_RETRY_FIRST_ATTEMPT_YES_FLOOR_CENTS=1`, `EXPIRY_RETRY_WIDEN_STEP_CENTS=0`, `EXPIRY_RETRY_FINAL_ATTEMPT_MAX_AGGRESSIVE=true`. With defaults the order pricing is **identical to pre-Phase-2** (1c floor, max aggressive). |
+| Opt-in example | Set `EXPIRY_RETRY_FIRST_ATTEMPT_YES_FLOOR_CENTS=30` and `EXPIRY_RETRY_WIDEN_STEP_CENTS=10` to try a 30c → 20c → 1c (final pin) schedule across the default 3 attempts. |
+| Safety rail | The final attempt is always pinned to 1c when `EXPIRY_RETRY_FINAL_ATTEMPT_MAX_AGGRESSIVE=true`. Do not disable this in production without a corresponding paper soak. |
+| Telemetry | `position_manager.expiry_retry_floor` log event records `attempt`, `floor_cents`, `side`, `reason`. Cross-reference against `trades.exit_reason`. |
+| Expected effect | When opted-in, a fraction of EXPIRY_GUARD round-trips harvest better fills; the rest fall through to the existing 1c-floor behavior on the final attempt. **No worse-case orphan exposure** because the final attempt is unchanged. |
+
+### Phase 3 — Pre-expiry passive limit ladder (CODED, default OFF)
+
+| | |
+|---|---|
+| What it does | When `time_remaining_sec < ladder_start_trigger_sec` AND >= `expiry_guard_trigger_sec`, places passive limit exits at progressively-aggressive rungs inside the spread. Each rung is canceled and stepped if not filled within `LADDER_RUNG_TIMEOUT_SEC`. Total budget is bounded by `LADDER_TOTAL_BUDGET_SEC`. **Always falls back to EXPIRY_GUARD on residual or timeout — never extends the orphan window.** |
+| Source | `backend/execution/position_manager.py::try_passive_limit_ladder`, `backend/coordinator.py::_run_pre_expiry_ladder` |
+| Config | `LADDER_ENABLED_PAPER`, `LADDER_ENABLED_LIVE`, `LADDER_START_TRIGGER_SEC=240`, `LADDER_TOTAL_BUDGET_SEC=50`, `LADDER_RUNG_COUNT=3`, `LADDER_RUNG_FIRST_OFFSET_CENTS=5`, `LADDER_RUNG_STEP_CENTS=3`, `LADDER_RUNG_TIMEOUT_SEC=8.0` |
+| Defaults | Both paper and live ladder flags **off**. The ladder is dormant until an operator opts in. |
+| Paper-mode caveat | The paper trader has no order-book simulation for resting limit orders, so the paper ladder flag is reserved for a future enhancement and currently does not change paper exit behavior. Use the canary live environment (`KALSHI_ENV=demo`) to soak the ladder before flipping the production live flag. |
+| Telemetry | `/api/diagnostics` exposes `expiry_ladder.{telemetry,config}`; `/api/status` exposes `expiry_ladder` (telemetry only). Counters: `runs`, `full_fills`, `partial_fills`, `no_fills`, `fallbacks`. |
+| Rollout discipline | (1) Enable on canary (demo Kalshi) for ≥7 days; verify diagnostics counters match expectations and no `position_manager.ladder_cancel_failed` storms. (2) Enable live with `LIVE_TRADE_LIMIT` ≤ 5 for ≥7 days. (3) Compare live EXPIRY_GUARD outcomes pre/post: ladder full-fill rate ≥ 30% AND no-fill ratio ≤ ladder-disabled rate. |
+| Restart safety | Default `LADDER_CANCEL_ON_RESTART=false`. The reconciliation path will surface stale ladder orders as orphans on the next tick if the bot restarts mid-ladder. The `LADDER_CANCEL_ON_RESTART=true` setting is a future enhancement; do not enable until verified on demo. |
+
+### Phase 4 — Deferred orphan/depth gates (TELEMETRY ONLY)
+
+**Status:** No execution behavior change. Counters are recorded so we can decide
+whether to enable real gating later.
+
+| Counter | What it measures | Activation rubric |
+|---|---|---|
+| `orphan_break_even_observed` | Every orphan-check pass with a usable bid. | Denominator. |
+| `orphan_break_even_blocked` | Subset where `bid < orphan.avg_entry_price` (current behavior already blocks these). | Numerator for the orphan-loss-tolerance proposal. **Activate** orphan-tolerance widening if blocked / observed > 0.40 over a rolling 14-day window AND the average loss-if-acted is < $0.20/contract. |
+| `near_expiry_depth_observed` | Hypothetical entry-depth observations near expiry; tagged at decision time, never enforced. | Denominator. |
+| `near_expiry_depth_would_block` | Subset where the book thickness at entry price would have failed the proposed gate. | **Activate** entry-depth gating only after running a paper counterfactual that shows the rejected cohort is net-negative AND `would_block / observed` < 0.10 (so it doesn't kill the long-side edge). |
+
+| | |
+|---|---|
+| Source | `backend/execution/position_manager.py::{record_entry_depth_observation,get_phase4_telemetry}` |
+| Where surfaced | `/api/diagnostics` -> `phase4_deferred_gates.telemetry` |
+| Owner signoff for activation | Quant + SRE must both sign off in writing on the rubric thresholds before any flag is flipped from telemetry-only to enforcing. The dashboard column for these counters MUST stay labeled "telemetry-only" until that signoff. |
+
+### Rollout sequence (operator playbook)
+
+Step A — Phase 1 + Phase 2 with ladder OFF:
+
+1. From local: `bash scripts/deploy.sh` (rsync now excludes ML artifacts; see BUG-033).
+2. Apply the schema migration on the remote DB (the trades.fill_source widening from VARCHAR(20)→VARCHAR(40) is required for the new `paper_guard_taker_bidask` label):
+   ```sh
+   ssh "$KBTC_DEPLOY_HOST" "docker exec -i kbtc-db psql -U kalshi -d kbtc" \
+     < backend/migrations/011_widen_fill_source.sql
+   ```
+3. Restart the container to pick up the new code: `ssh "$KBTC_DEPLOY_HOST" "cd /home/botuser/kbtc && docker compose up -d --build"`.
+4. Verify health: `ssh "$KBTC_DEPLOY_HOST" "curl -s 'http://localhost:8000/api/status'"` and confirm `expiry_ladder.config.live_enabled=false`.
+
+Step B — Optional retry widening soak (Phase 2 opt-in):
+
+1. Set `EXPIRY_RETRY_FIRST_ATTEMPT_YES_FLOOR_CENTS=30`, `EXPIRY_RETRY_FIRST_ATTEMPT_NO_FLOOR_CENTS=30`, `EXPIRY_RETRY_WIDEN_STEP_CENTS=10` in the remote `.env` (keep `EXPIRY_RETRY_FINAL_ATTEMPT_MAX_AGGRESSIVE=true`).
+2. Restart and observe `position_manager.expiry_retry_floor` log events for ≥3 trade days.
+3. Compare EXPIRY_GUARD success vs ORPHAN_SETTLED ratios using the verification SQL.
+
+Step C — Ladder canary (Phase 3 opt-in, demo Kalshi only):
+
+1. On a canary droplet with `KALSHI_ENV=demo` and `LIVE_TRADE_LIMIT` ≤ 5, set `LADDER_ENABLED_LIVE=true`.
+2. Run for ≥7 days. Read `/api/diagnostics` daily; counters should show `runs > 0`, `fallbacks ≤ runs`, no `ladder_cancel_failed` log spam.
+3. Promote to production only after the canary report passes.
+
+Step D — Phase 4 stays telemetry-only:
+
+1. The deferred-gate counters at `/api/diagnostics` -> `phase4_deferred_gates` accumulate as live trades happen.
+2. Do NOT flip any execution behavior on these counters until the rubric thresholds above are met AND signed off by Quant + SRE.
+
+### Verification SQL
+
+A canned script lives at `scripts/expiry_exit_reliability_verify.sql`. Run it post-deploy:
+
+```sh
+ssh "$KBTC_DEPLOY_HOST" "docker exec -i kbtc-db psql -U kalshi -d kbtc" \
+  < scripts/expiry_exit_reliability_verify.sql \
+  | tee backend/backtest_reports/expiry_verify_$(date +%Y%m%d).txt
+```
+
+Quick spot-checks (also embedded in the script):
+
+```sql
+-- Phase 1: paper fill_source distribution for guard exits
+SELECT fill_source,
+       COUNT(*) AS n,
+       ROUND(AVG(pnl)::numeric, 2) AS avg_pnl,
+       ROUND(100.0 * SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::numeric / COUNT(*), 1) AS win_pct
+FROM trades
+WHERE trading_mode = 'paper'
+  AND exit_reason IN ('EXPIRY_GUARD', 'SHORT_SETTLEMENT_GUARD')
+  AND timestamp > NOW() - INTERVAL '14 days'
+  AND data_quality_flag IS NULL
+GROUP BY fill_source
+ORDER BY n DESC;
+
+-- Phase 2: live EXPIRY_GUARD outcome distribution by retry-attempt
+-- Cross-reference structured logs (position_manager.expiry_retry_floor)
+-- with trade rows for the same ticker.
+
+-- Phase 3: ladder counters (process-local, read /api/diagnostics)
+
+-- Phase 4: telemetry counters (process-local, read /api/diagnostics)
+```
+
+---
+
 ## SQL snippets
 
 ```sql

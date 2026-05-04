@@ -63,6 +63,11 @@ class PaperTrade:
     # for human/dashboard lookups.
     entry_obi: float = 0.0
     entry_roc: float = 0.0
+    # Phase 1 (2026-05-04): label paper exits so analytics can separate
+    # legacy synthetic mid-price fills ("paper_mid_mark") from realistic
+    # taker-side guard exits ("paper_guard_taker_bidask"). None means
+    # caller did not specify a source.
+    fill_source: Optional[str] = None
 
 
 class PaperTrader:
@@ -121,7 +126,12 @@ class PaperTrader:
         )
         return self.position
 
-    def exit(self, price: float, reason: str) -> Optional[PaperTrade]:
+    def exit(
+        self,
+        price: float,
+        reason: str,
+        fill_source: Optional[str] = None,
+    ) -> Optional[PaperTrade]:
         if self.position is None:
             return None
 
@@ -160,6 +170,7 @@ class PaperTrader:
             signal_driver=pos.signal_driver,
             entry_obi=pos.entry_obi,
             entry_roc=pos.entry_roc,
+            fill_source=fill_source,
         )
 
         self.sizer.record_trade(net_pnl)
@@ -172,6 +183,7 @@ class PaperTrader:
             direction=trade.direction,
             pnl=trade.pnl,
             reason=reason,
+            fill_source=fill_source,
         )
         return trade
 

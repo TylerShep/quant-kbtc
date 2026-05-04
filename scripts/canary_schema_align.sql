@@ -82,7 +82,13 @@ ALTER TABLE trades
 ALTER TABLE trades
     ADD COLUMN IF NOT EXISTS pnl_drift NUMERIC(10,4);
 ALTER TABLE trades
-    ADD COLUMN IF NOT EXISTS fill_source VARCHAR(20) DEFAULT 'order_response';
+    ADD COLUMN IF NOT EXISTS fill_source VARCHAR(40) DEFAULT 'order_response';
+
+-- Phase 1 (Expiry Exit Reliability, 2026-05-04): widen pre-existing
+-- VARCHAR(20) ``fill_source`` columns to VARCHAR(40) so we can record
+-- longer source labels (e.g. ``paper_guard_taker_bidask``).
+ALTER TABLE trades
+    ALTER COLUMN fill_source TYPE VARCHAR(40);
 
 CREATE INDEX IF NOT EXISTS idx_trades_pnl_drift
     ON trades (pnl_drift DESC NULLS LAST)

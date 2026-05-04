@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_cost_dollars   NUMERIC(10,4),
     wallet_pnl          NUMERIC(14,4),
     pnl_drift           NUMERIC(10,4),
-    fill_source         VARCHAR(20)     DEFAULT 'order_response'
+    fill_source         VARCHAR(40)     DEFAULT 'order_response'
 );
 SELECT create_hypertable('trades', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker, timestamp DESC);
