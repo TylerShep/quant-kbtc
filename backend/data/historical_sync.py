@@ -332,11 +332,18 @@ class HistoricalSync:
         cascade pinned DB connections, queued bg-persist tasks, and
         eventually OOMKilled the container in ~4-5 minutes.
 
-        New behavior: skip the upsert entirely if a market's close_time
-        is older than the newest already-stored close_time + a small
-        overlap buffer. This makes the steady-state cost proportional
-        to *new* settlements per interval (a few per hour for KXBTC),
-        not the full historical depth.
+        New behavior:
+        1. Find the newest close_time already in the DB.
+        2. Iterate the API; for each market with close_time >= cutoff,
+           upsert it. As SOON AS we hit a window with N consecutive
+           older-than-cutoff markets, break — the API returns markets
+           in roughly close-time DESC order so once we drop below
+           cutoff we're done.
+
+        Combined with the early-break, this makes the steady-state
+        cost ~1-3 API pages instead of all 231+ pages — even the
+        iteration churn that pinned ~700 MB of httpx response buffers
+        (and triggered post-fix OOMs) is gone.
         """
         from data.kalshi_rest import KalshiHistoricalClient
         client = KalshiHistoricalClient()
@@ -349,10 +356,22 @@ class HistoricalSync:
 
         resume = self._settlement_cursor or await self._load_settlement_cursor()
 
+        # If we have a cutoff and a resume cursor, ignore the resume
+        # cursor — we want to iterate from the newest first so the
+        # early-break can fire ASAP.
+        if cutoff_time is not None:
+            resume = None
+
         inserted = 0
         skipped = 0
+        consecutive_old = 0
+        # Stop iterating after this many consecutive markets are
+        # older-than-cutoff. The /historical/markets endpoint returns
+        # in close-time DESC order so this cleanly bounds our scan.
+        EARLY_BREAK_THRESHOLD = 200
         batch: list[tuple] = []
         last_cursor = resume
+        broke_early = False
         async for market, cursor in client.iter_historical_markets(resume_cursor=resume):
             last_cursor = cursor
             row = self._parse_settlement_row(market)
@@ -362,7 +381,13 @@ class HistoricalSync:
                 row_close_time = row[3]
                 if row_close_time is not None and row_close_time < cutoff_time:
                     skipped += 1
+                    consecutive_old += 1
+                    if consecutive_old >= EARLY_BREAK_THRESHOLD:
+                        broke_early = True
+                        break
                     continue
+                else:
+                    consecutive_old = 0
             batch.append(row)
             if len(batch) >= BATCH_SIZE:
                 inserted += await self._flush_settlement_batch(batch)
@@ -370,15 +395,22 @@ class HistoricalSync:
                 await self._save_settlement_cursor(last_cursor)
         if batch:
             inserted += await self._flush_settlement_batch(batch)
-        if last_cursor:
+        # Don't persist the cursor when we broke early on cutoff; the
+        # DB is up-to-date and we want next run to re-scan from the
+        # top in case new settlements arrived.
+        if broke_early:
+            self._settlement_cursor = None
+            await self._save_settlement_cursor(None)
+        elif last_cursor:
             self._settlement_cursor = last_cursor
             await self._save_settlement_cursor(last_cursor)
-        if not last_cursor:
+        else:
             self._settlement_cursor = None
             await self._save_settlement_cursor(None)
         logger.info("historical_sync.settlements_inserted",
                     count=inserted, skipped=skipped,
-                    has_more=bool(last_cursor))
+                    broke_early=broke_early,
+                    has_more=bool(last_cursor) and not broke_early)
 
     async def _newest_market_close_time(self) -> Optional[datetime]:
         """Return the newest close_time in ``kalshi_markets`` (or None).
