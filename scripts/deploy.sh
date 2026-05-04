@@ -69,6 +69,13 @@ fi
 # ── Sync files ───────────────────────────────────────────────────────────
 echo "=== Deploying KBTC to ${REMOTE} ==="
 
+# IMPORTANT: ML model artifacts are excluded.
+# The production model lifecycle is owned entirely by the weekly retrain cron
+# on the droplet (scripts/retrain_xgb_cron.sh -> retrain_promote.py). A local
+# .pkl in the working tree is almost always stale; rsyncing it to the remote
+# would silently roll back a freshly-promoted model. Same applies to the
+# meta.json, promotion log, and archive/. Caused a silent rollback on
+# 2026-05-03; do not remove these excludes without redesigning the lifecycle.
 rsync -avz --progress \
     --exclude='.git' \
     --exclude='.env' \
@@ -83,6 +90,10 @@ rsync -avz --progress \
     --exclude='.cursor' \
     --exclude='kbtc-backups' \
     --exclude='*.dump' \
+    --exclude='backend/ml/models/*.pkl' \
+    --exclude='backend/ml/models/*_meta.json' \
+    --exclude='backend/ml/models/.promotion_log.json' \
+    --exclude='backend/ml/models/archive/' \
     . "${REMOTE}:${PROJECT_DIR}/"
 
 echo "=== Fixing ports for production ==="
