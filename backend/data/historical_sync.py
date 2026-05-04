@@ -324,19 +324,46 @@ class HistoricalSync:
             await asyncio.sleep(cfg.settlement_interval_sec)
 
     async def _sync_settlements(self) -> None:
+        """Sync recently-closed Kalshi markets into ``kalshi_markets``.
+
+        2026-05-04 (BUG-032 follow-up #2): the old behavior re-iterated
+        EVERY historical KXBTC market on every startup (1M+ rows in the
+        upsert path), each batch taking 30+s on the live DB. That
+        cascade pinned DB connections, queued bg-persist tasks, and
+        eventually OOMKilled the container in ~4-5 minutes.
+
+        New behavior: skip the upsert entirely if a market's close_time
+        is older than the newest already-stored close_time + a small
+        overlap buffer. This makes the steady-state cost proportional
+        to *new* settlements per interval (a few per hour for KXBTC),
+        not the full historical depth.
+        """
         from data.kalshi_rest import KalshiHistoricalClient
         client = KalshiHistoricalClient()
+
+        # Find the newest close_time already in the DB; only consider
+        # markets newer than (that - 6h overlap) as candidates.
+        cutoff_time = await self._newest_market_close_time()
+        if cutoff_time is not None:
+            cutoff_time = cutoff_time - timedelta(hours=6)
 
         resume = self._settlement_cursor or await self._load_settlement_cursor()
 
         inserted = 0
+        skipped = 0
         batch: list[tuple] = []
         last_cursor = resume
         async for market, cursor in client.iter_historical_markets(resume_cursor=resume):
             last_cursor = cursor
             row = self._parse_settlement_row(market)
-            if row:
-                batch.append(row)
+            if row is None:
+                continue
+            if cutoff_time is not None:
+                row_close_time = row[3]
+                if row_close_time is not None and row_close_time < cutoff_time:
+                    skipped += 1
+                    continue
+            batch.append(row)
             if len(batch) >= BATCH_SIZE:
                 inserted += await self._flush_settlement_batch(batch)
                 batch.clear()
@@ -349,8 +376,29 @@ class HistoricalSync:
         if not last_cursor:
             self._settlement_cursor = None
             await self._save_settlement_cursor(None)
-        logger.info("historical_sync.settlements_inserted", count=inserted,
-                     has_more=bool(last_cursor))
+        logger.info("historical_sync.settlements_inserted",
+                    count=inserted, skipped=skipped,
+                    has_more=bool(last_cursor))
+
+    async def _newest_market_close_time(self) -> Optional[datetime]:
+        """Return the newest close_time in ``kalshi_markets`` (or None).
+
+        Used by ``_sync_settlements`` to short-circuit upserts of markets
+        we already have. A simple aggregate against an indexed column
+        runs in <5ms even on a 1M-row hypertable.
+        """
+        try:
+            async with self._pool.connection() as conn:
+                row = await conn.execute(
+                    "SELECT MAX(close_time) FROM kalshi_markets"
+                )
+                result = await row.fetchone()
+                if result and result[0]:
+                    return result[0]
+        except Exception as e:
+            logger.warning("historical_sync.newest_market_close_failed",
+                           error=str(e))
+        return None
 
     def _parse_settlement_row(self, m: dict) -> Optional[tuple]:
         """Parse a Kalshi market dict into a DB row tuple."""
