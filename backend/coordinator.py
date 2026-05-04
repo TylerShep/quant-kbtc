@@ -135,6 +135,25 @@ class Coordinator:
         self._bg_persist_max = _bg_persist_max_env_default()
         self._bg_persist_dropped = 0
 
+        # 2026-05-04 (BUG-032 follow-up): rate-limit cache for
+        # ``coordinator.tfi_downgrade`` log lines. A sustained OBI/TFI
+        # disagreement during the high-frequency tick stream after a
+        # ticker rotation can fire 40+ identical log lines in 500ms and
+        # CPU-bind the event loop to the point where healthchecks time
+        # out and the container restart-loops. Keyed by (ticker, mode,
+        # obi_dir, old_conv, new_conv); we re-log on a 30s cadence so
+        # the condition is still observable on dashboards / alerts.
+        self._tfi_downgrade_log_cache: dict = {}
+        # 2026-05-04 (BUG-032 follow-up): single-flight guard for
+        # ``_periodic_reconciliation``. Without it the tick loop can
+        # spawn a fresh reconcile every ``reconcile_interval`` ticks
+        # before the previous one finishes (each reconcile does a REST
+        # round-trip, can take 10+ seconds under network jitter).
+        # Concurrent reconciles compound CPU load and double-fire the
+        # post-reconcile bankroll syncs that we observed flooding logs
+        # at 3-per-32ms during the 2026-05-04 incident.
+        self._periodic_reconcile_in_flight: bool = False
+
         # BUG-028 telemetry: counts how many ticks were skipped because the
         # active contract was within `min_seconds_to_expiry` (or its
         # remaining time was unknown). Surfaced on /api/diagnostics so we
@@ -205,6 +224,7 @@ class Coordinator:
         wallet = float(balance_data.get("balance", 0)) / 100
         self._last_bankroll_sync_ts = time.time()
         if wallet > 0:
+            old_wallet = self.live_sizer.bankroll
             self.live_sizer.bankroll = wallet
             old_peak = self.live_sizer.peak_bankroll
             if old_peak == settings.bot.initial_bankroll:
@@ -214,8 +234,15 @@ class Coordinator:
             if is_initial:
                 self.live_sizer.daily_start_bankroll = wallet
                 self.live_sizer.weekly_start_bankroll = wallet
-            logger.info("coordinator.live_bankroll_synced",
-                        wallet=wallet, peak=self.live_sizer.peak_bankroll)
+            # 2026-05-04 BUG-032 follow-up: only log at INFO when the
+            # wallet ACTUALLY changed, the call was forced (event-driven
+            # post-trade / startup), or this is the initial sync. The
+            # periodic poll at force=False used to log even on no-op
+            # calls, contributing to the spammy log stream that was
+            # CPU-binding the event loop.
+            if is_initial or force or abs(wallet - old_wallet) > 0.005:
+                logger.info("coordinator.live_bankroll_synced",
+                            wallet=wallet, peak=self.live_sizer.peak_bankroll)
         return wallet
 
     async def start(self):
@@ -302,7 +329,7 @@ class Coordinator:
         # ── 2. ATR regime on candle close ──────────────────────────────
         if completed_candle:
             if self._pool is not None:
-                asyncio.create_task(self._persist_candle(symbol, completed_candle))
+                self._spawn_bg_persist(self._persist_candle(symbol, completed_candle))
 
             old_regime = self.atr_filter.current_regime
             self.atr_filter.update(
@@ -314,7 +341,7 @@ class Coordinator:
 
             if self.paper_trader.has_position:
                 self.paper_trader.position.candles_held += 1
-                asyncio.create_task(self._save_paper_position())
+                self._spawn_bg_persist(self._save_paper_position())
             if self.live_trader.has_position:
                 self.live_trader.position.candles_held += 1
 
@@ -387,8 +414,12 @@ class Coordinator:
         if self._tick_count % 300 == 0 and self._pool is not None:
             self._spawn_bg_persist(self._save_state())
 
-        if self._tick_count % reconcile_interval == 0 and self.live_enabled and not self.live_trader.position_manager.is_busy:
-            asyncio.create_task(self._periodic_reconciliation())
+        if (self._tick_count % reconcile_interval == 0
+                and self.live_enabled
+                and not self.live_trader.position_manager.is_busy
+                and not self._periodic_reconcile_in_flight):
+            self._periodic_reconcile_in_flight = True
+            asyncio.create_task(self._periodic_reconciliation_wrapper())
 
     # ── Settlement guards ──────────────────────────────────────────────
 
@@ -1183,12 +1214,27 @@ class Coordinator:
                         new_conv,
                         skip_reason="TFI_DISAGREE" if new_conv == Conviction.NONE else None,
                     )
-                    logger.info("coordinator.tfi_downgrade",
-                                ticker=ticker, tfi=round(tfi, 4),
-                                obi_dir=decision.obi_dir.value,
-                                old_conviction=old_conv.value,
-                                new_conviction=new_conv.value,
-                                mode=mode)
+                    # 2026-05-04 (BUG-032 follow-up): rate-limit the
+                    # tfi_downgrade log to once per (ticker, mode, obi_dir,
+                    # new_conviction) combo. Without this, a sustained
+                    # OBI/TFI disagreement during the high-frequency tick
+                    # stream after a ticker rotation can fire 40+ identical
+                    # log lines in 500ms and tip the bot into a CPU-bound
+                    # restart loop. The log only carries diagnostic value
+                    # on transitions, not on every tick that the condition
+                    # holds.
+                    log_key = (ticker, mode, decision.obi_dir.value,
+                               old_conv.value, new_conv.value)
+                    last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                    now_t = time.time()
+                    if last_logged is None or (now_t - last_logged) > 30.0:
+                        self._tfi_downgrade_log_cache[log_key] = now_t
+                        logger.info("coordinator.tfi_downgrade",
+                                    ticker=ticker, tfi=round(tfi, 4),
+                                    obi_dir=decision.obi_dir.value,
+                                    old_conviction=old_conv.value,
+                                    new_conviction=new_conv.value,
+                                    mode=mode)
 
         if mode == "paper":
             self._last_paper_decision = decision
@@ -2646,6 +2692,15 @@ class Coordinator:
             ))
         elif new_orphan_count == 0 and getattr(self, '_last_orphan_count', 0) > 0:
             self._last_orphan_count = 0
+
+    async def _periodic_reconciliation_wrapper(self) -> None:
+        """BUG-032 follow-up wrapper: clears the in-flight flag in
+        ``finally`` so a failed reconcile doesn't permanently lock the
+        next periodic call out."""
+        try:
+            await self._periodic_reconciliation()
+        finally:
+            self._periodic_reconcile_in_flight = False
 
     async def _periodic_reconciliation(self) -> None:
         """Periodic check: detect exchange positions the bot doesn't know about,
