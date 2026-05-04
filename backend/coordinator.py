@@ -135,14 +135,16 @@ class Coordinator:
         self._bg_persist_max = _bg_persist_max_env_default()
         self._bg_persist_dropped = 0
 
-        # 2026-05-04 (BUG-032 follow-up): rate-limit cache for
-        # ``coordinator.tfi_downgrade`` log lines. A sustained OBI/TFI
-        # disagreement during the high-frequency tick stream after a
-        # ticker rotation can fire 40+ identical log lines in 500ms and
-        # CPU-bind the event loop to the point where healthchecks time
-        # out and the container restart-loops. Keyed by (ticker, mode,
-        # obi_dir, old_conv, new_conv); we re-log on a 30s cadence so
-        # the condition is still observable on dashboards / alerts.
+        # 2026-05-04 (BUG-032 follow-up): generic rate-limit cache for
+        # noisy per-tick log lines. A sustained signal during the
+        # high-frequency tick stream after a ticker rotation can fire
+        # 40+ identical log lines in 500ms and CPU-bind the event loop
+        # to the point where healthchecks time out and the container
+        # restart-loops. Keyed by a tuple unique to the log site +
+        # variant; we re-log on a 30s wall-clock cadence so the
+        # condition is still observable on dashboards / alerts.
+        # Currently used by: ``coordinator.tfi_downgrade``,
+        # ``coordinator.price_guard_rejected``.
         self._tfi_downgrade_log_cache: dict = {}
         # 2026-05-04 (BUG-032 follow-up): single-flight guard for
         # ``_periodic_reconciliation``. Without it the tick loop can
@@ -1292,9 +1294,16 @@ class Coordinator:
                 decision = decision.with_conviction(
                     Conviction.NONE, skip_reason=edge_reason,
                 )
-                logger.info("coordinator.edge_profile_rejected",
-                            reason=edge_reason, mode=mode, direction=pre_dir,
-                            driver=decision.signal_driver)
+                # 2026-05-04 BUG-032 follow-up: rate-limit (was logging
+                # every tick during sustained signals).
+                log_key = ("edge_pre", mode, pre_dir, edge_reason)
+                last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                now_t = time.time()
+                if last_logged is None or (now_t - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache[log_key] = now_t
+                    logger.info("coordinator.edge_profile_rejected",
+                                reason=edge_reason, mode=mode, direction=pre_dir,
+                                driver=decision.signal_driver)
 
         if decision.should_trade_in(mode):
             entry_price = self._get_entry_price(state, decision.direction)
@@ -1304,7 +1313,21 @@ class Coordinator:
                     regime, state.time_remaining_sec,
                 )
                 if not allowed:
-                    if self._tick_count % 60 == 0:
+                    # 2026-05-04 BUG-032 follow-up: rate-limit by
+                    # (mode, direction, guard_reason) tuple over 30s
+                    # wall-clock time. The previous tick-count-based
+                    # rate limit failed catastrophically when the WS
+                    # was delivering 800+ ticks/sec during a ticker
+                    # rotation: ``_tick_count % 60 == 0`` aligned 4x
+                    # in 280ms, contributing to the CPU-bind that
+                    # triggered the post-deploy restart loop. Wall-
+                    # clock rate limit is robust to tick-rate spikes.
+                    log_key = ("price_guard", mode,
+                               decision.direction.value, guard_reason)
+                    last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                    now_t = time.time()
+                    if last_logged is None or (now_t - last_logged) > 30.0:
+                        self._tfi_downgrade_log_cache[log_key] = now_t
                         logger.info("coordinator.price_guard_rejected",
                                     price=entry_price, direction=decision.direction.value,
                                     reason=guard_reason, mode=mode)
@@ -1319,11 +1342,21 @@ class Coordinator:
                         roc_value=roc_val,
                     )
                     if not edge_ok:
-                        logger.info("coordinator.edge_profile_rejected",
-                                    reason=edge_reason, mode=mode,
-                                    price=entry_price,
-                                    direction=decision.direction.value,
-                                    driver=decision.signal_driver)
+                        # 2026-05-04 BUG-032 follow-up: rate-limit log.
+                        # The DB write throttle below already capped the
+                        # signal_log row rate but the log line itself
+                        # was still firing every tick.
+                        log_key = ("edge_priced", mode,
+                                   decision.direction.value, edge_reason)
+                        last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                        now_t = time.time()
+                        if last_logged is None or (now_t - last_logged) > 30.0:
+                            self._tfi_downgrade_log_cache[log_key] = now_t
+                            logger.info("coordinator.edge_profile_rejected",
+                                        reason=edge_reason, mode=mode,
+                                        price=entry_price,
+                                        direction=decision.direction.value,
+                                        driver=decision.signal_driver)
                         # BUG-029: rate-limit DB writes for high-frequency
                         # rejections. During momentum surges this path could
                         # fire 60+ times/sec, queueing 60 DB tasks each
