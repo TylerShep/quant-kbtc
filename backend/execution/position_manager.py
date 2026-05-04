@@ -418,6 +418,7 @@ class PositionManager:
         order_id: str,
         *,
         early_rest_bailout_sec: Optional[float] = None,
+        timeout_sec: Optional[float] = None,
     ) -> dict:
         """Poll Kalshi for order terminalization.
 
@@ -430,10 +431,16 @@ class PositionManager:
                 short-circuit the loop and return the resting order_data
                 so the caller can cancel it. Defaults to None (no early
                 bailout, original behavior).
+            timeout_sec: Override for FILL_POLL_TIMEOUT. Used by
+                EXPIRY_GUARD/SHORT_SETTLEMENT_GUARD exits, where the
+                contract is about to close and we need to fail fast
+                rather than sit on a 15s poll loop. None = use module
+                default (BUG-032).
         """
+        timeout = timeout_sec if timeout_sec is not None else FILL_POLL_TIMEOUT
         elapsed = 0.0
         last_order_data: dict = {}
-        while elapsed < FILL_POLL_TIMEOUT:
+        while elapsed < timeout:
             await asyncio.sleep(FILL_POLL_INTERVAL)
             elapsed += FILL_POLL_INTERVAL
             try:
@@ -457,7 +464,7 @@ class PositionManager:
                 logger.warning("position_manager.poll_order_error",
                                order_id=order_id, error=str(e), elapsed=elapsed)
         logger.warning("position_manager.poll_order_timeout",
-                        order_id=order_id, timeout=FILL_POLL_TIMEOUT)
+                        order_id=order_id, timeout=timeout)
         try:
             detail = await self.client.get_order(order_id)
             return detail.get("order", {})
@@ -1001,7 +1008,23 @@ class PositionManager:
         exit_cost = None
         exit_fill_source = "order_response"
         if exit_order_id:
-            order_data = await self._poll_order_fill(exit_order_id)
+            # BUG-032: when the exit is racing the contract close
+            # (EXPIRY_GUARD or SHORT_SETTLEMENT_GUARD), use a much shorter
+            # fill-poll timeout so we get a chance to retry before the
+            # contract resolves on the exchange. Default 5s vs 15s
+            # general-purpose timeout.
+            try:
+                from config.settings import settings as _settings
+                expiry_reasons = ("EXPIRY_GUARD", "SHORT_SETTLEMENT_GUARD")
+                fill_timeout = (
+                    _settings.bot.expiry_guard_fill_poll_timeout_sec
+                    if reason in expiry_reasons else None
+                )
+            except Exception:
+                fill_timeout = None
+            order_data = await self._poll_order_fill(
+                exit_order_id, timeout_sec=fill_timeout,
+            )
             status = order_data.get("status", "")
             filled_count = self._parse_fill_count(order_data)
 
@@ -1388,6 +1411,48 @@ class PositionManager:
                         contracts=contracts, cause=cause, counted=counted)
         asyncio.ensure_future(self._persist_state())
 
+    def adopt_orphan_and_clear_position(
+        self, ticker: str, direction: str, contracts: int,
+        avg_entry_price: float, *,
+        cause: Optional[str] = None,
+        counted: bool = False,
+    ) -> None:
+        """BUG-031 runtime fix: atomic adopt-orphan + clear position +
+        transition to FLAT.
+
+        The previous coordinator path was three separate mutations:
+          ``pm.adopt_orphan(...)`` schedules a persist with the old
+          ``state == EXITING`` and the old ``position`` still attached;
+          ``pm.position = None`` clears the slot but does NOT call
+          ``_transition``, so ``state`` stays ``EXITING``;
+          a subsequent ``_transition`` from elsewhere (or the next
+          ad-hoc ``_persist_state``) writes the inconsistent
+          ``state="OPEN"|"EXITING"`` with ``position=null`` snapshot
+          to disk.
+        On the next restart, ``restore_from_snapshot`` reconciles via the
+        BUG-031 startup fix, but during *runtime* the inconsistency
+        still leaks into ``can_enter`` (which trusts ``self.state``)
+        and the live lane silently goes dark.
+
+        This method does all three mutations under no async barrier and
+        schedules exactly one ``_persist_state`` at the end so the
+        snapshot can never observe an in-between state.
+        """
+        self.adopt_orphan(
+            ticker, direction, contracts, avg_entry_price,
+            cause=cause, counted=counted,
+        )
+        self.position = None
+        if self.state != PositionState.FLAT:
+            old = self.state
+            self.state = PositionState.FLAT
+            logger.info(
+                "position_manager.state_transition",
+                old=old.value, new=PositionState.FLAT.value,
+                ticker=ticker, source="adopt_orphan_and_clear_position",
+            )
+        asyncio.ensure_future(self._persist_state())
+
     async def check_orphans(self) -> list[dict]:
         """Check orphaned positions for recovery. Acquires lock."""
         async with self._lock:
@@ -1692,10 +1757,11 @@ class PositionManager:
 
             if self.position:
                 pos = self.position
-                self.adopt_orphan(pos.ticker, pos.direction,
-                                  pos.contracts, pos.entry_price)
-                self.position = None
-                self._transition(PositionState.FLAT)
+                # BUG-031 runtime fix: atomic adopt + clear + transition.
+                self.adopt_orphan_and_clear_position(
+                    pos.ticker, pos.direction,
+                    pos.contracts, pos.entry_price,
+                )
                 logger.error("position_manager.emergency_close_abandoned",
                              ticker=pos.ticker)
             return None

@@ -47,6 +47,24 @@ from monitoring.live_health import run_live_health_checks
 logger = structlog.get_logger(__name__)
 
 
+def _bg_persist_max_env_default() -> int:
+    """Read BG_PERSIST_MAX from env with a 256 default.
+
+    See ``Coordinator.__init__`` for the BUG-032 rationale on the cap
+    size. Lives at module scope so it can be re-exported / patched in
+    tests without touching the Coordinator class body.
+    """
+    import os
+    raw = os.getenv("BG_PERSIST_MAX")
+    if raw is None:
+        return 256
+    try:
+        v = int(raw)
+        return v if v > 0 else 256
+    except ValueError:
+        return 256
+
+
 class Coordinator:
     """Wires data feeds -> features -> strategy -> risk -> execution -> dashboard."""
 
@@ -103,8 +121,18 @@ class Coordinator:
         # got OOM-killed (~1.5 GiB → restart loop). When the queue is full we
         # *drop* the new task instead of letting memory grow unbounded — the
         # loss of a single ob_snapshot is harmless; an OOM kill is not.
+        #
+        # 2026-05-04 (BUG-032 follow-up): bumped from 64 → 256 after
+        # observing cold-start storms saturate the queue and trigger the
+        # healthcheck restart loop (14 uvicorn restarts in ~3h). The 64
+        # cap was sized for steady-state but a fresh container with a live
+        # position open can spawn 50+ persists in the first minute
+        # (entry_confirmed, fill_stream_capture, MAE/MFE updates,
+        # bankroll_synced × 5, ws broadcasts). 256 gives the cold start
+        # ~4x headroom while still bounding worst-case memory growth.
+        # Configurable via env so we can tune in prod without a redeploy.
         self._bg_persist_tasks: set = set()
-        self._bg_persist_max = 64  # tune if logs show frequent drops
+        self._bg_persist_max = _bg_persist_max_env_default()
         self._bg_persist_dropped = 0
 
         # BUG-028 telemetry: counts how many ticks were skipped because the
@@ -414,7 +442,16 @@ class Coordinator:
                         if trade:
                             self._on_trade_exit(trade, symbol, mode)
 
-            if pos and state.time_remaining_sec is not None and state.time_remaining_sec < 60:
+            # BUG-032: trigger EXPIRY_GUARD at T-``expiry_guard_trigger_sec``
+            # (default 180s), not the historical T-60s. A single failed
+            # exit attempt can burn 18+ seconds during pre-close volatility,
+            # and the coordinator's retry sequence (2s + 4s backoff + 3x
+            # ~22s requests) needs the full window to complete before the
+            # contract closes. Without this widened buffer we hit 409
+            # Conflict on every retry and orphan the position.
+            expiry_trigger = settings.bot.expiry_guard_trigger_sec
+            if (pos and state.time_remaining_sec is not None
+                    and state.time_remaining_sec < expiry_trigger):
                 exit_price = self._get_exit_price_for(state, trader) or pos.entry_price
                 if is_live:
                     if not pm_busy and not self._live_exit_in_flight:
@@ -919,13 +956,18 @@ class Coordinator:
                 logger.error("coordinator.live_exit_abandoned",
                              ticker=pos.ticker, contracts=pos.contracts)
                 self._unregister_position_ticker(pos.ticker)
-                self.live_trader.adopt_orphan(
+                # BUG-031 runtime fix: use the atomic adopt-and-clear so
+                # state never lands in OPEN/EXITING with position=null
+                # between the adopt_orphan call and the position-clear.
+                # The previous two-step sequence was the runtime path
+                # that re-introduced the OPEN-with-null-position snapshot
+                # we'd already fixed at restore time.
+                self.live_trader.position_manager.adopt_orphan_and_clear_position(
                     ticker=pos.ticker,
                     direction=pos.direction,
                     contracts=pos.contracts,
                     avg_entry_price=pos.entry_price,
                 )
-                self.live_trader.position = None
                 asyncio.create_task(get_notifier().unhandled_exception(
                     location="coordinator._handle_live_exit",
                     error=f"Exit failed after retries for {pos.ticker}, converted to orphan",

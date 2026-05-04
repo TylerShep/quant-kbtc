@@ -548,3 +548,106 @@ class TestOrphanLifecycleIntegration:
         for i in range(70):
             pm.adopt_orphan("KXBTC-BUG015", "long", 6, 17.0)
         assert pm.orphaned_positions[0].contracts == 6
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BUG-031 RUNTIME PATH: adopt_orphan_and_clear_position atomicity
+# ══════════════════════════════════════════════════════════════════════
+#
+# These guard the runtime path that produces ``state="OPEN"|"EXITING"`` with
+# ``position=null`` snapshots. The previous coordinator path called
+# ``pm.adopt_orphan(...)`` then ``pm.position = None`` — two separate
+# mutations, two separate scheduled persists. If the bot crashed/OOM'd or
+# the snapshot landed between the calls, the persisted state was
+# inconsistent and BUG-031's restore-time reconciliation would have to
+# silently downgrade to FLAT on the NEXT boot. This battery enforces the
+# new ``adopt_orphan_and_clear_position`` does all three mutations
+# (adopt + clear position + transition to FLAT) before its single persist
+# is scheduled, so the snapshot can never observe the in-between state.
+
+
+class TestAdoptOrphanAndClearPositionAtomic:
+
+    def test_adopts_orphan(self):
+        pm = _make_pm()
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+        assert len(pm.orphaned_positions) == 1
+        assert pm.orphaned_positions[0].ticker == "KXBTC-BUG031"
+        assert pm.orphaned_positions[0].contracts == 8
+        assert pm.orphaned_positions[0].direction == "long"
+
+    def test_clears_position(self):
+        pm = _make_pm()
+        pm.position = _make_position(ticker="KXBTC-BUG031", contracts=8, entry_price=26.0)
+        pm.state = PositionState.OPEN
+
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+
+        assert pm.position is None
+
+    def test_transitions_to_flat(self):
+        pm = _make_pm()
+        pm.position = _make_position(ticker="KXBTC-BUG031")
+        pm.state = PositionState.EXITING
+
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+
+        assert pm.state == PositionState.FLAT
+
+    def test_no_op_state_change_when_already_flat(self):
+        pm = _make_pm()
+        pm.state = PositionState.FLAT
+
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+
+        assert pm.state == PositionState.FLAT
+        assert pm.position is None
+
+    def test_snapshot_after_atomic_call_is_consistent(self):
+        """Snapshot taken after the atomic call must show
+        state=FLAT AND position=None — never state=OPEN+position=None
+        which is the BUG-031 inconsistent state."""
+        pm = _make_pm()
+        pm.position = _make_position(ticker="KXBTC-BUG031")
+        pm.state = PositionState.EXITING
+
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+
+        snap = pm.get_snapshot()
+        assert snap["state"] == "FLAT"
+        assert snap["position"] is None
+        assert len(snap["orphaned_positions"]) == 1
+
+    def test_passes_cause_and_counted_through(self):
+        pm = _make_pm()
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+            cause="EXPIRY_409", counted=True,
+        )
+        o = pm.orphaned_positions[0]
+        assert o.cause == "EXPIRY_409"
+        assert o.counted is True
+
+    def test_idempotent_with_existing_orphan_for_same_ticker(self):
+        pm = _make_pm()
+        pm.adopt_orphan("KXBTC-BUG031", "long", 8, 26.0)
+        pm.position = _make_position(ticker="KXBTC-BUG031")
+        pm.state = PositionState.EXITING
+
+        pm.adopt_orphan_and_clear_position(
+            "KXBTC-BUG031", "long", 8, 26.0,
+        )
+
+        assert len(pm.orphaned_positions) == 1
+        assert pm.position is None
+        assert pm.state == PositionState.FLAT

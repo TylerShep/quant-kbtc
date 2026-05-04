@@ -235,6 +235,28 @@ class BotConfig:
     expiry_market_status_check_enabled: bool = field(
         default_factory=lambda: _env_bool("EXPIRY_MARKET_STATUS_CHECK_ENABLED", True)
     )
+    # BUG-032 (2026-05-04): the EXPIRY_GUARD exit was triggered at T-60s,
+    # but a single Kalshi exit-order round-trip during the pre-close
+    # volatility window can take 18+ seconds (15s FILL_POLL_TIMEOUT +
+    # 1.5s ledger lag + jitter). The coordinator retries up to 3 times
+    # with 2s + 4s backoff, so the *worst-case* exit takes ~70 seconds —
+    # which guarantees we cross the contract close. Three orphans on
+    # 2026-05-04 (B79950, B80350, B79150) followed exactly this pattern:
+    # exit fired at T-50s, first attempt sat in flight for 22s, retry,
+    # 409 Conflict from Kalshi (contract already closed), orphan adopted.
+    # Move the EXPIRY_GUARD trigger to T-180s so the worst-case retry
+    # sequence still completes before the close, and so a single failed
+    # round-trip doesn't burn the entire window.
+    expiry_guard_trigger_sec: int = field(
+        default_factory=lambda: _env_int("EXPIRY_GUARD_TRIGGER_SEC", 180)
+    )
+    # BUG-032 layer-2: the inner FILL_POLL_TIMEOUT for an EXPIRY_GUARD
+    # exit. The default 15s polling window is the right balance for
+    # normal exits but is way too long when the contract is about to
+    # close. Override it for EXPIRY_GUARD/SHORT_SETTLEMENT_GUARD only.
+    expiry_guard_fill_poll_timeout_sec: float = field(
+        default_factory=lambda: _env_float("EXPIRY_GUARD_FILL_POLL_TIMEOUT_SEC", 5.0)
+    )
 
     @property
     def is_production(self) -> bool:
