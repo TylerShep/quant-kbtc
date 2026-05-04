@@ -52,6 +52,17 @@ class PaperTrade:
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
     signal_driver: str = "-"
+    # BUG-030 (2026-05-02): entry_obi and entry_roc were missing from
+    # PaperTrade entirely, so coordinator's `getattr(trade, "entry_obi",
+    # 0.0)` always defaulted to 0. The trades.entry_obi / entry_roc
+    # columns were 100% NULL/zero across all 532 paper trades, breaking
+    # any attribution (incl. the new edge_profile_review's ROC bucketing)
+    # that joins on the trades table. Live trades stored the values
+    # correctly; only paper was broken. trade_features.roc_5 remains the
+    # source of truth for ML, but the trades table is the canonical row
+    # for human/dashboard lookups.
+    entry_obi: float = 0.0
+    entry_roc: float = 0.0
 
 
 class PaperTrader:
@@ -147,6 +158,8 @@ class PaperTrader:
             max_favorable_excursion=pos.max_favorable_excursion,
             max_adverse_excursion=pos.max_adverse_excursion,
             signal_driver=pos.signal_driver,
+            entry_obi=pos.entry_obi,
+            entry_roc=pos.entry_roc,
         )
 
         self.sizer.record_trade(net_pnl)

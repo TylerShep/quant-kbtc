@@ -67,7 +67,17 @@ class LiveTrader:
         # alongside the live wiring; left None for paper/dev so unit tests
         # don't have to stand up a WebSocket auth flow.
         self.fill_stream = fill_stream
-        self.position_manager = PositionManager(self.client, fill_stream=fill_stream)
+        # Supervised live-trade cap from BotConfig.live_trade_limit.
+        # 0 (or anything <=0) means unlimited; positive int caps consecutive
+        # round-trips before requiring an operator counter reset.
+        from config import settings as _s
+        _limit = _s.bot.live_trade_limit
+        live_trade_limit = _limit if _limit and _limit > 0 else None
+        self.position_manager = PositionManager(
+            self.client,
+            fill_stream=fill_stream,
+            live_trade_limit=live_trade_limit,
+        )
         self.trades: list[LiveTrade] = []
 
     # ── Backward-compatible properties ────────────────────────────────

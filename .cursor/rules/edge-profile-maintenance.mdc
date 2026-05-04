@@ -1,0 +1,195 @@
+---
+description: Edge profile maintenance system for the Kalshi BTC 15min trading bot — tripwire alarms, weekly co-calibration review, and Tier 1 auto-apply. Use this skill when modifying anything in backend/monitoring/live_health.py, scripts/edge_profile_review.py, scripts/edge_profile_apply.py, or the .env EDGE_LIVE_* keys.
+alwaysApply: false
+---
+
+# Edge Profile Maintenance System
+
+Documents the philosophy, components, and operator workflow for the
+edge_profile maintenance stack. Reference this rule when:
+
+* Modifying any tripwire alarm in `backend/monitoring/live_health.py`
+* Touching the weekly review script `scripts/edge_profile_review.py`
+* Touching the Tier 1 auto-apply script `scripts/edge_profile_apply.py`
+* Adjusting any `EDGE_LIVE_*` env variable
+* Adding or changing cron entries for the maintenance jobs
+
+## Why this exists
+
+Before this system, the live lane silently went dark for 5 days because
+`EDGE_LIVE_LONG_ONLY=true` plus the `0–7 UTC` blocked-hours list rejected
+nearly every signal — but no alarm fired, no operator noticed, and no
+weekly review process existed to surface the drift. The maintenance
+system makes that failure mode impossible to repeat by combining
+continuous tripwire alarms, an ML-conditional co-calibration review, and
+a conservative auto-apply path for unambiguously safe tightening
+recommendations.
+
+## Architecture
+
+```
+                    ┌─ tick ──→ resolver → spread → TFI → trend ──→ ML gate ──→ edge_profile ──→ price guard ──→ entry
+                    │
+backend/coordinator ─┤
+                    │
+                    └─ hourly: live_health.run_live_health_checks()
+                          ├─ check_live_drought          (>36h dark + paper firing)
+                          ├─ check_edge_skip_ratio       (>95% EDGE_*, 2 consec checks)
+                          └─ check_direction_imbalance   (short>>long rejections, 0 live shorts)
+
+Sunday cron on droplet:
+  04:00 UTC  scripts/retrain_xgb_cron.sh          → ML retrain + maybe promote
+  05:00 UTC  scripts/edge_profile_review_cron.sh  → weekly review, JSON sidecar, Discord post
+  05:30 UTC  scripts/edge_profile_apply_cron.sh   → auto-apply Tier 1 recs from sidecar
+```
+
+## Tripwire alarms (Phase 1)
+
+`backend/monitoring/live_health.py` runs three independent checks every
+hour from `coordinator._schedule_live_health`. Each persists its
+cooldown in `bot_state` so a restart can't accidentally re-fire alarms
+that were already in cooldown.
+
+| Alarm | Trigger | Cooldown | Channel |
+| --- | --- | --- | --- |
+| `live_drought_alarm` | last live trade > 36h ago AND ≥5 paper trades in same window AND `trading_mode=live` AND `trading_paused=off` | 12h | RISK |
+| `edge_skip_ratio_alarm` | `EDGE_*` skip ratio > 95% over 24h for 2 consecutive checks (≥100 signal_log rows) | 12h | RISK |
+| `direction_imbalance_alarm` | EDGE short rejections > 5x EDGE long rejections AND 0 live shorts in 7d AND ≥50 short rejections | 24h | RISK |
+
+Each alarm is a pure decision (`_should_fire` helper) plus an
+integration call. Tests in `backend/tests/test_live_health.py`.
+
+The same module exposes `fetch_edge_profile_health(pool)` which returns
+a snapshot of every alarm input plus auto-apply state. It's surfaced in
+both `/api/diagnostics` and `/api/status` so the dashboard can render an
+"edge profile health" card without anyone having to wait for an alarm.
+
+## Weekly review (Phase 2)
+
+`scripts/edge_profile_review.py` runs Sunday 05:00 UTC. It:
+
+1. Pulls last 14 days of paper trades joined with `trade_features`
+2. (Default ON) re-scores each row through the active `xgb_entry_v1.pkl`
+   so attribution reflects what the live lane actually sees post-ML
+3. For each tunable param, computes "protecting" vs "leaking" PnL
+4. Suggests a new value per param using monotone tightening rules
+   (raise `short_min_price` when above-floor cohort lost >$100 over ≥5
+   trades, etc.)
+5. Tags every recommendation as `AUTO_APPLY` or `MANUAL_ONLY`
+6. Writes a JSON sidecar to `~/kbtc/data/edge_review/recommendations_<ts>.json`
+7. Posts a markdown report to `DISCORD_ATTRIBUTION_WEBHOOK`
+
+`AUTO_APPLY` requires ALL of:
+
+* The change is **strictly tightening** (more restrictive than current).
+  Loosening is NEVER auto-apply — even with overwhelming evidence.
+* Supporting cohort has **≥30 trades** in the affected slice
+* Signed `|PnL impact| > $200`
+* The param is NOT a kill switch (`EDGE_LIVE_PROFILE_ENABLED`,
+  `EDGE_LIVE_LONG_ONLY`, `EDGE_LIVE_AUTO_APPLY_ENABLED` are always manual)
+
+Tests in `backend/tests/test_edge_profile_review.py`.
+
+## Tier 1 auto-apply (Phase 2.5)
+
+`scripts/edge_profile_apply.py` runs Sunday 05:30 UTC, 30 minutes after
+the review. It:
+
+1. Reads the newest `recommendations_<ts>.json` sidecar
+2. Aborts entirely if `EDGE_LIVE_AUTO_APPLY_ENABLED=false` (the default)
+3. Applies defense-in-depth filters: re-checks tier=AUTO_APPLY, blocks
+   loosening, blocks kill-switch params, blocks no-ops
+4. Per-param 7-day throttle (queries `edge_profile_change_log`)
+5. For each surviving rec:
+   - Backup `.env` to `.env.backup-auto-<ts>`
+   - INSERT audit row into `edge_profile_change_log` FIRST
+   - Mutate `.env` (Python read/modify/write — portable across BSD/GNU sed)
+   - On env failure: rollback the audit row by id
+6. After applies: hit `/api/deploy-check`. If safe, restart bot. If a
+   live position is open, defer restart and log "deferred_position_open"
+7. Post to `DISCORD_RISK_WEBHOOK` with rollback command
+
+Audit table: `edge_profile_change_log` (migration 009).
+
+Tests in `backend/tests/test_edge_profile_apply.py`. Pin every safety
+invariant — defense in depth, throttle, kill switch, audit ordering,
+dry-run, restart deferral.
+
+## Operator opt-in
+
+`EDGE_LIVE_AUTO_APPLY_ENABLED=false` by default. Operator MUST observe
+3+ weekly review cycles producing AUTO_APPLY recommendations and
+confirm each one would have been a change they'd have made manually,
+before flipping the switch on. Document the 3-cycle observation in a
+new `EDGE-PROFILE-YYYY-MM-DD` known-bugs entry before opting in.
+
+## Survivorship-bias guardrails
+
+The review uses `trade_features ⨝ trades`, the same dataset the ML
+model trains on. Three guardrails make this safe:
+
+1. `--ml-conditional` (default ON) re-scores rows through the
+   incumbent model so attribution reflects the live filter stack
+2. The Discord report shows leaking + protecting side-by-side per gate
+3. **Never use unconditional attribution to calibrate live-lane gates.**
+   The post-ML cohort is the only honest dataset.
+
+## ML co-calibration
+
+The 1h offset between the ML retrain (04:00) and the review (05:00) is
+deliberate. After a model promotion, the trade distribution that
+edge_profile is calibrated against shifts. The review must consume the
+new model's view of the world. **When promoting a new model manually
+(out of cron), also re-run `edge_profile_review.py` immediately so the
+gates get re-evaluated against the new distribution.**
+
+## Hard guardrails (do NOT change without fresh attribution)
+
+* **Don't loosen `short_min_price` below $40** without fresh paper data
+  showing shorts in the $30–$40 band are now profitable. The 2026-04-29
+  recalibration set this floor based on a 14-day window in which the
+  $30–$40 short cohort lost over $1,000.
+* **Don't add `ROC/TIGHT` back to allowed_drivers** — removed
+  2026-04-21 after a 9-day counterfactual showed sustained decay.
+* **Don't auto-flip `EDGE_LIVE_LONG_ONLY`** — it's a kill switch and
+  the apply script is hard-coded to refuse it. If the review suggests
+  flipping it, the operator must hand-review the underlying attribution
+  before applying.
+* **Don't widen `EDGE_LIVE_BLOCKED_HOURS_UTC` without a paper PnL
+  attribution** showing the candidate hour lost >$200 over ≥10 trades.
+  Conversely, never *clear* a blocked hour without showing the cohort
+  is now profitable in the post-ML window.
+* **Don't loosen `short_block_negative_roc_threshold` toward more
+  negative values** (e.g. toward `-0.10` or further from 0) without
+  showing the `>−0.05` cohort is breakeven or better in a fresh
+  ≥10-trade slice. The 2026-05-02 calibration set this floor based
+  on a 14-day window in which NORMAL shorts with raw 5-bar ROC
+  ≤ −0.05 lost **$120/trade across 103 trades** (40% WR). This gate
+  is short-only by design — paper attribution showed longs in every
+  ROC bucket are profitable, so a mirror long-side gate must NOT be
+  added without a similarly clean cohort isolation.
+
+## Rollback
+
+* **Auto-applied change wrong?** Backup is at
+  `~/kbtc/.env.backup-auto-<ts>`. Restore with
+  `cp ~/kbtc/.env.backup-auto-<ts> ~/kbtc/.env && bash scripts/deploy.sh`.
+* **Audit trail:** every change has a row in `edge_profile_change_log`
+  with `applied_by='auto'` and the full recommendation JSON.
+* **Disable auto-apply quickly:** flip `EDGE_LIVE_AUTO_APPLY_ENABLED=false`
+  in `.env`, deploy. Next Sunday's apply pass will exit 1 (no-op).
+
+## Related files
+
+* `backend/monitoring/live_health.py` — alarms + diagnostics snapshot
+* `backend/notifications.py` — Discord embed methods (live_drought_alarm,
+  edge_skip_ratio_alarm, direction_imbalance_alarm, edge_profile_auto_applied)
+* `backend/coordinator.py` — `_schedule_live_health` task wiring
+* `backend/api/routes.py` — diagnostics/status endpoints with edge_profile_health block
+* `backend/config/settings.py` — `EdgeProfileConfig` (incl. `auto_apply_enabled`)
+* `backend/filters/edge_profile.py` — the actual gate the bot evaluates
+* `backend/migrations/009_edge_profile_change_log.sql` — audit table
+* `scripts/edge_profile_review.py` + `scripts/edge_profile_review_cron.sh`
+* `scripts/edge_profile_apply.py` + `scripts/edge_profile_apply_cron.sh`
+* `docs/runbooks/edge-profile-review.md` — operator SOP for the
+  weekly Discord report

@@ -34,6 +34,7 @@ from execution.live_trader import LiveTrader
 from data.fill_stream import FillStream
 from api.ws import ws_manager
 from database import get_pool, close_pool
+from database.connection import write_gate
 from notifications import get_notifier
 from filters.price_guard import PriceGuard
 from filters.trend_guard import TrendGuard
@@ -41,6 +42,7 @@ from filters.edge_profile import evaluate as evaluate_edge_profile
 from ml.feature_capture import extract_features, save_features, label_trade
 from ml.inference import ml_gate
 from data.historical_sync import HistoricalSync
+from monitoring.live_health import run_live_health_checks
 
 logger = structlog.get_logger(__name__)
 
@@ -93,6 +95,17 @@ class Coordinator:
         # Fix 1: Duplicate entry guard — prevents concurrent live entry tasks
         self._live_entry_in_flight = False
         self._live_exit_in_flight = False
+
+        # 2026-05-01 OOM fix: bounded background-task set for high-frequency
+        # fire-and-forget persists (snapshots, signals, equity, save_state).
+        # Without a cap, slow DB writes caused create_task() coros to pile up
+        # holding references to state/features/decision until the container
+        # got OOM-killed (~1.5 GiB → restart loop). When the queue is full we
+        # *drop* the new task instead of letting memory grow unbounded — the
+        # loss of a single ob_snapshot is harmless; an OOM kill is not.
+        self._bg_persist_tasks: set = set()
+        self._bg_persist_max = 64  # tune if logs show frequent drops
+        self._bg_persist_dropped = 0
 
         # BUG-028 telemetry: counts how many ticks were skipped because the
         # active contract was within `min_seconds_to_expiry` (or its
@@ -182,6 +195,7 @@ class Coordinator:
         self.live_trader.position_manager.set_db_pool(self._pool)
         await self.live_trader.position_manager.restore_state()
         await self._restore_state()
+        await self._restore_paper_position()
         await self._warmup_atr()
         await self._warmup_spread_filter()
         self.data_manager.add_listener(self._on_market_update)
@@ -198,6 +212,7 @@ class Coordinator:
         asyncio.create_task(self._schedule_daily_attribution())
         asyncio.create_task(self._schedule_weekly_digest())
         asyncio.create_task(self._schedule_paper_sizer_resets())
+        asyncio.create_task(self._schedule_live_health())
         await self.historical_sync.start(self._pool)
         logger.info("coordinator.started",
                     fill_stream_enabled=self.fill_stream is not None)
@@ -271,6 +286,7 @@ class Coordinator:
 
             if self.paper_trader.has_position:
                 self.paper_trader.position.candles_held += 1
+                asyncio.create_task(self._save_paper_position())
             if self.live_trader.has_position:
                 self.live_trader.position.candles_held += 1
 
@@ -305,7 +321,9 @@ class Coordinator:
             self._run_live_lane(symbol, state, features, regime)
 
         # ── 5. Broadcast to dashboard ──────────────────────────────────
-        asyncio.create_task(
+        # Backpressure-aware: dashboard updates are nice-to-have, not
+        # essential. Drop under load rather than OOM the bot.
+        self._spawn_bg_persist(
             ws_manager.broadcast({
                 "type": "market_update",
                 "symbol": symbol,
@@ -317,8 +335,12 @@ class Coordinator:
         )
 
         # ── 6. Periodic tasks ─────────────────────────────────────────
-        if self._tick_count % 10 == 0 and self._pool is not None:
-            asyncio.create_task(self._persist_snapshot(symbol, state, features))
+        # 2026-05-01 OOM fix: snapshot persists were happening every 10 ticks
+        # (~1 Hz) which, under DB write_gate pressure, caused create_task
+        # coroutines to back up holding state/features references → OOM.
+        # 30-tick interval is still fine for backtest replay granularity.
+        if self._tick_count % 30 == 0 and self._pool is not None:
+            self._spawn_bg_persist(self._persist_snapshot(symbol, state, features))
 
         high_risk_window = (
             regime == "HIGH"
@@ -331,11 +353,11 @@ class Coordinator:
             asyncio.create_task(self._check_orphaned_positions())
 
         if self._tick_count % 60 == 0 and self._pool is not None:
-            asyncio.create_task(self._persist_equity("paper"))
+            self._spawn_bg_persist(self._persist_equity("paper"))
             if self.live_enabled:
-                asyncio.create_task(self._persist_equity("live"))
+                self._spawn_bg_persist(self._persist_equity("live"))
         if self._tick_count % 300 == 0 and self._pool is not None:
-            asyncio.create_task(self._save_state())
+            self._spawn_bg_persist(self._save_state())
 
         if self._tick_count % reconcile_interval == 0 and self.live_enabled and not self.live_trader.position_manager.is_busy:
             asyncio.create_task(self._periodic_reconciliation())
@@ -492,18 +514,22 @@ class Coordinator:
             self._unregister_position_ticker(trade.ticker)
             self._last_live_exit_tick = self._tick_count
 
-            # Supervised single-trade mode: auto-pause after every live trade
-            # so the operator can review before the next one is allowed.
-            self.trading_paused = "paused"
-            logger.info("coordinator.supervised_auto_pause",
-                        ticker=trade.ticker, exit_reason=trade.exit_reason,
-                        pnl=trade.pnl)
-            asyncio.create_task(ws_manager.broadcast({
-                "type": "supervised_pause",
-                "trading_paused": "paused",
-                "reason": "Post-trade review required",
-                "trade_ticker": trade.ticker,
-            }))
+            # Supervised single-trade mode: when enabled, auto-pause after
+            # every live trade so the operator must review before the next
+            # one. Default OFF — operators rely on the ``live_trade_limit``
+            # cap and manual dashboard pauses instead. Toggle with
+            # SUPERVISED_AUTO_PAUSE=true in .env and restart.
+            if settings.bot.supervised_auto_pause:
+                self.trading_paused = "paused"
+                logger.info("coordinator.supervised_auto_pause",
+                            ticker=trade.ticker, exit_reason=trade.exit_reason,
+                            pnl=trade.pnl)
+                asyncio.create_task(ws_manager.broadcast({
+                    "type": "supervised_pause",
+                    "trading_paused": "paused",
+                    "reason": "Post-trade review required",
+                    "trade_ticker": trade.ticker,
+                }))
         else:
             self._last_paper_exit_tick = self._tick_count
 
@@ -512,6 +538,9 @@ class Coordinator:
     async def _persist_and_notify_exit(self, trade, symbol: str, mode: str) -> None:
         """Persist trade first, then notify. Skip Discord if trade was quarantined."""
         quarantined, trade_id = await self._persist_trade(trade, mode)
+
+        if mode == "paper":
+            await self._clear_paper_position()
 
         if trade_id is not None:
             await self._save_and_label_features(trade, trade_id, mode)
@@ -790,6 +819,8 @@ class Coordinator:
         """Common post-entry logic for both paper and live trades."""
         if mode == "live":
             self._register_position_ticker(pos.ticker, symbol)
+        else:
+            asyncio.create_task(self._save_paper_position())
         asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY",
                                                     roc_value=roc_val))
         asyncio.create_task(ws_manager.broadcast({
@@ -1122,7 +1153,8 @@ class Coordinator:
         else:
             self._last_live_decision = decision
 
-        roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
+        # roc_val computed earlier (above the edge_profile gate) and reused
+        # here so the filter and the trade record see the same value.
 
         self.trend_guard.apply_short_trend_filter(decision, closes, mode)
 
@@ -1151,6 +1183,12 @@ class Coordinator:
                 logger.info("coordinator.ml_gate_rejected",
                             p_win=round(p_win, 3), mode=mode, direction=pre_dir)
 
+        # Compute raw 5-bar ROC once and reuse for the edge_profile gate
+        # (below) and downstream entry/log paths. Was previously recomputed
+        # at lines ~1156 / ~1230; consolidating here removes drift between
+        # what the filter sees and what we persist on the entry.
+        roc_val = calculate_roc(closes, settings.roc.lookback) or 0.0
+
         # Edge profile gate — LIVE LANE ONLY. Restricts live trading to the
         # subset of setups validated by paper-trading attribution. Paper is
         # never affected so it keeps generating training data.
@@ -1159,6 +1197,7 @@ class Coordinator:
                 and decision.should_trade_in(mode)):
             edge_ok, edge_reason = evaluate_edge_profile(
                 decision=decision, entry_price=None,
+                roc_value=roc_val,
             )
             if not edge_ok:
                 pre_dir = decision.direction.value if decision.direction else None
@@ -1189,6 +1228,7 @@ class Coordinator:
                 if mode == "live" and settings.edge_profile.enabled:
                     edge_ok, edge_reason = evaluate_edge_profile(
                         decision=decision, entry_price=entry_price,
+                        roc_value=roc_val,
                     )
                     if not edge_ok:
                         logger.info("coordinator.edge_profile_rejected",
@@ -1196,10 +1236,21 @@ class Coordinator:
                                     price=entry_price,
                                     direction=decision.direction.value,
                                     driver=decision.signal_driver)
-                        asyncio.create_task(self._persist_signal(
-                            state, features, decision, edge_reason,
-                            roc_value=roc_val,
-                        ))
+                        # BUG-029: rate-limit DB writes for high-frequency
+                        # rejections. During momentum surges this path could
+                        # fire 60+ times/sec, queueing 60 DB tasks each
+                        # holding a connection from the pool, exhausting it
+                        # within seconds and triggering pool timeouts that
+                        # cascaded into container restarts. Throttling to
+                        # once every 60 ticks (~1/min) is plenty for the
+                        # edge-skip-ratio alarm to detect persistent issues
+                        # without filling signal_log with millisecond-spaced
+                        # duplicates of the same rejection reason.
+                        if self._tick_count % 60 == 0:
+                            self._spawn_bg_persist(self._persist_signal(
+                                state, features, decision, edge_reason,
+                                roc_value=roc_val,
+                            ))
                         return
 
                 ticker = state.kalshi_ticker or symbol
@@ -1243,7 +1294,7 @@ class Coordinator:
                             bankroll=sizer.bankroll,
                         ))
         elif decision.skip_reason and self._tick_count % 60 == 0:
-            asyncio.create_task(self._persist_signal(
+            self._spawn_bg_persist(self._persist_signal(
                 state, features, decision, decision.skip_reason,
                 roc_value=roc_val,
             ))
@@ -1450,6 +1501,32 @@ class Coordinator:
 
     # ── Persistence ────────────────────────────────────────────────────
 
+    def _spawn_bg_persist(self, coro) -> None:
+        """Schedule a high-frequency fire-and-forget persist with backpressure.
+
+        2026-05-01 OOM fix: protect the event loop from unbounded
+        ``asyncio.create_task`` accumulation. When too many persists are
+        already queued (DB pressure), we *close* the new coroutine and
+        increment a counter rather than spawn it. This trades a tiny amount
+        of telemetry for surviving the next ~10 minutes of DB latency.
+        """
+        if len(self._bg_persist_tasks) >= self._bg_persist_max:
+            self._bg_persist_dropped += 1
+            try:
+                coro.close()
+            except Exception:
+                pass
+            if self._bg_persist_dropped % 50 == 1:
+                logger.warning(
+                    "coordinator.bg_persist_dropped",
+                    queue_size=len(self._bg_persist_tasks),
+                    total_dropped=self._bg_persist_dropped,
+                )
+            return
+        task = asyncio.create_task(coro)
+        self._bg_persist_tasks.add(task)
+        task.add_done_callback(self._bg_persist_tasks.discard)
+
     async def _persist_snapshot(self, symbol: str, state, features) -> None:
         try:
             pool = self._pool
@@ -1460,21 +1537,22 @@ class Coordinator:
             bids_json = _json.dumps([list(p) for p in state.order_book.top_n_bids(10)])
             asks_json = _json.dumps([list(p) for p in state.order_book.top_n_asks(10)])
 
-            async with pool.connection() as conn:
-                await conn.execute(
-                    """INSERT INTO ob_snapshots
-                       (timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents)
-                       VALUES (NOW(), %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)""",
-                    (
-                        state.kalshi_ticker or symbol,
-                        bids_json,
-                        asks_json,
-                        features.obi,
-                        features.total_bid_vol,
-                        features.total_ask_vol,
-                        features.spread_cents,
-                    ),
-                )
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO ob_snapshots
+                           (timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents)
+                           VALUES (NOW(), %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)""",
+                        (
+                            state.kalshi_ticker or symbol,
+                            bids_json,
+                            asks_json,
+                            features.obi,
+                            features.total_bid_vol,
+                            features.total_ask_vol,
+                            features.spread_cents,
+                        ),
+                    )
         except Exception as e:
             logger.error("coordinator.persist_failed", error=str(e))
             asyncio.create_task(get_notifier().db_error("persist_snapshot", str(e)))
@@ -1498,9 +1576,34 @@ class Coordinator:
             logger.error("coordinator.persist_candle_failed", error=str(e))
 
     async def _schedule_tuning(self) -> None:
-        """Periodic tuning task — runs every TUNING_INTERVAL_HOURS."""
+        """Periodic tuning task — runs every TUNING_INTERVAL_HOURS.
+
+        Discord noise control (2026-05-02): the previous version posted
+        ``tuning_cycle_report`` to Discord on every cycle, including
+        no-op cycles like "Walk-forward produced no valid windows" and
+        "No parameter changes needed". On a 6h cadence with insufficient
+        historical candles to fill a walk-forward window (need
+        ~train_window+test_window=4000 candles, bot accumulates over
+        weeks), this produced 4 identical "no valid windows" Discord
+        embeds per day forever. We now:
+
+          1. Always log the cycle outcome (full visibility in container
+             logs and ``coordinator.tuning_complete`` events).
+          2. Post to Discord only when there's actually something the
+             operator should see — health alerts present, ``should_apply``
+             true, OR the cycle is the first NON-noop after a streak of
+             noops (so the operator sees recovery without the noise).
+          3. Once per UTC day, post a one-line summary of the previous
+             24h's cycle outcomes when the day-long sequence was 100%
+             noop. Keeps observability without spamming.
+        """
         interval_sec = settings.bot.tuning_interval_hours * 3600
         min_candles = 2000
+
+        # In-memory daily summary state. Reset at UTC midnight.
+        skipped_streak_day = datetime.now(timezone.utc).date()
+        skipped_reasons: dict[str, int] = {}
+        last_summary_date = skipped_streak_day
 
         while True:
             await asyncio.sleep(interval_sec)
@@ -1513,6 +1616,13 @@ class Coordinator:
                 if len(candles) < min_candles:
                     logger.info("coordinator.tuning_skipped", reason="insufficient_candles",
                                 count=len(candles), required=min_candles)
+                    skipped_reasons["insufficient_candles"] = (
+                        skipped_reasons.get("insufficient_candles", 0) + 1
+                    )
+                    await self._maybe_post_tuning_daily_summary(
+                        skipped_reasons, last_summary_date,
+                    )
+                    last_summary_date = datetime.now(timezone.utc).date()
                     continue
 
                 ob_history = await load_ob_snapshots_db(pool)
@@ -1521,8 +1631,6 @@ class Coordinator:
                     candles, ob_history, pool=pool, auto_apply=False,
                 )
 
-                notifier = get_notifier()
-
                 health_alerts: list[str] = []
                 try:
                     from monitoring.signal_health import run_signal_health_check
@@ -1530,21 +1638,89 @@ class Coordinator:
                 except Exception as e:
                     logger.warning("coordinator.signal_health_check_failed", error=str(e))
 
-                await notifier.tuning_cycle_report(
-                    edge_consistency=result.edge_consistency,
-                    avg_oos_sharpe=result.avg_oos_sharpe,
-                    should_apply=result.should_apply,
-                    reason=result.reason,
-                    changes=result.changes,
-                    health_alerts=health_alerts,
-                )
-
+                # Always log the result.
                 logger.info("coordinator.tuning_complete",
                             consistency=result.edge_consistency,
                             sharpe=result.avg_oos_sharpe,
-                            should_apply=result.should_apply)
+                            should_apply=result.should_apply,
+                            reason=result.reason,
+                            changes_n=len(result.changes or {}))
+
+                # Decide whether to post to Discord.
+                is_noop = (
+                    not result.should_apply
+                    and not health_alerts
+                    and not (result.changes or {})
+                )
+                if is_noop:
+                    skipped_reasons[result.reason or "unknown"] = (
+                        skipped_reasons.get(result.reason or "unknown", 0) + 1
+                    )
+                    logger.info("coordinator.tuning_post_skipped",
+                                reason=result.reason,
+                                noop_streak=sum(skipped_reasons.values()))
+                else:
+                    notifier = get_notifier()
+                    await notifier.tuning_cycle_report(
+                        edge_consistency=result.edge_consistency,
+                        avg_oos_sharpe=result.avg_oos_sharpe,
+                        should_apply=result.should_apply,
+                        reason=result.reason,
+                        changes=result.changes,
+                        health_alerts=health_alerts,
+                    )
+                    # Reset the noop streak on every actual post so the
+                    # daily summary only fires when nothing happened.
+                    skipped_reasons = {}
+
+                await self._maybe_post_tuning_daily_summary(
+                    skipped_reasons, last_summary_date,
+                )
+                # Roll the day pointer to today so the summary fires
+                # at most once per UTC day.
+                last_summary_date = datetime.now(timezone.utc).date()
             except Exception as e:
                 logger.error("coordinator.tuning_failed", error=str(e))
+
+    async def _maybe_post_tuning_daily_summary(
+        self,
+        skipped_reasons: dict[str, int],
+        last_summary_date,
+    ) -> None:
+        """Post a single Discord summary at most once per UTC day when
+        all of the previous day's tuning cycles were noops.
+
+        Mutates ``skipped_reasons`` in place: empties it after a successful
+        post so the next day starts clean.
+        """
+        today = datetime.now(timezone.utc).date()
+        if today == last_summary_date:
+            return
+        if not skipped_reasons:
+            return
+        try:
+            notifier = get_notifier()
+            total = sum(skipped_reasons.values())
+            top_reason = max(skipped_reasons.items(), key=lambda kv: kv[1])[0]
+            await notifier.tuning_cycle_report(
+                edge_consistency=0.0,
+                avg_oos_sharpe=0.0,
+                should_apply=False,
+                reason=(
+                    f"Daily summary: {total} no-op cycles in past 24h "
+                    f"(top reason: {top_reason}). No Discord posts were "
+                    f"emitted per cycle. Investigate if this persists."
+                ),
+                changes=None,
+                health_alerts=None,
+            )
+            logger.info("coordinator.tuning_daily_summary_posted",
+                        total_noops=total, top_reason=top_reason)
+        except Exception as e:
+            logger.warning("coordinator.tuning_daily_summary_failed",
+                           error=str(e))
+        finally:
+            skipped_reasons.clear()
 
     async def _schedule_daily_attribution(self) -> None:
         """Run attribution on yesterday's trades at midnight UTC each day."""
@@ -1764,6 +1940,32 @@ class Coordinator:
                 self.paper_sizer.reset_weekly()
                 logger.info("coordinator.paper_sizer_weekly_reset",
                             bankroll=self.paper_sizer.bankroll)
+
+    async def _schedule_live_health(self) -> None:
+        """Hourly live-health tripwire alarms.
+
+        Runs the three checks in monitoring/live_health.py: drought,
+        edge_skip_ratio, and direction_imbalance. Each is independent
+        and persists its own cooldown in bot_state, so a restart can't
+        accidentally re-fire alarms that were already in cooldown.
+
+        First run is delayed 5 minutes so the bot has a chance to load
+        state and start ticking before we measure anything.
+        """
+        await asyncio.sleep(300)
+        while True:
+            try:
+                pool = self._pool
+                if pool is not None:
+                    await run_live_health_checks(
+                        pool, get_notifier(),
+                        trading_mode=self.trading_mode,
+                        trading_paused=self.trading_paused,
+                    )
+            except Exception as e:
+                logger.error("coordinator.live_health_check_failed",
+                             error=str(e))
+            await asyncio.sleep(3600)
 
     async def _warmup_atr(self) -> None:
         """Pre-seed ATR filter from historical candles so regime and atr_pct
@@ -2037,27 +2239,28 @@ class Coordinator:
             pool = self._pool
             if pool is None:
                 return
-            async with pool.connection() as conn:
-                await conn.execute(
-                    """INSERT INTO signal_log
-                       (timestamp, ticker, obi_value, obi_direction, roc_value,
-                        roc_direction, atr_regime, decision, conviction,
-                        skip_reason, size_mult, spread_state)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        state.kalshi_ticker or state.symbol,
-                        features.obi,
-                        decision.obi_dir.value,
-                        roc_value,
-                        decision.roc_dir.value,
-                        self.atr_filter.current_regime,
-                        action,
-                        decision.conviction.value,
-                        decision.skip_reason,
-                        decision.size_multiplier,
-                        decision.spread_state.value,
-                    ),
-                )
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO signal_log
+                           (timestamp, ticker, obi_value, obi_direction, roc_value,
+                            roc_direction, atr_regime, decision, conviction,
+                            skip_reason, size_mult, spread_state)
+                           VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                            state.kalshi_ticker or state.symbol,
+                            features.obi,
+                            decision.obi_dir.value,
+                            roc_value,
+                            decision.roc_dir.value,
+                            self.atr_filter.current_regime,
+                            action,
+                            decision.conviction.value,
+                            decision.skip_reason,
+                            decision.size_multiplier,
+                            decision.spread_state.value,
+                        ),
+                    )
         except Exception as e:
             logger.error("coordinator.persist_signal_failed", error=str(e))
             asyncio.create_task(get_notifier().db_error("persist_signal", str(e)))
@@ -2069,22 +2272,135 @@ class Coordinator:
                 return
             sizer = self.live_sizer if mode == "live" else self.paper_sizer
             trader = self.live_trader if mode == "live" else self.paper_trader
-            async with pool.connection() as conn:
-                await conn.execute(
-                    """INSERT INTO bankroll_history
-                       (timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count, trading_mode)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s)""",
-                    (
-                        sizer.bankroll,
-                        sizer.peak_bankroll,
-                        round(sizer.current_drawdown * 100, 4),
-                        round(sum(sizer.trades_today), 4),
-                        len(trader.trades),
-                        mode,
-                    ),
-                )
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO bankroll_history
+                           (timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count, trading_mode)
+                           VALUES (NOW(), %s, %s, %s, %s, %s, %s)""",
+                        (
+                            sizer.bankroll,
+                            sizer.peak_bankroll,
+                            round(sizer.current_drawdown * 100, 4),
+                            round(sum(sizer.trades_today), 4),
+                            len(trader.trades),
+                            mode,
+                        ),
+                    )
         except Exception as e:
             logger.error("coordinator.persist_equity_failed", error=str(e))
+
+    async def _save_paper_position(self) -> None:
+        """Persist the open paper position to bot_state so it survives restarts.
+
+        Called from _on_trade_entry (paper branch) and once per tick when the
+        position is open (so candles_held / MFE / MAE updates aren't lost on a
+        crash). The row is cleared in _clear_paper_position on every paper exit.
+
+        Without this persistence, a container restart while a paper trade was
+        open would orphan the open notification on Discord ("opened, never
+        closed"), the in-memory position would be lost, and a brand-new entry
+        could fire on the same ticker without a closing trade ever being
+        recorded. See ``_persist_and_notify_exit`` for the exit half.
+        """
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            pos = self.paper_trader.position
+            if pos is None:
+                return
+            import json
+            payload = {
+                "ticker": pos.ticker,
+                "direction": pos.direction,
+                "contracts": pos.contracts,
+                "entry_price": pos.entry_price,
+                "entry_time": pos.entry_time.isoformat(),
+                "conviction": pos.conviction,
+                "regime_at_entry": pos.regime_at_entry,
+                "entry_obi": pos.entry_obi,
+                "entry_roc": pos.entry_roc,
+                "candles_held": pos.candles_held,
+                "max_favorable_excursion": pos.max_favorable_excursion,
+                "max_adverse_excursion": pos.max_adverse_excursion,
+                "signal_driver": pos.signal_driver,
+            }
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO bot_state (key, value, updated_at)
+                           VALUES ('paper_open_position', %s::jsonb, NOW())
+                           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                        (json.dumps(payload),),
+                    )
+        except Exception as e:
+            logger.warning("coordinator.save_paper_position_failed", error=str(e))
+
+    async def _clear_paper_position(self) -> None:
+        """Remove the persisted paper open-position row after exit/settlement."""
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        "DELETE FROM bot_state WHERE key = 'paper_open_position'"
+                    )
+        except Exception as e:
+            logger.warning("coordinator.clear_paper_position_failed", error=str(e))
+
+    async def _restore_paper_position(self) -> None:
+        """Reconstruct the paper position from bot_state on startup.
+
+        Best-effort: any exception is logged and the bot starts FLAT. Stale
+        entries (for tickers that have already settled) are dropped so we
+        don't try to manage a dead position.
+        """
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            import json
+            from datetime import datetime
+            async with pool.connection() as conn:
+                row = await conn.execute(
+                    "SELECT value FROM bot_state WHERE key = 'paper_open_position'"
+                )
+                result = await row.fetchone()
+            if not result:
+                return
+            data = result[0] if isinstance(result[0], dict) else json.loads(result[0])
+
+            try:
+                entry_time = datetime.fromisoformat(data["entry_time"])
+            except (KeyError, ValueError, TypeError):
+                entry_time = datetime.now(timezone.utc)
+
+            from execution.paper_trader import PaperPosition
+            self.paper_trader.position = PaperPosition(
+                ticker=data["ticker"],
+                direction=data["direction"],
+                contracts=int(data["contracts"]),
+                entry_price=float(data["entry_price"]),
+                entry_time=entry_time,
+                conviction=data.get("conviction", "NORMAL"),
+                regime_at_entry=data.get("regime_at_entry", "MEDIUM"),
+                entry_obi=float(data.get("entry_obi") or 0.0),
+                entry_roc=float(data.get("entry_roc") or 0.0),
+                candles_held=int(data.get("candles_held") or 0),
+                max_favorable_excursion=float(data.get("max_favorable_excursion") or 0.0),
+                max_adverse_excursion=float(data.get("max_adverse_excursion") or 0.0),
+                signal_driver=data.get("signal_driver", "-"),
+            )
+            logger.info("coordinator.paper_position_restored",
+                        ticker=data["ticker"],
+                        direction=data["direction"],
+                        contracts=data["contracts"],
+                        candles_held=data.get("candles_held", 0))
+        except Exception as e:
+            logger.warning("coordinator.restore_paper_position_failed", error=str(e))
 
     async def _save_state(self) -> None:
         """Persist bankroll state for both paper and live sizers."""
@@ -2109,13 +2425,14 @@ class Coordinator:
                 "trading_paused": self.trading_paused,
                 "ml_data_ready_sent": self._ml_data_ready_sent,
             }
-            async with pool.connection() as conn:
-                await conn.execute(
-                    """INSERT INTO bot_state (key, value, updated_at)
-                       VALUES ('sizer_state', %s::jsonb, NOW())
-                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
-                    (json.dumps(state),),
-                )
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO bot_state (key, value, updated_at)
+                           VALUES ('sizer_state', %s::jsonb, NOW())
+                           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                        (json.dumps(state),),
+                    )
             logger.info("coordinator.state_saved",
                         paper_bankroll=state["paper"]["bankroll"],
                         live_bankroll=state["live"]["bankroll"],

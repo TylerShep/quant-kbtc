@@ -83,6 +83,7 @@ def evaluate(
     decision: TradeDecision,
     entry_price: Optional[float],
     now_utc: Optional[datetime] = None,
+    roc_value: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Return (allowed, skip_reason).
 
@@ -98,6 +99,15 @@ def evaluate(
       known — a pre-filter call (``entry_price=None``) on a short with
       sub-threshold conviction passes through and gets re-evaluated once
       the coordinator looks up the live entry price.
+
+    ROC-contradiction veto (NORMAL shorts only):
+      When ``roc_value`` is provided and the trade is a NORMAL-conviction
+      short with raw 5-bar ROC at or below
+      ``short_block_negative_roc_threshold`` (default -0.05), reject it.
+      See ``EdgeProfileConfig.short_block_negative_roc_threshold`` docstring
+      for the calibration rationale. Backward-compatible:
+      ``roc_value=None`` skips the gate (callers that haven't wired the
+      raw ROC through pass through unchanged).
     """
     cfg = settings.edge_profile
 
@@ -124,6 +134,20 @@ def evaluate(
                 return False, (
                     f"EDGE_SHORT_PRICE_LOW_{entry_price:.0f}c<{cfg.short_min_price:.0f}c"
                 )
+
+        # ROC-contradiction veto. Only fires for NORMAL conviction (HIGH
+        # overrides). Threshold is negative; values <= threshold reject.
+        # Set threshold to 0.0 (or positive) to disable the gate entirely.
+        if (
+            decision.conviction == Conviction.NORMAL
+            and roc_value is not None
+            and cfg.short_block_negative_roc_threshold < 0.0
+            and roc_value <= cfg.short_block_negative_roc_threshold
+        ):
+            return False, (
+                f"EDGE_SHORT_NEGATIVE_ROC_{roc_value:.3f}"
+                f"<={cfg.short_block_negative_roc_threshold:.3f}"
+            )
 
     if cfg.block_low_conviction and decision.conviction == Conviction.LOW:
         return False, "EDGE_LOW_CONVICTION_BLOCKED"

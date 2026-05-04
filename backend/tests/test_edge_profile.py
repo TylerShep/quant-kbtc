@@ -506,6 +506,12 @@ def test_defaults_off_until_explicitly_enabled():
         "hours 03/05/06 alone produced +$28,513 of long PnL. Re-add "
         "specific hours only with fresh attribution evidence."
     )
+    assert cfg.short_block_negative_roc_threshold == -0.05, (
+        "Calibrated 2026-05-02 from 14-day paper window: NORMAL shorts "
+        "with raw 5-bar ROC <= -0.05 lost -$120/trade across 103 trades "
+        "(40% WR). All other ROC buckets were breakeven-to-profitable. "
+        "Threshold of 0.0 (or any non-negative value) disables the gate."
+    )
 
 
 def test_invalid_hour_strings_are_dropped():
@@ -515,3 +521,134 @@ def test_invalid_hour_strings_are_dropped():
         EdgeProfileConfig(), blocked_hours_utc="0,bogus,3,99,7,",
     )
     assert cfg.blocked_hours_set == {0, 3, 7}  # 99 out of range, 'bogus' not int
+
+
+# ─── short ROC-contradiction veto (2026-05-02 calibration) ───────────────
+def _short_normal_decision() -> "TradeDecision":
+    """A NORMAL-conviction short setup that satisfies the price/conviction
+    gate (so we isolate the ROC veto). Uses entry_price=80c which clears
+    the default short_min_price=40c floor."""
+    return _decision(
+        direction=Direction.SHORT,
+        conviction=Conviction.NORMAL,
+        obi_dir=Direction.SHORT,
+        roc_dir=Direction.NEUTRAL,
+    )
+
+
+def test_negative_roc_blocks_normal_short(override_edge):
+    """NORMAL short with raw ROC <= threshold (-0.05 default) is rejected."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="HIGH",
+                  short_block_negative_roc_threshold=-0.05)
+    decision = _short_normal_decision()
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=80.0,
+        roc_value=-0.10,
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is False
+    assert reason is not None
+    assert reason.startswith("EDGE_SHORT_NEGATIVE_ROC_")
+    assert "-0.100" in reason
+    assert "-0.050" in reason
+
+
+def test_negative_roc_does_not_block_high_conviction_short(override_edge):
+    """HIGH conviction shorts override the ROC veto. The veto exists for
+    NORMAL-conviction shorts where the resolver couldn't see a strong
+    contradiction; HIGH means OBI+ROC already agreed and the trade is
+    high-quality regardless of the raw 5-bar ROC value."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="LOW",
+                  short_block_negative_roc_threshold=-0.05)
+    decision = _decision(
+        direction=Direction.SHORT,
+        conviction=Conviction.HIGH,
+        obi_dir=Direction.SHORT,
+        roc_dir=Direction.SHORT,
+    )
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=50.0,
+        roc_value=-0.20,
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_negative_roc_just_above_threshold_passes(override_edge):
+    """ROC of -0.04 is above -0.05 threshold; trade is allowed."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="HIGH",
+                  short_block_negative_roc_threshold=-0.05)
+    decision = _short_normal_decision()
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=80.0,
+        roc_value=-0.04,
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_negative_roc_does_not_apply_to_long(override_edge):
+    """The veto is short-only. 14-day paper attribution showed longs are
+    profitable in every roc_5 bucket including roc < -0.10 (mean reversion
+    works in our favor when buying at a falling price). Mirror gate on
+    longs is explicitly NOT proposed."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="HIGH",
+                  short_block_negative_roc_threshold=-0.05,
+                  max_entry_price=100.0)  # disable price cap
+    decision = _decision(
+        direction=Direction.LONG,
+        conviction=Conviction.NORMAL,
+        obi_dir=Direction.LONG,
+        roc_dir=Direction.NEUTRAL,
+    )
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=20.0,
+        roc_value=-0.50,
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_negative_roc_disabled_when_threshold_zero(override_edge):
+    """A non-negative threshold disables the gate entirely. Catches the
+    operator who wants to turn the gate off without removing the env var."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="HIGH",
+                  short_block_negative_roc_threshold=0.0)
+    decision = _short_normal_decision()
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=80.0,
+        roc_value=-0.50,  # would trigger if gate were active
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is True
+    assert reason is None
+
+
+def test_negative_roc_passthrough_when_value_missing(override_edge):
+    """Backward compat: callers that don't pass roc_value (e.g. legacy
+    tests, partial wiring) get the old behavior — gate doesn't fire."""
+    override_edge(enabled=True, long_only=False, blocked_hours_utc="",
+                  block_low_conviction=False, short_min_price=0.0,
+                  short_min_conviction="HIGH",
+                  short_block_negative_roc_threshold=-0.05)
+    decision = _short_normal_decision()
+    allowed, reason = evaluate_edge_profile(
+        decision=decision, entry_price=80.0,
+        # roc_value omitted → defaults to None → gate skipped
+        now_utc=datetime(2026, 5, 2, 14, tzinfo=timezone.utc),
+    )
+    assert allowed is True
+    assert reason is None

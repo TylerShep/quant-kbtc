@@ -267,19 +267,23 @@ class TestNearExpirySkipCounter:
 class TestMarketOpenForEntry:
     """Backstop check inside position_manager.enter()."""
 
-    async def test_returns_true_when_kalshi_reports_open(self):
+    @pytest.mark.parametrize("status", ["open", "active", "Active", "OPEN"])
+    async def test_returns_true_for_tradeable_statuses(self, status):
+        """BUG-030: Kalshi returns ``"active"`` for most KXBTC contracts.
+        Both ``open`` and ``active`` (and any unknown future status) must
+        be accepted so we don't silently block entries."""
         pm = _make_pm()
         pm.client.get_market = AsyncMock(
-            return_value={"market": {"status": "open", "ticker": "KXBTC-T"}},
+            return_value={"market": {"status": status, "ticker": "KXBTC-T"}},
         )
         assert await pm._market_open_for_entry("KXBTC-T") is True
 
     @pytest.mark.parametrize("status", [
         "closed", "closing", "settled", "finalized",
-        "determined", "CLOSED", "Settled",
+        "determined", "halted", "CLOSED", "Settled",
     ])
-    async def test_returns_false_when_kalshi_reports_non_open(self, status):
-        """Both lower-case and mixed-case must be rejected -- Kalshi has
+    async def test_returns_false_for_terminal_statuses(self, status):
+        """Both lower-case and mixed-case must be rejected — Kalshi has
         used both spellings historically and the comparison is case-
         insensitive.
         """

@@ -79,17 +79,141 @@ class TestSettledTickersPersistence:
         assert pm._settled_tickers == set()
 
     def test_round_trip_snapshot_restore(self):
+        """Snapshot round-trips the *counter* (so a restart can't release
+        the supervised cap) but does NOT round-trip the *limit* — the
+        limit always comes from the live PositionManager constructor
+        (BotConfig.live_trade_limit) so operators can change the cap by
+        editing LIVE_TRADE_LIMIT and restarting, without wiping bot_state.
+        See position_manager.restore_from_snapshot for the rationale."""
         pm1 = _make_pm()
         pm1._settled_tickers = {"T1", "T2", "T3"}
         pm1._completed_live_trades = 3
-        pm1.live_trade_limit = 5
+        pm1.live_trade_limit = 5  # only affects the snapshot we serialize
         snap = pm1.get_snapshot()
 
+        # pm2 gets a fresh limit from its constructor (None by default
+        # in tests); the snapshot's "live_trade_limit" key is intentionally
+        # ignored on restore.
         pm2 = _make_pm()
         pm2.restore_from_snapshot(snap)
         assert pm2._settled_tickers == {"T1", "T2", "T3"}
         assert pm2._completed_live_trades == 3
-        assert pm2.live_trade_limit == 5
+        assert pm2.live_trade_limit is None, (
+            "Snapshot must NOT overwrite the constructor-set limit."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BUG-031: restore_from_snapshot reconciles state/position mismatch
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestRestoreReconcilesInconsistentState:
+    """BUG-031 (2026-05-03): the position-manager snapshot is written in
+    two stages (state flips, then position is set/cleared, then persist).
+    A crash or OOM kill between stage 2 and stage 3 — or an exit path
+    that flips position to None without re-persisting — leaves the DB
+    snapshot saying ``state="OPEN", position=null``. On restart the
+    bot rehydrates that mismatch and ``can_enter()`` returns False
+    forever. The live lane silently goes dark with no alarm because
+    the position-manager guard short-circuits before the edge_profile
+    filter ever fires (no signal_log rejections to count).
+
+    Observed in production 2026-05-02: live trade #1200 closed at
+    21:02:53 UTC, snapshot was persisted with state=OPEN/position=null,
+    bot was restarted by a deploy ~5h later, ran for ~17h with
+    ``can_enter: false`` and 0 EDGE skips in 24h.
+
+    The fix forces FLAT when state is non-FLAT but position is None
+    (the OPEN-without-position case) and clears the position when
+    state is FLAT but position is set (the inverse case).
+    """
+
+    def test_open_with_null_position_forced_flat(self):
+        """Exact production fingerprint."""
+        pm = _make_pm()
+        pm.restore_from_snapshot({
+            "state": "OPEN",
+            "position": None,
+            "orphaned_positions": [],
+            "completed_live_trades": 5,
+            "settled_tickers": [],
+        })
+        assert pm.state == PositionState.FLAT, (
+            "OPEN with no position must reconcile to FLAT or can_enter() "
+            "returns False forever and the live lane silently goes dark."
+        )
+        assert pm.position is None
+        assert pm._completed_live_trades == 5  # counter preserved
+
+    def test_entering_with_null_position_forced_flat(self):
+        """ENTERING (a transient mid-entry state) caught by the same
+        rule — anything non-FLAT with no position is an inconsistency."""
+        pm = _make_pm()
+        pm.restore_from_snapshot({
+            "state": "ENTERING",
+            "position": None,
+            "orphaned_positions": [],
+        })
+        assert pm.state == PositionState.FLAT
+        assert pm.position is None
+
+    def test_flat_with_position_forced_to_no_position(self):
+        """The inverse mismatch: state says FLAT but a position dict is
+        present. Trust the state field over the phantom position
+        (FLAT is the safe default; trading proceeds without a phantom
+        ManagedPosition that doesn't reflect actual exchange state)."""
+        pm = _make_pm()
+        pm.restore_from_snapshot({
+            "state": "FLAT",
+            "position": {
+                "ticker": "KXBTC-PHANTOM",
+                "direction": "long",
+                "contracts": 5,
+                "entry_price": 25.0,
+                "entry_time": "2026-05-03T00:00:00+00:00",
+                "conviction": "NORMAL",
+                "regime_at_entry": "MEDIUM",
+            },
+            "orphaned_positions": [],
+        })
+        assert pm.state == PositionState.FLAT
+        assert pm.position is None, (
+            "FLAT state with a populated position dict is an inconsistency; "
+            "the phantom must be dropped to keep state and position in sync."
+        )
+
+    def test_consistent_open_with_position_left_alone(self):
+        """The reconciliation must NOT fire when state and position
+        agree — happy-path restore must work unchanged."""
+        pm = _make_pm()
+        pm.restore_from_snapshot({
+            "state": "OPEN",
+            "position": {
+                "ticker": "KXBTC-LIVE",
+                "direction": "short",
+                "contracts": 3,
+                "entry_price": 65.0,
+                "entry_time": "2026-05-03T00:00:00+00:00",
+                "conviction": "HIGH",
+                "regime_at_entry": "MEDIUM",
+            },
+            "orphaned_positions": [],
+        })
+        assert pm.state == PositionState.OPEN
+        assert pm.position is not None
+        assert pm.position.ticker == "KXBTC-LIVE"
+
+    def test_consistent_flat_with_no_position_left_alone(self):
+        """Mirror happy-path: clean FLAT restore is untouched."""
+        pm = _make_pm()
+        pm.restore_from_snapshot({
+            "state": "FLAT",
+            "position": None,
+            "orphaned_positions": [],
+        })
+        assert pm.state == PositionState.FLAT
+        assert pm.position is None
 
 
 # ══════════════════════════════════════════════════════════════════════

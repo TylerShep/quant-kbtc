@@ -133,6 +133,8 @@ class PositionManager:
         self,
         client: KalshiOrderClient,
         fill_stream: Optional[FillStream] = None,
+        *,
+        live_trade_limit: Optional[int] = None,
     ):
         self.client = client
         # BUG-025: optional authoritative source for per-execution fill
@@ -145,11 +147,14 @@ class PositionManager:
         self.orphaned_positions: list[OrphanedPosition] = []
         self._db_pool = None
 
-        # Supervised live-trade mode: after `live_trade_limit` completed round-
-        # trips, the coordinator auto-pauses for post-trade review. Set to None
-        # for unlimited (normal operation once testing is complete). Restored
-        # from persisted state if present.
-        self.live_trade_limit: Optional[int] = None
+        # Supervised live-trade cap. After this many completed live round-
+        # trips, ``can_enter`` returns False until ``reset_trade_counter`` is
+        # called. None = unlimited. Sourced from ``BotConfig.live_trade_limit``
+        # by the production callsite (LiveTrader); tests pass it explicitly.
+        # The COUNTER (``_completed_live_trades``) is restored from snapshot;
+        # the LIMIT is always taken from the constructor / env so changing
+        # ``LIVE_TRADE_LIMIT`` is a simple env edit + restart, no DB wipe.
+        self.live_trade_limit: Optional[int] = live_trade_limit
         self._completed_live_trades: int = 0
 
         # Tracks tickers confirmed as settled/finalized to prevent
@@ -560,23 +565,32 @@ class PositionManager:
             return False
         return True
 
-    async def _market_open_for_entry(self, ticker: str) -> bool:
-        """BUG-028: confirm Kalshi reports the market as ``open`` right
-        before placing an entry order.
+    # Terminal statuses where Kalshi will not accept new orders.
+    # Anything NOT in this set is treated as tradeable.
+    #
+    # BUG-030: the original code used an allowlist (``status != "open"``)
+    # but Kalshi's API returns ``"active"`` for most tradeable KXBTC
+    # contracts, which silently blocked every live entry since 2026-04-27.
+    # Using a blocklist is safer: if Kalshi adds a new tradeable status
+    # tomorrow, we'll accept it by default instead of silently halting.
+    _TERMINAL_STATUSES = frozenset({
+        "closed", "closing", "settled", "finalized", "determined", "halted",
+    })
 
-        Returns True if the market is confirmed open. Returns True (fail-
-        open) if the recheck call itself errors -- the coordinator's
-        time-to-expiry guard is the primary defense and we don't want a
-        transient REST blip to convert into a missed signal. Returns
-        False only when Kalshi explicitly reports a non-open status
-        (``closing``, ``closed``, ``settled``, ``finalized``,
-        ``determined``).
+    async def _market_open_for_entry(self, ticker: str) -> bool:
+        """BUG-028/BUG-030: confirm Kalshi reports the market as tradeable
+        right before placing an entry order.
+
+        Returns True if the market is NOT in a terminal status. Returns
+        True (fail-open) if the recheck call itself errors — the
+        coordinator's time-to-expiry guard is the primary defense and we
+        don't want a transient REST blip to block a valid signal.
         """
         try:
             data = await self.client.get_market(ticker)
             market = data.get("market", data)
             status = (market.get("status") or "").lower()
-            if status and status != "open":
+            if status in self._TERMINAL_STATUSES:
                 logger.info(
                     "position_manager.market_not_open_pre_entry",
                     ticker=ticker, status=status,
@@ -1765,6 +1779,33 @@ class PositionManager:
             filtered = {k: v for k, v in pos_data.items() if k in allowed}
             self.position = ManagedPosition(**filtered)
         else:
+            self.position = None
+
+        # BUG-031 (2026-05-03): a snapshot can land here with state="OPEN"
+        # AND position=null when an exit happened but the post-exit save
+        # was lost (OOM-kill / crash between flipping `self.position = None`
+        # and `_persist_state()`). Without this reconciliation, restore
+        # leaves the manager stuck in "OPEN with no position" -- can_enter()
+        # returns False forever, the live lane silently goes dark, and no
+        # alarm fires (signal_log shows no rejections because we never get
+        # past the position-manager guard). Force back to FLAT and log so
+        # the operator can audit. Inverse case (state=FLAT but position
+        # present) is handled below by trusting the state field over the
+        # phantom position.
+        if self.state != PositionState.FLAT and self.position is None:
+            logger.warning(
+                "position_manager.restore_inconsistent_state_no_position",
+                stale_state=self.state.value,
+                forced_to="FLAT",
+            )
+            self.state = PositionState.FLAT
+        elif self.state == PositionState.FLAT and self.position is not None:
+            logger.warning(
+                "position_manager.restore_inconsistent_flat_with_position",
+                ticker=self.position.ticker,
+                contracts=self.position.contracts,
+                forced_position_to="None",
+            )
             self.position = None
 
         self.orphaned_positions = []

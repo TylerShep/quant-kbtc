@@ -62,3 +62,34 @@ def test_cannot_enter_when_already_in_position():
     assert first is not None
     assert second is None
     assert trader.position.ticker == "T"
+
+
+def test_paper_trade_preserves_entry_obi_and_roc_bug030():
+    """BUG-030 regression: PaperTrade was missing entry_obi/entry_roc
+    fields entirely, so coordinator's getattr(trade, "entry_obi", 0.0)
+    always wrote 0 to the trades table. The 14-day paper window had
+    532 trades with all-zeros in both columns, breaking attribution
+    that joined on trades for these features (e.g. the new
+    edge_profile_review's ROC bucketing). trade_features.roc_5 stays
+    the source of truth for ML; this test pins that the trades table
+    row also carries the entry-time signal values."""
+    sizer = PositionSizer(50_000.0)
+    trader = PaperTrader(sizer)
+    pos = trader.enter(
+        ticker="KXBTC-TEST", direction="short", price=50.0,
+        conviction="NORMAL", regime="LOW", obi=0.42, roc=-0.073,
+    )
+    assert pos is not None
+    assert pos.entry_obi == 0.42
+    assert pos.entry_roc == -0.073
+
+    trade = trader.exit(60.0, reason="TEST")
+    assert trade is not None
+    assert trade.entry_obi == 0.42, (
+        "PaperTrade.entry_obi must equal PaperPosition.entry_obi or the "
+        "trades.entry_obi column will silently store zero (BUG-030)."
+    )
+    assert trade.entry_roc == -0.073, (
+        "PaperTrade.entry_roc must equal PaperPosition.entry_roc or the "
+        "trades.entry_roc column will silently store zero (BUG-030)."
+    )

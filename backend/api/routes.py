@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from api.auth import require_api_token
 from database import get_pool
+from database.connection import pool_stats as db_pool_stats
 
 
 class _TTLCache:
@@ -68,6 +69,7 @@ async def health():
 async def diagnostics():
     """System health diagnostics for debugging live data issues."""
     from main import coordinator
+    from monitoring.live_health import fetch_edge_profile_health
 
     dm = coordinator.data_manager
     now = time.time()
@@ -97,6 +99,13 @@ async def diagnostics():
     state = dm.states.get("BTC")
     book_healthy = coordinator._is_book_healthy(state) if state else False
 
+    edge_health: dict[str, Any] = {}
+    try:
+        pool = await get_pool()
+        edge_health = await fetch_edge_profile_health(pool)
+    except Exception:
+        edge_health = {"error": "unavailable"}
+
     return {
         "tick_count": coordinator._tick_count,
         "kalshi_ws": kalshi_info,
@@ -112,12 +121,20 @@ async def diagnostics():
         "book_healthy": book_healthy,
         "dashboard_ws_clients": len(dm._listeners),
         "near_expiry_skips": dict(coordinator._near_expiry_skip_count),
+        "edge_profile_health": edge_health,
+        "db_pool": db_pool_stats(),
+        "bg_persist": {
+            "queued": len(coordinator._bg_persist_tasks),
+            "max": coordinator._bg_persist_max,
+            "dropped_total": coordinator._bg_persist_dropped,
+        },
     }
 
 
 @router.get("/status")
 async def status():
     from main import coordinator
+    from monitoring.live_health import fetch_edge_profile_health
 
     states = {}
     for symbol, state in coordinator.data_manager.states.items():
@@ -169,6 +186,13 @@ async def status():
             "connect_attempts": fs.connect_attempts,
         }
 
+    edge_health: dict[str, Any] = {}
+    try:
+        pool = await get_pool()
+        edge_health = await fetch_edge_profile_health(pool)
+    except Exception:
+        edge_health = {"error": "unavailable"}
+
     return {
         "market_states": states,
         "atr": coordinator.atr_filter.get_state(),
@@ -186,6 +210,8 @@ async def status():
         "paper_risk": coordinator.paper_breaker.get_state(),
         "live_risk": coordinator.live_breaker.get_state(),
         "fill_stream": fill_stream_status,
+        "edge_profile_health": edge_health,
+        "db_pool": db_pool_stats(),
     }
 
 

@@ -122,25 +122,73 @@ class DiscordNotifier:
     # ── Transport ──────────────────────────────────────────────────────────────
 
     async def _post(self, url: str, embed: dict) -> None:
+        """POST a single embed to Discord with retries.
+
+        Retry policy:
+          * 200/204: success, return immediately.
+          * 429 (rate-limited): sleep ``Retry-After`` seconds (capped at 60),
+            then retry. Counts against the attempt budget.
+          * 5xx (Discord-side outage / CDN failure): exponential backoff
+            (0.5s, 1s, 2s, 4s, 8s, capped at 30s) then retry. We were
+            previously dropping these silently after one attempt, which
+            caused missing trade_closed notifications during Discord
+            incidents (BUG-029).
+          * 4xx other than 429 (bad payload, bad webhook URL): log and
+            give up — retrying won't help.
+          * Network exceptions: exponential backoff then retry, same as 5xx.
+
+        Total attempt budget: ``MAX_ATTEMPTS`` across all failure modes.
+        """
         if not url:
             return
         payload = {"embeds": [_sanitize_embed(embed)]}
+        MAX_ATTEMPTS = 8
         async with self._post_lock:
+            backoff = 0.5
             try:
                 async with httpx.AsyncClient(timeout=12.0) as client:
-                    for _ in range(8):
-                        resp = await client.post(url, json=payload)
+                    for attempt in range(1, MAX_ATTEMPTS + 1):
+                        try:
+                            resp = await client.post(url, json=payload)
+                        except (httpx.HTTPError, httpx.TransportError) as e:
+                            if attempt >= MAX_ATTEMPTS:
+                                logger.warning(
+                                    "discord.post_error",
+                                    error=str(e), attempts=attempt, url=url[:60],
+                                )
+                                return
+                            await asyncio.sleep(min(backoff, 30.0))
+                            backoff *= 2
+                            continue
+
                         if resp.status_code in (200, 204):
                             return
                         if resp.status_code == 429:
                             wait = _retry_after(resp) + 0.05
                             await asyncio.sleep(min(max(wait, 0.05), 60.0))
                             continue
-                        logger.warning("discord.post_failed", status=resp.status_code, body=resp.text[:300])
+                        if 500 <= resp.status_code < 600:
+                            if attempt >= MAX_ATTEMPTS:
+                                logger.warning(
+                                    "discord.post_failed_after_retries",
+                                    status=resp.status_code,
+                                    body=resp.text[:300],
+                                    attempts=attempt,
+                                    url=url[:60],
+                                )
+                                return
+                            await asyncio.sleep(min(backoff, 30.0))
+                            backoff *= 2
+                            continue
+                        logger.warning(
+                            "discord.post_failed",
+                            status=resp.status_code, body=resp.text[:300],
+                            url=url[:60],
+                        )
                         return
-                    logger.warning("discord.rate_limited", url=url[:60])
+                    logger.warning("discord.exhausted_retries", url=url[:60])
             except Exception as e:
-                logger.warning("discord.post_error", error=str(e))
+                logger.warning("discord.post_error", error=str(e), url=url[:60])
 
     def _footer(self) -> dict:
         return {"text": f"KBTC Bot \u00b7 {_ts()}"}
@@ -280,6 +328,146 @@ class DiscordNotifier:
             "description": desc,
             "color": color,
             "fields": fields,
+            "footer": self._footer(),
+        }
+        await self._post(self._risk_url, embed)
+
+    async def live_drought_alarm(
+        self,
+        last_live_age_str: str,
+        paper_trades_36h: int,
+        threshold_hours: int,
+    ) -> None:
+        """Live lane has gone too long without a trade despite paper firing.
+
+        Catches the failure mode where edge_profile (or any other live-only
+        filter) silently rejects everything and the operator doesn't notice.
+        """
+        embed = {
+            "title": "\u26a0\ufe0f Live Trading Drought",
+            "description": (
+                f"Live lane has been dark for **{last_live_age_str}** while "
+                f"paper has executed **{paper_trades_36h}** trades in the same "
+                "36h window. The edge_profile filter or another live-only gate "
+                "may be over-blocking. Investigate via the dashboard or run "
+                "`scripts/edge_profile_review.py --print-only`."
+            ),
+            "color": COLOR_ORANGE,
+            "fields": [
+                {"name": "Last Live Trade", "value": last_live_age_str, "inline": True},
+                {"name": "Paper Trades 36h", "value": str(paper_trades_36h), "inline": True},
+                {"name": "Threshold", "value": f">{threshold_hours}h", "inline": True},
+            ],
+            "footer": self._footer(),
+        }
+        await self._post(self._risk_url, embed)
+
+    async def edge_skip_ratio_alarm(
+        self,
+        ratio: float,
+        consecutive: int,
+        top_reasons: list,
+    ) -> None:
+        """edge_profile has been rejecting >95% of would-be entries for
+        consecutive 24h windows. Strong signal of calibration drift."""
+        reasons_str = "\n".join(
+            f"- `{r}`: {n}" for r, n in top_reasons[:5]
+        ) or "(none)"
+        embed = {
+            "title": "\u26a0\ufe0f EDGE Skip Ratio Elevated",
+            "description": (
+                f"**{ratio:.1%}** of signal_log rows in the last 24h were "
+                f"rejected by an EDGE_* filter, for **{consecutive}** "
+                "consecutive checks. Likely calibration drift; review the "
+                "weekly edge_profile report."
+            ),
+            "color": COLOR_ORANGE,
+            "fields": [
+                {"name": "24h EDGE Ratio", "value": f"{ratio:.1%}", "inline": True},
+                {"name": "Consecutive Breaches", "value": str(consecutive), "inline": True},
+                {"name": "Top Skip Reasons", "value": reasons_str, "inline": False},
+            ],
+            "footer": self._footer(),
+        }
+        await self._post(self._risk_url, embed)
+
+    async def direction_imbalance_alarm(
+        self,
+        short_rejected: int,
+        long_rejected: int,
+        live_short_count_7d: int,
+    ) -> None:
+        """Short rejections vastly outweigh long rejections AND no live
+        shorts have happened in 7d. The short-side filter may be calibrated
+        for a market regime that no longer applies."""
+        ratio_str = (
+            f"{short_rejected / long_rejected:.1f}x"
+            if long_rejected > 0 else "inf"
+        )
+        embed = {
+            "title": "\u26a0\ufe0f Direction Skip Imbalance",
+            "description": (
+                f"Short-side EDGE rejections (**{short_rejected}**) are "
+                f"**{ratio_str}** the long-side rejections "
+                f"(**{long_rejected}**) over the past 7 days, and "
+                f"**{live_short_count_7d}** live shorts have actually "
+                "traded. The short-side filter may be mis-calibrated for "
+                "the current regime."
+            ),
+            "color": COLOR_ORANGE,
+            "fields": [
+                {"name": "Short Rejected (7d)", "value": str(short_rejected), "inline": True},
+                {"name": "Long Rejected (7d)", "value": str(long_rejected), "inline": True},
+                {"name": "Imbalance", "value": ratio_str, "inline": True},
+                {"name": "Live Shorts (7d)", "value": str(live_short_count_7d), "inline": True},
+            ],
+            "footer": self._footer(),
+        }
+        await self._post(self._risk_url, embed)
+
+    async def edge_profile_auto_applied(
+        self,
+        changes: list,
+        backup_path: str,
+        restart_status: str,
+    ) -> None:
+        """Phase 2.5 auto-apply state-change announcement.
+
+        Posts to the RISK channel because this is a state mutation, not an
+        attribution report. Includes the rollback template so the operator
+        can revert without hunting for the backup path.
+
+        ``changes`` is a list of dicts with keys: param, old, new, sed_cmd.
+        ``restart_status`` is one of: 'restarted', 'deferred_position_open',
+        'failed', 'skipped'.
+        """
+        change_lines = "\n".join(
+            f"`{c['param']}`: `{c['old']}` \u2192 `{c['new']}`"
+            for c in changes
+        ) or "(none)"
+        sed_lines = "\n".join(c["sed_cmd"] for c in changes) or "(none)"
+        rollback_cmd = f"cp {backup_path} ~/kbtc/.env"
+        restart_label = {
+            "restarted": "Restarted",
+            "deferred_position_open": "Restart deferred (live position open)",
+            "failed": "Restart FAILED",
+            "skipped": "Skipped (--no-restart)",
+        }.get(restart_status, restart_status)
+        color = COLOR_RED if restart_status == "failed" else COLOR_BLUE
+        embed = {
+            "title": f"\U0001f527 edge_profile auto-applied {len(changes)} change(s)",
+            "description": (
+                "Tier 1 (tightening-only) recommendations from the weekly "
+                "review have been applied to the live env. Rollback command "
+                "below if any look wrong."
+            ),
+            "color": color,
+            "fields": [
+                {"name": "Changes", "value": change_lines, "inline": False},
+                {"name": "sed Commands", "value": f"```{sed_lines[:900]}```", "inline": False},
+                {"name": "Restart", "value": restart_label, "inline": True},
+                {"name": "Rollback", "value": f"```{rollback_cmd}```", "inline": False},
+            ],
             "footer": self._footer(),
         }
         await self._post(self._risk_url, embed)

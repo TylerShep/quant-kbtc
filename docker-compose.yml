@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
-    command: postgres -c shared_buffers=256MB -c work_mem=8MB -c effective_cache_size=512MB
+    command: postgres -c shared_buffers=256MB -c work_mem=8MB -c effective_cache_size=512MB -c max_connections=100
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kalshi} -d ${POSTGRES_DB:-kbtc}"]
       interval: 5s
@@ -39,7 +39,7 @@ services:
     volumes:
       - ./backend:/app
       - kbtc-data:/mnt/data
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --loop uvloop
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --loop uvloop --workers 1 --no-access-log --timeout-graceful-shutdown 30
     logging:
       driver: "json-file"
       options:

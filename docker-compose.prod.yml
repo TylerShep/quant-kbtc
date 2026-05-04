@@ -5,12 +5,18 @@ services:
     environment:
       BOT_ENV: production
       LOG_LEVEL: INFO
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --loop uvloop --workers 1
-    mem_limit: 1536m
-    memswap_limit: 2g
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --loop uvloop --workers 1 --no-access-log --timeout-graceful-shutdown 30
+    # 2026-05-01: bot was OOM-killed every ~2 min at 1536m due to backlogged
+    # create_task() coroutines holding state references during DB pressure.
+    # Bumped to 1800m (with 512m for db on 2 GB host = ~2.3 GB committed,
+    # acceptable with swap). Pair with the snapshot throttle in coordinator.py.
+    mem_limit: 1800m
+    memswap_limit: 2400m
     cpus: 1.5
 
   db:
     restart: always
-    mem_limit: 768m
-    memswap_limit: 1g
+    # Postgres steady-state observed at ~100 MiB; 512m is plenty for our
+    # write rate and frees ~256 MiB for the bot.
+    mem_limit: 512m
+    memswap_limit: 768m

@@ -5,7 +5,11 @@ Entry point: FastAPI app with lifespan managing all subsystems.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import sys
 import time
+import traceback
 from contextlib import asynccontextmanager
 
 import structlog
@@ -151,16 +155,87 @@ async def _periodic_summary_loop(notifier):
         await asyncio.sleep(300)
 
 
+_shutdown_reason: str = "unknown"
+
+
+def _record_shutdown_reason(reason: str) -> None:
+    """Record why we're shutting down so the lifespan exit can log it.
+
+    Called from the OS signal handler and from the global asyncio exception
+    handler. Idempotent — first writer wins so a SIGTERM that arrives during
+    an unhandled exception still surfaces the original error.
+    """
+    global _shutdown_reason
+    if _shutdown_reason == "unknown":
+        _shutdown_reason = reason
+        try:
+            logger.warning("kbtc.shutdown_reason_recorded", reason=reason)
+        except Exception:
+            pass
+
+
+def _install_signal_handlers() -> None:
+    """Attach SIGTERM/SIGINT handlers so we know if Docker killed us.
+
+    Uvicorn already installs its own handlers that call ``app.shutdown``;
+    ours run first and just record the reason. We do not call ``sys.exit``
+    here — uvicorn's handler will run next and trigger the lifespan exit
+    cleanly, which is when ``coordinator.stop`` runs.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        for sig_name, sig in (("SIGTERM", signal.SIGTERM), ("SIGINT", signal.SIGINT)):
+            try:
+                loop.add_signal_handler(
+                    sig,
+                    lambda s=sig_name: _record_shutdown_reason(f"signal_{s}"),
+                )
+            except (NotImplementedError, RuntimeError):
+                signal.signal(sig, lambda *_args, s=sig_name: _record_shutdown_reason(f"signal_{s}"))
+    except Exception as e:
+        logger.warning("kbtc.signal_handler_install_failed", error=str(e))
+
+
+def _install_loop_exception_handler() -> None:
+    """Catch un-awaited task exceptions so they don't vanish into the void.
+
+    Without this, ``asyncio.create_task(coro)`` exceptions surface only as
+    ``Task was destroyed but it is pending`` warnings on stderr. With it,
+    we get a structured log + a recorded shutdown reason that the lifespan
+    teardown can surface to Discord.
+    """
+    def _handler(loop, context):
+        msg = context.get("message") or "asyncio_exception"
+        exc = context.get("exception")
+        if exc is not None:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            logger.error(
+                "kbtc.unhandled_async_exception",
+                message=msg, error=str(exc), traceback=tb[:2000],
+            )
+            _record_shutdown_reason(f"async_exc:{type(exc).__name__}")
+        else:
+            logger.error("kbtc.async_loop_error", message=msg, context=str(context)[:500])
+    try:
+        asyncio.get_event_loop().set_exception_handler(_handler)
+    except Exception as e:
+        logger.warning("kbtc.exception_handler_install_failed", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _start_time, _heartbeat_task, _summary_task
     _start_time = time.monotonic()
+
+    _install_signal_handlers()
+    _install_loop_exception_handler()
 
     logger.info(
         "kbtc.starting",
         env=settings.bot.env,
         market=settings.bot.market,
         mode=settings.bot.trading_mode,
+        pid=os.getpid(),
     )
 
     notifier = init_notifier()
@@ -185,25 +260,49 @@ async def lifespan(app: FastAPI):
     _heartbeat_task = asyncio.create_task(_heartbeat_loop(notifier))
     _summary_task = asyncio.create_task(_periodic_summary_loop(notifier))
 
-    yield
+    startup_exc: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        startup_exc = exc
+        _record_shutdown_reason(f"lifespan_exc:{type(exc).__name__}")
+        logger.error(
+            "kbtc.lifespan_exception",
+            error=str(exc),
+            traceback="".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[:2000],
+        )
 
-    logger.info("kbtc.shutting_down")
+    uptime = _format_uptime(time.monotonic() - _start_time)
+    logger.warning(
+        "kbtc.shutting_down",
+        reason=_shutdown_reason,
+        uptime=uptime,
+        pid=os.getpid(),
+    )
 
     if _heartbeat_task:
         _heartbeat_task.cancel()
     if _summary_task:
         _summary_task.cancel()
 
-    uptime = _format_uptime(time.monotonic() - _start_time)
     final_bankroll = (
         coordinator.live_sizer.bankroll if coordinator.live_enabled
         else coordinator.paper_sizer.bankroll
     )
-    await notifier.bot_stopped(
-        uptime_str=uptime,
-        bankroll=final_bankroll,
-    )
-    await coordinator.stop()
+    try:
+        await notifier.bot_stopped(
+            uptime_str=uptime,
+            bankroll=final_bankroll,
+        )
+    except Exception as e:
+        logger.warning("kbtc.bot_stopped_notify_failed", error=str(e))
+    try:
+        await coordinator.stop()
+    except Exception as e:
+        logger.error("kbtc.coordinator_stop_failed", error=str(e))
+
+    if startup_exc is not None:
+        raise startup_exc
 
 
 app = FastAPI(

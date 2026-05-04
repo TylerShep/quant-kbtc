@@ -69,6 +69,12 @@ class DatabaseConfig:
             "postgresql://kalshi:kalshi_secret@localhost:5432/kbtc",
         )
     )
+    pool_min_size: int = field(default_factory=lambda: _env_int("DB_POOL_MIN_SIZE", 5))
+    pool_max_size: int = field(default_factory=lambda: _env_int("DB_POOL_MAX_SIZE", 20))
+    pool_timeout_sec: float = field(default_factory=lambda: _env_float("DB_POOL_TIMEOUT_SEC", 10.0))
+    pool_max_idle_sec: float = field(default_factory=lambda: _env_float("DB_POOL_MAX_IDLE_SEC", 600.0))
+    pool_max_lifetime_sec: float = field(default_factory=lambda: _env_float("DB_POOL_MAX_LIFETIME_SEC", 3600.0))
+    write_gate_size: int = field(default_factory=lambda: _env_int("DB_WRITE_GATE_SIZE", 8))
 
     @property
     def async_url(self) -> str:
@@ -191,6 +197,24 @@ class BotConfig:
     roc_low_conviction_live_enabled: bool = field(
         default_factory=lambda: _env_bool("ROC_LOW_CONVICTION_LIVE_ENABLED", False)
     )
+    # Supervised live-trade cap. After this many completed live round-trips,
+    # PositionManager.can_enter returns False until the operator calls the
+    # reset endpoint (or the counter is bumped down manually). 0 = unlimited.
+    # Default 5 keeps live trading on a short leash while we are still
+    # validating the post-OOM stability and the market-status fix.
+    live_trade_limit: int = field(
+        default_factory=lambda: _env_int("LIVE_TRADE_LIMIT", 5)
+    )
+    # Supervised auto-pause: when True, the coordinator flips
+    # ``trading_paused = "paused"`` after every live exit so the operator
+    # must manually unpause via /api/trading-pause before the next live
+    # entry can fire. When False, live trading runs continuously and the
+    # operator pauses manually via the dashboard. Default False — the
+    # ``live_trade_limit`` cap is the primary safety rail; an additional
+    # per-trade pause is only useful during very early validation.
+    supervised_auto_pause: bool = field(
+        default_factory=lambda: _env_bool("SUPERVISED_AUTO_PAUSE", False)
+    )
 
     # BUG-028 expiry-race guard. Refuse to evaluate or place an entry when
     # the active contract is within this many seconds of close. Also treats
@@ -288,6 +312,21 @@ class EdgeProfileConfig:
     # conviction >= short_min_conviction. Either gate alone is sufficient.
     short_min_price: float = field(default_factory=lambda: _env_float("EDGE_LIVE_SHORT_MIN_PRICE", 40.0))
     short_min_conviction: str = field(default_factory=lambda: _env("EDGE_LIVE_SHORT_MIN_CONVICTION", "HIGH"))
+    # ROC-contradiction veto for NORMAL-conviction shorts.
+    # 14-day paper attribution (2026-04-19 → 2026-05-02, 189 NORMAL shorts post-ML)
+    # showed a single clean disaster cohort: shorts with raw 5-bar ROC <= -0.05
+    # (price already falling sharply) lost -$120/trade across 103 trades at 40%
+    # WR. Every other ROC bucket was breakeven-to-profitable. Pattern is mean
+    # reversion: short OBI on top of an extended down-move gets steamrolled by
+    # the snap-back. Counterfactual application would have lifted 14-day paper
+    # short PnL from -$10,613 to +$244. Long-side mirror cohort is profitable
+    # in every roc_5 bucket so the gate is short-only.
+    #
+    # Filter is short-only and gated on conviction == NORMAL (HIGH-conviction
+    # shorts override). Set to 0.0 (or any non-negative value) to disable.
+    short_block_negative_roc_threshold: float = field(
+        default_factory=lambda: _env_float(
+            "EDGE_LIVE_SHORT_BLOCK_NEGATIVE_ROC_THRESHOLD", -0.05))
     block_low_conviction: bool = field(default_factory=lambda: _env_bool("EDGE_LIVE_BLOCK_LOW_CONVICTION", True))
     max_entry_price: float = field(default_factory=lambda: _env_float("EDGE_LIVE_MAX_ENTRY_PRICE", 25.0))
     agreement_overrides_price_cap: bool = field(
@@ -306,6 +345,16 @@ class EdgeProfileConfig:
     # were among the strongest long-PnL hours of the day. See class docstring.
     blocked_hours_utc: str = field(
         default_factory=lambda: _env("EDGE_LIVE_BLOCKED_HOURS_UTC", "")
+    )
+    # Phase 2.5 master kill switch. Default OFF; the operator opts in
+    # after observing 3+ weekly review cycles and confirming the
+    # AUTO_APPLY recommendations match what they would have done by
+    # hand. The bot itself does NOT read this — scripts/edge_profile_apply.py
+    # reads the env file directly. Defining it here ensures it shows up
+    # in /api/diagnostics' edge_profile_health block so the dashboard
+    # can render the kill-switch state.
+    auto_apply_enabled: bool = field(
+        default_factory=lambda: _env_bool("EDGE_LIVE_AUTO_APPLY_ENABLED", False)
     )
 
     @property
