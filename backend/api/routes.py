@@ -48,6 +48,13 @@ _ATTR_TTL = 30.0
 MECHANICAL_EXIT_REASONS = ("ORPHAN_SETTLED", "TICKER_ROLLED", "RETRY")
 _MECHANICAL_FILTER = "AND exit_reason NOT IN ('ORPHAN_SETTLED', 'TICKER_ROLLED', 'RETRY')"
 
+# Exclude rows tagged by scripts/backfill_data_quality_flags.py from
+# aggregations so cumulative stats / attribution / daily / by-regime
+# panels reflect real strategy outcomes only. The /api/trades inspection
+# view intentionally does NOT apply this filter -- operators need to see
+# every row, including flagged ones, when investigating individual trades.
+_DATA_QUALITY_FILTER = "AND data_quality_flag IS NULL"
+
 
 class TradingModeRequest(BaseModel):
     mode: str
@@ -816,7 +823,7 @@ async def stats(mode: str = Query(None)):
                  COALESCE(MIN(pnl), 0) as worst_trade,
                  COALESCE(AVG(pnl), 0) as avg_pnl
                FROM trades
-               WHERE trading_mode = %s {_MECHANICAL_FILTER}""",
+               WHERE trading_mode = %s {_MECHANICAL_FILTER} {_DATA_QUALITY_FILTER}""",
             (active_mode,),
         )
         r = await row.fetchone()
@@ -868,11 +875,11 @@ async def attribution(mode: str = Query(None)):
     pool = await get_pool()
     async with pool.connection() as conn:
         rows = await conn.execute(
-            """SELECT timestamp, ticker, direction, contracts, entry_price,
+            f"""SELECT timestamp, ticker, direction, contracts, entry_price,
                       exit_price, pnl, pnl_pct, fees, exit_reason, conviction,
                       regime_at_entry, candles_held, closed_at
                FROM trades
-               WHERE trading_mode = %s
+               WHERE trading_mode = %s {_DATA_QUALITY_FILTER}
                ORDER BY timestamp ASC""",
             (active_mode,),
         )
@@ -997,7 +1004,7 @@ async def stats_daily(mode: str = Query(None)):
                       COUNT(*) FILTER (WHERE pnl >= 0) as wins,
                       COUNT(*) FILTER (WHERE pnl < 0) as losses
                FROM trades
-               WHERE trading_mode = %s {_MECHANICAL_FILTER}
+               WHERE trading_mode = %s {_MECHANICAL_FILTER} {_DATA_QUALITY_FILTER}
                GROUP BY DATE(timestamp)
                ORDER BY day ASC""",
             (active_mode,),
@@ -1040,7 +1047,7 @@ async def stats_by_regime(mode: str = Query(None)):
                       COALESCE(SUM(pnl), 0) as pnl,
                       COUNT(*) FILTER (WHERE pnl >= 0) as wins
                FROM trades
-               WHERE trading_mode = %s {_MECHANICAL_FILTER}
+               WHERE trading_mode = %s {_MECHANICAL_FILTER} {_DATA_QUALITY_FILTER}
                GROUP BY regime_at_entry
                ORDER BY trades DESC""",
             (active_mode,),

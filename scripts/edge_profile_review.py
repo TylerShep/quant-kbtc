@@ -187,6 +187,12 @@ def load_trades_with_features(db_url: str, window_days: int, mode: str):
     by trade_id. We left-join so trades whose features were not captured
     (older trades, capture-failure rows) still appear with feature columns
     as None. The ML re-scoring step skips rows that lack features.
+
+    Rows tagged with a ``data_quality_flag`` are excluded so the
+    attribution math is computed on real strategy outcomes only.
+    Without this, pre-fix artifact rows (CATASTROPHIC_SHORT,
+    CORRUPTED_PNL, EXIT_REASON_RECLASSED, PRE_BUG027_WALLET) skew
+    per-gate protecting/leaking PnL and bias the recommendations.
     """
     from sqlalchemy import create_engine, text
     engine = create_engine(_normalize_db_url(db_url))
@@ -212,6 +218,7 @@ def load_trades_with_features(db_url: str, window_days: int, mode: str):
         WHERE t.timestamp > NOW() - (:days || ' days')::interval
           AND t.trading_mode = :mode
           AND t.pnl IS NOT NULL
+          AND t.data_quality_flag IS NULL
         ORDER BY t.timestamp ASC
     """)
     with engine.connect() as conn:
