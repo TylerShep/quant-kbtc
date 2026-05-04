@@ -65,6 +65,69 @@ async def health():
     return {"status": "ok"}
 
 
+@router.get("/_debug/memory")
+async def debug_memory():
+    """2026-05-04: per-process memory + asyncio task census for the
+    OOM-restart investigation. Cheap enough to leave in production —
+    GC stats are O(1), task list is short.
+    """
+    import asyncio
+    import gc
+    import resource
+    import sys
+
+    rusage = resource.getrusage(resource.RUSAGE_SELF)
+
+    try:
+        with open("/proc/1/status") as f:
+            status_lines = f.read().splitlines()
+        proc_status = {
+            line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
+            for line in status_lines
+            if line.startswith(("VmRSS", "VmSize", "VmPeak", "RssAnon",
+                                "RssFile", "VmData", "VmStk", "Threads"))
+        }
+    except Exception:
+        proc_status = {}
+
+    try:
+        tasks = asyncio.all_tasks()
+        task_summary: dict[str, int] = {}
+        for t in tasks:
+            name = t.get_name() or "<unnamed>"
+            label = name.split("-")[0] if "-" in name else name
+            task_summary[label] = task_summary.get(label, 0) + 1
+        task_count = len(tasks)
+    except Exception:
+        task_summary = {}
+        task_count = 0
+
+    counts = gc.get_count()
+    stats = gc.get_stats()
+
+    obj_counts: dict[str, int] = {}
+    for obj in gc.get_objects():
+        t = type(obj).__name__
+        obj_counts[t] = obj_counts.get(t, 0) + 1
+    top_objs = dict(sorted(obj_counts.items(), key=lambda x: -x[1])[:20])
+
+    return {
+        "rss_kib": rusage.ru_maxrss,
+        "proc_status": proc_status,
+        "asyncio_tasks": {
+            "total": task_count,
+            "by_prefix": task_summary,
+        },
+        "gc": {
+            "counts": list(counts),
+            "stats": stats,
+            "tracked_objects": sum(obj_counts.values()),
+        },
+        "top_object_types": top_objs,
+        "python_version": sys.version,
+    }
+
+
 @router.get("/diagnostics")
 async def diagnostics():
     """System health diagnostics for debugging live data issues."""
