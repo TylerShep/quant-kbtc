@@ -207,14 +207,17 @@ class TestExitInnerHonorsExpiryReason:
 
 class TestBgPersistMaxConfigurable:
 
-    def test_default_is_256(self):
-        """64 was too low; cold-start storms saturate it inside 60s and
-        trigger the healthcheck restart loop."""
+    def test_default_is_96(self):
+        """2026-05-04 follow-up #2: 256 was too high — queued tasks could
+        each pin a MarketState reference, pushing RSS over the container
+        limit. 96 is enough to absorb cold-start / ticker-rotation bursts
+        without runaway memory growth, paired with the snapshot eager-
+        serialization fix and the 5 Hz broadcast throttle."""
         import os
         prev = os.environ.pop("BG_PERSIST_MAX", None)
         try:
             from coordinator import _bg_persist_max_env_default
-            assert _bg_persist_max_env_default() == 256
+            assert _bg_persist_max_env_default() == 96
         finally:
             if prev is not None:
                 os.environ["BG_PERSIST_MAX"] = prev
@@ -241,7 +244,7 @@ class TestBgPersistMaxConfigurable:
         try:
             for bad in ("not-an-int", "0", "-50"):
                 os.environ["BG_PERSIST_MAX"] = bad
-                assert _bg_persist_max_env_default() == 256, f"failed at {bad}"
+                assert _bg_persist_max_env_default() == 96, f"failed at {bad}"
         finally:
             if prev is None:
                 os.environ.pop("BG_PERSIST_MAX", None)

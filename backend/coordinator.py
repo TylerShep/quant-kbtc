@@ -48,21 +48,28 @@ logger = structlog.get_logger(__name__)
 
 
 def _bg_persist_max_env_default() -> int:
-    """Read BG_PERSIST_MAX from env with a 256 default.
+    """Read BG_PERSIST_MAX from env with a 96 default.
 
-    See ``Coordinator.__init__`` for the BUG-032 rationale on the cap
-    size. Lives at module scope so it can be re-exported / patched in
-    tests without touching the Coordinator class body.
+    2026-05-04 (BUG-032 follow-up #2): empirically a higher cap (256) made
+    things *worse* by letting the queue accumulate enough write-blocked
+    tasks (each pinning a copy of MarketState / OrderBook references) to
+    push container memory over the 1.8 GB limit and trigger SIGKILL inside
+    ~2 minutes of uptime. The real fix is in ``_persist_snapshot`` (we now
+    serialize the order book to JSON synchronously in the calling task so
+    the queued coroutine holds only small primitives) — combined with this
+    smaller cap, RSS now stays under ~600 MiB at steady state. 96 is large
+    enough to absorb cold-start / ticker-rotation bursts but small enough
+    that even the worst-case per-task memory footprint can't OOM us.
     """
     import os
     raw = os.getenv("BG_PERSIST_MAX")
     if raw is None:
-        return 256
+        return 96
     try:
         v = int(raw)
-        return v if v > 0 else 256
+        return v if v > 0 else 96
     except ValueError:
-        return 256
+        return 96
 
 
 class Coordinator:
@@ -122,18 +129,24 @@ class Coordinator:
         # *drop* the new task instead of letting memory grow unbounded — the
         # loss of a single ob_snapshot is harmless; an OOM kill is not.
         #
-        # 2026-05-04 (BUG-032 follow-up): bumped from 64 → 256 after
-        # observing cold-start storms saturate the queue and trigger the
-        # healthcheck restart loop (14 uvicorn restarts in ~3h). The 64
-        # cap was sized for steady-state but a fresh container with a live
-        # position open can spawn 50+ persists in the first minute
-        # (entry_confirmed, fill_stream_capture, MAE/MFE updates,
-        # bankroll_synced × 5, ws broadcasts). 256 gives the cold start
-        # ~4x headroom while still bounding worst-case memory growth.
+        # 2026-05-04 (BUG-032 follow-up #2): default 96. The earlier 256
+        # bump made things worse (queued coroutines pinned MarketState
+        # references → SIGKILL in ~2 min). Combined with the snapshot
+        # eager-serialization fix in ``_persist_snapshot`` and the 5 Hz
+        # broadcast throttle below, 96 gives the cold start enough
+        # headroom without letting in-flight tasks dominate RSS.
         # Configurable via env so we can tune in prod without a redeploy.
         self._bg_persist_tasks: set = set()
         self._bg_persist_max = _bg_persist_max_env_default()
         self._bg_persist_dropped = 0
+        # 2026-05-04 (BUG-032 follow-up #2): wall-clock throttle for the
+        # per-tick dashboard broadcast. The dashboard renders at ~2-3 fps;
+        # broadcasting every tick (up to ~30 Hz during ticker rotation)
+        # was queueing serialized snapshots that the dashboard would just
+        # collapse + drop client-side anyway, while pinning RSS in the
+        # bg-persist queue. 5 Hz keeps the UI fluid without the spam.
+        self._last_broadcast_ts: float = 0.0
+        self._broadcast_min_interval_sec: float = 0.2  # 5 Hz
 
         # 2026-05-04 (BUG-032 follow-up): generic rate-limit cache for
         # noisy per-tick log lines. A sustained signal during the
@@ -378,26 +391,46 @@ class Coordinator:
             self._run_live_lane(symbol, state, features, regime)
 
         # ── 5. Broadcast to dashboard ──────────────────────────────────
-        # Backpressure-aware: dashboard updates are nice-to-have, not
-        # essential. Drop under load rather than OOM the bot.
-        self._spawn_bg_persist(
-            ws_manager.broadcast({
-                "type": "market_update",
-                "symbol": symbol,
-                "data": features.to_dict(),
-                "state": _serialize_state(state),
-                "decision": self._serialize_decision("paper"),
-                "live_decision": self._serialize_decision("live") if self.live_enabled else None,
-            })
-        )
+        # 2026-05-04 (BUG-032 follow-up #2): throttle to 5 Hz wall-clock.
+        # Was firing every tick (~30 Hz during ticker rotations) and the
+        # serialized payload was the largest single contributor to the
+        # bg-persist queue's memory footprint (state + features dicts
+        # held until ws send completes). 5 Hz is fast enough for a human
+        # dashboard but flat-lines the queue under tick storms.
+        now_t = time.time()
+        if (now_t - self._last_broadcast_ts) >= self._broadcast_min_interval_sec:
+            self._last_broadcast_ts = now_t
+            self._spawn_bg_persist(
+                ws_manager.broadcast({
+                    "type": "market_update",
+                    "symbol": symbol,
+                    "data": features.to_dict(),
+                    "state": _serialize_state(state),
+                    "decision": self._serialize_decision("paper"),
+                    "live_decision": self._serialize_decision("live") if self.live_enabled else None,
+                })
+            )
 
         # ── 6. Periodic tasks ─────────────────────────────────────────
         # 2026-05-01 OOM fix: snapshot persists were happening every 10 ticks
         # (~1 Hz) which, under DB write_gate pressure, caused create_task
         # coroutines to back up holding state/features references → OOM.
         # 30-tick interval is still fine for backtest replay granularity.
+        # 2026-05-04 (BUG-032 follow-up #2): serialize the order book
+        # synchronously here so the queued task only carries small
+        # primitives, not a live MarketState reference. This dropped per-
+        # task footprint from ~few KB (with full order book pinned via
+        # __closure__) to a fixed ~few hundred bytes.
         if self._tick_count % 30 == 0 and self._pool is not None:
-            self._spawn_bg_persist(self._persist_snapshot(symbol, state, features))
+            import json as _json
+            ticker = state.kalshi_ticker or symbol
+            bids_json = _json.dumps([list(p) for p in state.order_book.top_n_bids(10)])
+            asks_json = _json.dumps([list(p) for p in state.order_book.top_n_asks(10)])
+            self._spawn_bg_persist(self._persist_snapshot_eager(
+                ticker, bids_json, asks_json,
+                features.obi, features.total_bid_vol,
+                features.total_ask_vol, features.spread_cents,
+            ))
 
         high_risk_window = (
             regime == "HIGH"
@@ -1648,7 +1681,46 @@ class Coordinator:
         self._bg_persist_tasks.add(task)
         task.add_done_callback(self._bg_persist_tasks.discard)
 
+    async def _persist_snapshot_eager(
+        self,
+        ticker: str,
+        bids_json: str,
+        asks_json: str,
+        obi: float,
+        total_bid_vol: float,
+        total_ask_vol: float,
+        spread_cents: float,
+    ) -> None:
+        """2026-05-04 (BUG-032 follow-up #2): pre-serialized snapshot writer.
+
+        Caller serializes the order book + extracts feature scalars before
+        spawning the background task, so this coroutine carries only small
+        primitives. Replaces the older ``_persist_snapshot(state, features)``
+        path that pinned full ``MarketState`` references in the bg-persist
+        queue and pushed RSS over the container limit during ticker storms.
+        """
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO ob_snapshots
+                           (timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents)
+                           VALUES (NOW(), %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)""",
+                        (ticker, bids_json, asks_json, obi,
+                         total_bid_vol, total_ask_vol, spread_cents),
+                    )
+        except Exception as e:
+            logger.error("coordinator.persist_failed", error=str(e))
+            asyncio.create_task(get_notifier().db_error("persist_snapshot", str(e)))
+
     async def _persist_snapshot(self, symbol: str, state, features) -> None:
+        """Legacy snapshot writer kept for tests / external callers.
+
+        New per-tick path uses ``_persist_snapshot_eager`` (pre-serialized).
+        """
         try:
             pool = self._pool
             if pool is None:
