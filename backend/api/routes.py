@@ -670,25 +670,46 @@ async def errored_trades(
 
 
 @router.get("/equity")
-async def equity(mode: str = Query(None)):
-    """Equity curve data from bankroll_history (survives restarts)."""
+async def equity(mode: str = Query(None), days: int = Query(30)):
+    """Equity curve data from bankroll_history (survives restarts).
+
+    2026-05-04 (BUG-032 follow-up #2): bounded by ``days`` (default 30).
+    Without it, the unbounded ORDER BY scan over 1M+ rows took 27+
+    seconds per call, holding a DB connection and starving every other
+    write task — the cascade pinned bg-persist queue memory and
+    eventually SIGKILLed the container. Combined with the new
+    ``(trading_mode, timestamp DESC)`` index, the bounded query now
+    returns in <50ms on the same dataset. ``days=0`` keeps the legacy
+    full-history behavior for one-off ad-hoc requests.
+    """
+    from datetime import datetime, timezone, timedelta
     from main import coordinator
     active_mode = mode or coordinator.trading_mode
 
-    cache_key = f"equity:{active_mode}"
+    cache_key = f"equity:{active_mode}:{days}"
     cached = _cache.get(cache_key, _EQUITY_TTL)
     if cached is not None:
         return cached
 
     pool = await get_pool()
     async with pool.connection() as conn:
-        rows = await conn.execute(
-            """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
-               FROM bankroll_history
-               WHERE trading_mode = %s
-               ORDER BY timestamp ASC""",
-            (active_mode,),
-        )
+        if days and days > 0:
+            since = datetime.now(timezone.utc) - timedelta(days=days)
+            rows = await conn.execute(
+                """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
+                   FROM bankroll_history
+                   WHERE trading_mode = %s AND timestamp >= %s
+                   ORDER BY timestamp ASC""",
+                (active_mode, since),
+            )
+        else:
+            rows = await conn.execute(
+                """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
+                   FROM bankroll_history
+                   WHERE trading_mode = %s
+                   ORDER BY timestamp ASC""",
+                (active_mode,),
+            )
         results = await rows.fetchall()
 
     items = []
