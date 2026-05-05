@@ -602,6 +602,7 @@ async def test_snapshot_roundtrip_preserves_fill_source_and_wallet():
     pos.entry_fees_dollars = 0.05
     pos.entry_fill_source = "fill_ws"
     pos.wallet_at_entry = 250.42
+    pos.position_uid = "live-test-uid-123"
 
     snapshot = trader.position_manager.get_snapshot()
 
@@ -613,6 +614,7 @@ async def test_snapshot_roundtrip_preserves_fill_source_and_wallet():
     assert restored.entry_fill_source == "fill_ws"
     assert restored.wallet_at_entry == pytest.approx(250.42)
     assert restored.entry_cost_dollars == pytest.approx(1.60)
+    assert restored.position_uid == "live-test-uid-123"
 
 
 @pytest.mark.asyncio

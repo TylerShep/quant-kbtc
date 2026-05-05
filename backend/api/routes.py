@@ -237,6 +237,7 @@ async def diagnostics():
                 "rubric."
             ),
         },
+        "exit_intelligence": coordinator.get_exit_intelligence_state(),
     }
 
 
@@ -333,6 +334,7 @@ async def status():
         "edge_profile_health": edge_health,
         "db_pool": db_pool_stats(),
         "expiry_ladder": ladder_status,
+        "exit_intelligence": coordinator.get_exit_intelligence_state(),
     }
 
 

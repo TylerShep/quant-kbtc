@@ -74,6 +74,8 @@ class ManagedPosition:
     # the entry debit baked in and the diff would only reflect the exit
     # leg's cash flow, making the drift metric structurally wrong.
     wallet_at_entry: Optional[float] = None
+    # Stable per-position identifier used by telemetry streams.
+    position_uid: str = ""
 
 
 @dataclass
@@ -956,6 +958,7 @@ class PositionManager:
                 signal_driver=signal_driver,
                 entry_fill_source=fill_source,
                 wallet_at_entry=wallet_at_entry,
+                position_uid=(order_id or client_order_id),
             )
             self._transition(PositionState.OPEN)
 
@@ -1334,6 +1337,7 @@ class PositionManager:
             "entry_fill_source": pos.entry_fill_source,
             "exit_fill_source": exit_fill_source,
             "wallet_at_entry": getattr(pos, "wallet_at_entry", None),
+            "position_uid": pos.position_uid,
             "max_favorable_excursion": pos.max_favorable_excursion,
             "max_adverse_excursion": pos.max_adverse_excursion,
         }
@@ -1694,6 +1698,7 @@ class PositionManager:
             "entry_fill_source": pos.entry_fill_source,
             "exit_fill_source": exit_fill_source,
             "wallet_at_entry": pos.wallet_at_entry,
+            "position_uid": pos.position_uid,
         }
 
         self.position = None
@@ -1808,6 +1813,7 @@ class PositionManager:
             "entry_fill_source": pos.entry_fill_source,
             "exit_fill_source": "settlement",
             "wallet_at_entry": pos.wallet_at_entry,
+            "position_uid": pos.position_uid,
         }
 
         remaining = await self._verify_with_retry(pos.ticker)
@@ -2481,6 +2487,7 @@ class PositionManager:
                 "candles_held": self.position.candles_held,
                 "conviction": self.position.conviction,
                 "signal_driver": self.position.signal_driver,
+                "position_uid": self.position.position_uid,
             } if self.position else None,
             "orphaned_positions": [
                 {

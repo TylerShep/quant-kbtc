@@ -730,6 +730,91 @@ class DiscordNotifier:
         }
         await self._post(self._attribution_url, embed)
 
+    async def exit_intelligence_promotion_ready(
+        self,
+        *,
+        qualifying_trades: int,
+        distinct_regimes: int,
+        distinct_hours: int,
+        winners_with_telemetry: int,
+        losers_with_telemetry: int,
+        avg_min_score_winners: Optional[float],
+        avg_min_score_losers: Optional[float],
+        current_threshold: float,
+        breach_ticks: int,
+    ) -> None:
+        """One-shot alert: enough paper telemetry exists to evaluate promoting
+        the health-score from shadow mode to a real exit driver.
+
+        Posted to the attribution channel because this is a research/analysis
+        prompt, not a state mutation. The operator should:
+          1. Open the dashboard / `/api/diagnostics` and inspect the
+             `exit_intelligence` block.
+          2. Pull the win/loss min-score split from `position_telemetry`.
+          3. Backtest the proposed threshold against logged shadow exits.
+          4. If the gate is informative, flip
+             ``EXIT_INTELLIGENCE_SHADOW_ONLY=false`` (and tune
+             ``HEALTH_SCORE_THRESHOLD`` / ``HEALTH_SCORE_BREACH_TICKS``).
+        """
+        winners_str = (
+            f"{avg_min_score_winners:.1f}" if avg_min_score_winners is not None else "N/A"
+        )
+        losers_str = (
+            f"{avg_min_score_losers:.1f}" if avg_min_score_losers is not None else "N/A"
+        )
+        if avg_min_score_winners is not None and avg_min_score_losers is not None:
+            spread = avg_min_score_winners - avg_min_score_losers
+            spread_str = f"{spread:+.1f} pts (winners − losers)"
+        else:
+            spread_str = "Insufficient sample"
+        embed = {
+            "title": "\U0001f9ea Exit Intelligence \u2014 Promotion-Ready Review",
+            "description": (
+                f"Paper lane has accumulated **{qualifying_trades}** completed "
+                "trades with full open-position telemetry coverage. The health "
+                "score is currently in **shadow mode** \u2014 it is time to "
+                "review whether to promote it to an active exit driver.\n\n"
+                "Open the dashboard `/api/diagnostics` and look at the "
+                "`exit_intelligence` block, then pull the win/loss min-score "
+                "split from `position_telemetry`."
+            ),
+            "color": COLOR_PURPLE,
+            "fields": [
+                {"name": "Qualifying Paper Trades", "value": str(qualifying_trades), "inline": True},
+                {"name": "Distinct Regimes", "value": str(distinct_regimes), "inline": True},
+                {"name": "Distinct UTC Hours", "value": str(distinct_hours), "inline": True},
+                {"name": "Winners w/ Telemetry", "value": str(winners_with_telemetry), "inline": True},
+                {"name": "Losers w/ Telemetry", "value": str(losers_with_telemetry), "inline": True},
+                {"name": "Avg Min Score (Win)", "value": winners_str, "inline": True},
+                {"name": "Avg Min Score (Loss)", "value": losers_str, "inline": True},
+                {"name": "Win\u2212Loss Spread", "value": spread_str, "inline": True},
+                {
+                    "name": "Current Shadow Config",
+                    "value": (
+                        f"`HEALTH_SCORE_THRESHOLD={current_threshold:g}`\n"
+                        f"`HEALTH_SCORE_BREACH_TICKS={breach_ticks}`"
+                    ),
+                    "inline": False,
+                },
+                {
+                    "name": "Promotion Checklist",
+                    "value": (
+                        "1. Confirm winners' avg min-score \u226b losers' "
+                        "(target spread \u2265 10 pts).\n"
+                        "2. Replay a week of shadow `HEALTH_SCORE_DECAY` "
+                        "candidates against actual exits.\n"
+                        "3. Tune `HEALTH_SCORE_THRESHOLD` / `BREACH_TICKS` "
+                        "via backtest.\n"
+                        "4. Flip `EXIT_INTELLIGENCE_SHADOW_ONLY=false` and "
+                        "`bash scripts/deploy.sh`."
+                    ),
+                    "inline": False,
+                },
+            ],
+            "footer": self._footer(),
+        }
+        await self._post(self._attribution_url, embed)
+
     async def ml_data_ready(self, row_count: int, sample_win_rate: float) -> None:
         embed = {
             "title": "\U0001f9e0 ML Training Data Ready",

@@ -151,9 +151,10 @@ async def test_persist_live_trade_no_drift_records_trade_row():
     assert "entry_cost_dollars" in sql
     assert "wallet_pnl" in sql
     assert "fill_source" in sql
-    # entry_cost_dollars, exit_cost_dollars, wallet_pnl, pnl_drift, fill_source
-    # are the LAST five params.
-    entry_cost, exit_cost, wallet_pnl, pnl_drift, fill_source = params[-5:]
+    # entry_cost_dollars, exit_cost_dollars, wallet_pnl, pnl_drift,
+    # fill_source, position_uid are the LAST six params (position_uid
+    # added in migration 013_trade_position_uid.sql).
+    entry_cost, exit_cost, wallet_pnl, pnl_drift, fill_source, _uid = params[-6:]
     assert entry_cost == pytest.approx(1.50)
     assert exit_cost == pytest.approx(3.50)
     assert wallet_pnl == pytest.approx(1.50)
@@ -187,7 +188,7 @@ async def test_persist_live_trade_drift_above_threshold_quarantines_but_records(
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, main_params = main
-    _, _, wallet_pnl, pnl_drift, _ = main_params[-5:]
+    _, _, wallet_pnl, pnl_drift, _ = main_params[-6:-1]
     assert wallet_pnl == pytest.approx(0.20)
     assert pnl_drift == pytest.approx(1.30)
 
@@ -209,7 +210,7 @@ async def test_persist_live_trade_drift_below_threshold_no_quarantine():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    _, _, wallet_pnl, pnl_drift, _ = params[-5:]
+    _, _, wallet_pnl, pnl_drift, _ = params[-6:-1]
     assert pnl_drift == pytest.approx(0.04, abs=1e-6)
     assert wallet_pnl == pytest.approx(1.46)
 
@@ -230,7 +231,7 @@ async def test_persist_paper_trade_skips_reconciliation():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    _, _, wallet_pnl, pnl_drift, _ = params[-5:]
+    _, _, wallet_pnl, pnl_drift, _ = params[-6:-1]
     # Reconciliation skipped → wallet_pnl/drift NULL
     assert wallet_pnl is None
     assert pnl_drift is None
@@ -259,7 +260,7 @@ async def test_persist_live_settlement_trade_skips_drift_quarantine():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    _, _, wallet_pnl, pnl_drift, fill_source = params[-5:]
+    _, _, wallet_pnl, pnl_drift, fill_source = params[-6:-1]
     # Reconciliation IS computed (wallet check still runs)
     assert wallet_pnl == pytest.approx(5.00)
     assert pnl_drift == pytest.approx(3.50)
@@ -281,7 +282,7 @@ async def test_persist_live_trade_no_wallet_at_entry_skips_reconciliation():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    _, _, wallet_pnl, pnl_drift, _ = params[-5:]
+    _, _, wallet_pnl, pnl_drift, _ = params[-6:-1]
     assert wallet_pnl is None
     assert pnl_drift is None
 
@@ -303,7 +304,7 @@ async def test_persist_live_trade_balance_failure_does_not_block_persist():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    _, _, wallet_pnl, pnl_drift, _ = params[-5:]
+    _, _, wallet_pnl, pnl_drift, _ = params[-6:-1]
     assert wallet_pnl is None
     assert pnl_drift is None
 
@@ -342,5 +343,49 @@ async def test_fill_source_uses_exit_leg_when_not_settlement():
     main = _find_insert(coord._pool.calls, "trades")
     assert main is not None
     _, params = main
-    *_, fill_source = params[-5:]
+    *_, fill_source = params[-6:-1]
     assert fill_source == "fill_ws"
+
+
+@pytest.mark.asyncio
+async def test_persist_trade_writes_position_uid_for_telemetry_join():
+    """Migration 013 added ``trades.position_uid`` so the exit-intelligence
+    promotion-readiness query can join trades to ``position_telemetry``
+    by an exact key (the time-window join was zero-width because
+    trades.timestamp == closed_at). Lock the contract: when the trade
+    object carries a ``position_uid``, the INSERT must include it as the
+    last param and the SQL must reference the column."""
+    coord = _make_coordinator(wallet_post_dollars=251.50)
+    trade = _FakeTrade(pnl=1.50, wallet_at_entry=250.00)
+    trade.position_uid = "paper-deadbeefcafebabe"
+
+    await coord._persist_trade(trade, mode="paper")
+
+    main = _find_insert(coord._pool.calls, "trades")
+    assert main is not None
+    sql, params = main
+    assert "position_uid" in sql, (
+        "INSERT into trades must reference position_uid for the "
+        "exit-intelligence promotion query to find the row"
+    )
+    assert params[-1] == "paper-deadbeefcafebabe", (
+        "position_uid must be the LAST insert param (telemetry-join key)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_trade_writes_null_position_uid_when_missing():
+    """Legacy/orphan trades do not carry a position_uid. Empty strings
+    must be normalized to NULL so the partial index on position_uid
+    stays compact and the join-readiness gate doesn't false-positive
+    on uid='' rows."""
+    coord = _make_coordinator(wallet_post_dollars=251.50)
+    trade = _FakeTrade(pnl=1.50, wallet_at_entry=250.00)
+    trade.position_uid = ""
+
+    await coord._persist_trade(trade, mode="paper")
+
+    main = _find_insert(coord._pool.calls, "trades")
+    assert main is not None
+    _, params = main
+    assert params[-1] is None

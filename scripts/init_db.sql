@@ -75,13 +75,19 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_cost_dollars   NUMERIC(10,4),
     wallet_pnl          NUMERIC(14,4),
     pnl_drift           NUMERIC(10,4),
-    fill_source         VARCHAR(40)     DEFAULT 'order_response'
+    fill_source         VARCHAR(40)     DEFAULT 'order_response',
+    -- 013_trade_position_uid: exact join key for position_telemetry. Required
+    -- because trades.timestamp is set at close time and equals closed_at, so
+    -- entry-vs-exit window joins are zero-width.
+    position_uid        VARCHAR(96)
 );
 SELECT create_hypertable('trades', 'timestamp', chunk_time_interval => INTERVAL '30 days', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades (ticker, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_pnl_drift
     ON trades (pnl_drift DESC NULLS LAST) WHERE pnl_drift IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_trades_fill_source ON trades (fill_source);
+CREATE INDEX IF NOT EXISTS idx_trades_position_uid
+    ON trades (position_uid) WHERE position_uid IS NOT NULL;
 
 -- Bankroll history
 CREATE TABLE IF NOT EXISTS bankroll_history (
@@ -194,6 +200,41 @@ CREATE TABLE IF NOT EXISTS trade_features (
 CREATE INDEX IF NOT EXISTS idx_trade_features_trade ON trade_features (trade_id);
 CREATE INDEX IF NOT EXISTS idx_trade_features_label ON trade_features (label) WHERE label IS NOT NULL;
 
+-- Open-position telemetry sampled during runtime (exit intelligence)
+CREATE TABLE IF NOT EXISTS position_telemetry (
+    id                  BIGSERIAL       NOT NULL,
+    timestamp           TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    position_uid        VARCHAR(96)     NOT NULL,
+    trading_mode        VARCHAR(10)     NOT NULL,
+    ticker              VARCHAR(60)     NOT NULL,
+    direction           VARCHAR(10)     NOT NULL,
+    mark_price          NUMERIC(10,4),
+    unrealized_pnl_pct  NUMERIC(10,6),
+    mfe_pct             NUMERIC(10,6),
+    mae_pct             NUMERIC(10,6),
+    health_score        NUMERIC(6,2),
+    health_breach_count INTEGER,
+    obi                 NUMERIC(8,4),
+    roc_15m             NUMERIC(10,4),
+    mini_roc_fast       NUMERIC(10,6),
+    mini_roc_slow       NUMERIC(10,6),
+    atr_regime          VARCHAR(12),
+    time_remaining_sec  INTEGER,
+    spot_price          NUMERIC(14,4),
+    health_components   JSONB,
+    PRIMARY KEY (timestamp, id)
+);
+SELECT create_hypertable('position_telemetry', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day',
+    migrate_data => TRUE,
+    if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_uid_ts
+    ON position_telemetry (position_uid, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_mode_ts
+    ON position_telemetry (trading_mode, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_ticker_ts
+    ON position_telemetry (ticker, timestamp DESC);
+
 -- Settled KXBTC contract outcomes (settlement price, result, volume)
 CREATE TABLE IF NOT EXISTS kalshi_markets (
     ticker           VARCHAR(60)    NOT NULL,
@@ -235,6 +276,11 @@ SELECT add_compression_policy('latency_metrics', INTERVAL '3 days', if_not_exist
 ALTER TABLE pipeline_health SET (timescaledb.compress, timescaledb.compress_segmentby = 'source');
 SELECT add_compression_policy('pipeline_health', INTERVAL '14 days', if_not_exists => TRUE);
 
+ALTER TABLE position_telemetry
+    SET (timescaledb.compress, timescaledb.compress_segmentby = 'position_uid,trading_mode');
+SELECT add_compression_policy('position_telemetry', INTERVAL '7 days', if_not_exists => TRUE);
+
 -- Retention policies (latency and pipeline health kept 90 days)
 SELECT add_retention_policy('latency_metrics', INTERVAL '90 days', if_not_exists => TRUE);
 SELECT add_retention_policy('pipeline_health', INTERVAL '90 days', if_not_exists => TRUE);
+SELECT add_retention_policy('position_telemetry', INTERVAL '90 days', if_not_exists => TRUE);

@@ -22,6 +22,9 @@ class FeatureSnapshot:
     spread_cents: Optional[int]
     spot_price: Optional[float]
     mid_price: Optional[float]
+    spot_roc_30s: Optional[float] = None
+    spot_roc_60s: Optional[float] = None
+    spot_momentum_decay: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -32,6 +35,18 @@ class FeatureSnapshot:
             "spread_cents": self.spread_cents,
             "spot_price": self.spot_price,
             "mid_price": self.mid_price,
+            "spot_roc_30s": (
+                round(self.spot_roc_30s, 6)
+                if self.spot_roc_30s is not None else None
+            ),
+            "spot_roc_60s": (
+                round(self.spot_roc_60s, 6)
+                if self.spot_roc_60s is not None else None
+            ),
+            "spot_momentum_decay": (
+                round(self.spot_momentum_decay, 6)
+                if self.spot_momentum_decay is not None else None
+            ),
         }
 
 
@@ -95,10 +110,42 @@ class OBISmoother:
 class FeatureEngine:
     """Computes features from MarketState on each tick."""
 
+    _MOMENTUM_HISTORY_SEC = 180.0
+    _MOMENTUM_FAST_SEC = 30.0
+    _MOMENTUM_SLOW_SEC = 60.0
+
     def __init__(self):
         self._obi_history: Dict[str, deque] = {}
         self._obi_smoothers: Dict[str, OBISmoother] = {}
         self._last_spot: Dict[str, float] = {}
+        self._spot_history: Dict[str, deque[tuple[float, float]]] = {}
+
+    @staticmethod
+    def _price_n_seconds_ago(
+        history: deque[tuple[float, float]],
+        now_ts: float,
+        seconds: float,
+    ) -> Optional[float]:
+        cutoff = now_ts - seconds
+        candidate = None
+        for ts, price in history:
+            if ts <= cutoff:
+                candidate = price
+            else:
+                break
+        if candidate is not None:
+            return candidate
+        # If the stream hasn't been running for the full window yet,
+        # fall back to earliest seen price as a warmup estimate.
+        if history:
+            return history[0][1]
+        return None
+
+    @staticmethod
+    def _roc_pct(current: Optional[float], past: Optional[float]) -> Optional[float]:
+        if current is None or past is None or past == 0:
+            return None
+        return ((current - past) / past) * 100.0
 
     def update(self, symbol: str, state) -> Optional[FeatureSnapshot]:
         book = state.order_book
@@ -128,6 +175,34 @@ class FeatureEngine:
         if state.spot_price:
             self._last_spot[symbol] = state.spot_price
 
+        spot_roc_30s: Optional[float] = None
+        spot_roc_60s: Optional[float] = None
+        spot_momentum_decay: Optional[float] = None
+        if spot is not None:
+            now_ts = time.time()
+            if symbol not in self._spot_history:
+                self._spot_history[symbol] = deque(maxlen=4096)
+            history = self._spot_history[symbol]
+            history.append((now_ts, spot))
+            cutoff = now_ts - self._MOMENTUM_HISTORY_SEC
+            while history and history[0][0] < cutoff:
+                history.popleft()
+
+            price_30s = self._price_n_seconds_ago(
+                history, now_ts, self._MOMENTUM_FAST_SEC
+            )
+            price_60s = self._price_n_seconds_ago(
+                history, now_ts, self._MOMENTUM_SLOW_SEC
+            )
+            spot_roc_30s = self._roc_pct(spot, price_30s)
+            spot_roc_60s = self._roc_pct(spot, price_60s)
+            if (
+                spot_roc_30s is not None
+                and spot_roc_60s is not None
+                and abs(spot_roc_60s) > 1e-9
+            ):
+                spot_momentum_decay = spot_roc_30s / spot_roc_60s
+
         spread = book.spread
         spread_cents = int(spread) if spread is not None else None
 
@@ -139,6 +214,9 @@ class FeatureEngine:
             spread_cents=spread_cents,
             spot_price=spot,
             mid_price=book.mid,
+            spot_roc_30s=spot_roc_30s,
+            spot_roc_60s=spot_roc_60s,
+            spot_momentum_decay=spot_momentum_decay,
         )
 
     def obi_history(self, symbol: str) -> list[float]:

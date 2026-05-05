@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional
+import uuid
 
 import structlog
 
@@ -31,6 +32,7 @@ class PaperPosition:
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
     signal_driver: str = "-"
+    position_uid: str = ""
 
 
 @dataclass
@@ -68,6 +70,7 @@ class PaperTrade:
     # taker-side guard exits ("paper_guard_taker_bidask"). None means
     # caller did not specify a source.
     fill_source: Optional[str] = None
+    position_uid: str = ""
 
 
 class PaperTrader:
@@ -115,6 +118,7 @@ class PaperTrader:
             entry_obi=obi,
             entry_roc=roc,
             signal_driver=signal_driver,
+            position_uid=f"paper-{uuid.uuid4().hex[:16]}",
         )
         logger.info(
             "paper.entry",
@@ -171,6 +175,7 @@ class PaperTrader:
             entry_obi=pos.entry_obi,
             entry_roc=pos.entry_roc,
             fill_source=fill_source,
+            position_uid=pos.position_uid,
         )
 
         self.sizer.record_trade(net_pnl)
@@ -215,6 +220,7 @@ class PaperTrader:
                 "candles_held": self.position.candles_held,
                 "conviction": self.position.conviction,
                 "signal_driver": self.position.signal_driver,
+                "position_uid": self.position.position_uid,
             }
             if self.position
             else None,

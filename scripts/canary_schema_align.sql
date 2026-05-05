@@ -59,6 +59,7 @@
 --   004b_backfill_signal_driver.sql -> the conviction-based UPDATEs
 --   006_pnl_reconciliation.sql      -> the five trades cost/wallet/fill
 --                                       columns + the two indexes
+--   012_exit_intelligence.sql       -> position_telemetry hypertable + idx
 
 BEGIN;
 
@@ -95,6 +96,57 @@ CREATE INDEX IF NOT EXISTS idx_trades_pnl_drift
     WHERE pnl_drift IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_trades_fill_source
     ON trades (fill_source);
+
+-- ─── from 013_trade_position_uid.sql ─────────────────────────────────────
+ALTER TABLE trades
+    ADD COLUMN IF NOT EXISTS position_uid VARCHAR(96);
+CREATE INDEX IF NOT EXISTS idx_trades_position_uid
+    ON trades (position_uid)
+    WHERE position_uid IS NOT NULL;
+
+-- ─── from 012_exit_intelligence.sql ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS position_telemetry (
+    id                  BIGSERIAL       NOT NULL,
+    timestamp           TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    position_uid        VARCHAR(96)     NOT NULL,
+    trading_mode        VARCHAR(10)     NOT NULL,
+    ticker              VARCHAR(60)     NOT NULL,
+    direction           VARCHAR(10)     NOT NULL,
+    mark_price          NUMERIC(10,4),
+    unrealized_pnl_pct  NUMERIC(10,6),
+    mfe_pct             NUMERIC(10,6),
+    mae_pct             NUMERIC(10,6),
+    health_score        NUMERIC(6,2),
+    health_breach_count INTEGER,
+    obi                 NUMERIC(8,4),
+    roc_15m             NUMERIC(10,4),
+    mini_roc_fast       NUMERIC(10,6),
+    mini_roc_slow       NUMERIC(10,6),
+    atr_regime          VARCHAR(12),
+    time_remaining_sec  INTEGER,
+    spot_price          NUMERIC(14,4),
+    health_components   JSONB,
+    PRIMARY KEY (timestamp, id)
+);
+
+ALTER TABLE position_telemetry DROP CONSTRAINT IF EXISTS position_telemetry_pkey;
+ALTER TABLE position_telemetry
+    ADD CONSTRAINT position_telemetry_pkey PRIMARY KEY (timestamp, id);
+
+SELECT create_hypertable(
+    'position_telemetry',
+    'timestamp',
+    chunk_time_interval => INTERVAL '1 day',
+    migrate_data => TRUE,
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_uid_ts
+    ON position_telemetry (position_uid, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_mode_ts
+    ON position_telemetry (trading_mode, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_telemetry_ticker_ts
+    ON position_telemetry (ticker, timestamp DESC);
 
 -- ─── from 004b_backfill_signal_driver.sql ───────────────────────────────
 -- Conviction-based deterministic mapping. Only updates rows where the

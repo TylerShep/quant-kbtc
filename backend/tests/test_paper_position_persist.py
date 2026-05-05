@@ -139,6 +139,7 @@ def _set_paper_position(coord: Coordinator) -> PaperPosition:
         max_favorable_excursion=0.015,
         max_adverse_excursion=-0.008,
         signal_driver="OBI+ROC",
+        position_uid="paper-test-uid-123",
     )
     coord.paper_trader.position = pos
     return pos
@@ -156,6 +157,7 @@ def test_save_paper_position_writes_to_bot_state():
     assert payload["entry_price"] == 42.0
     assert payload["candles_held"] == 2
     assert payload["signal_driver"] == "OBI+ROC"
+    assert payload["position_uid"] == "paper-test-uid-123"
     assert payload["entry_time"].startswith("2026-04-30T12:00")
 
 
@@ -194,6 +196,7 @@ def test_restore_paper_position_round_trip():
     assert restored.conviction == original.conviction
     assert restored.regime_at_entry == original.regime_at_entry
     assert restored.signal_driver == original.signal_driver
+    assert restored.position_uid == original.position_uid
 
 
 def test_restore_paper_position_no_op_when_empty_store():

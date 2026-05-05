@@ -51,6 +51,7 @@ class LiveTrade:
     entry_fill_source: str = "order_response"
     exit_fill_source: str = "order_response"
     wallet_at_entry: Optional[float] = None
+    position_uid: str = ""
 
 
 class LiveTrader:
@@ -254,6 +255,7 @@ class LiveTrader:
             entry_fill_source=result.get("entry_fill_source", "order_response"),
             exit_fill_source=result.get("exit_fill_source", "order_response"),
             wallet_at_entry=result.get("wallet_at_entry"),
+            position_uid=result.get("position_uid", ""),
         )
 
     def get_state(self) -> dict:

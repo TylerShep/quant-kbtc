@@ -13,7 +13,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 
@@ -25,6 +25,10 @@ from strategies.obi import evaluate_obi, check_obi_exit, Direction
 from strategies.roc import evaluate_roc, calculate_roc, check_roc_exit
 from strategies.resolver import SignalConflictResolver, Conviction
 from strategies.spread_div import evaluate_spread_divergence, SpreadState
+from strategies.exit_intelligence import (
+    HealthComponents,
+    compute_position_health_score,
+)
 from filters.atr_regime import ATRRegimeFilter
 from filters.spread_regime import SpreadRegimeFilter
 from risk.position_sizer import PositionSizer
@@ -178,8 +182,19 @@ class Coordinator:
         # ML feature snapshots: keyed by ticker, captured at entry, consumed at exit
         self._pending_features: dict[str, dict] = {}
 
+        # Exit-intelligence runtime telemetry caches.
+        self._health_breach_counts: dict[str, int] = {}
+        self._last_health_snapshot: dict[str, Optional[dict[str, Any]]] = {
+            "paper": None,
+            "live": None,
+        }
+        self._last_position_telemetry_ts: dict[str, float] = {}
+
         # One-time alert: fires when 500+ fully-labeled paper trades exist
         self._ml_data_ready_sent: bool = False
+        # One-time alert: fires when paper telemetry coverage is rich enough
+        # to evaluate promoting health-score from shadow → enforced exit.
+        self._exit_intel_promotion_sent: bool = False
 
         # Throttle for periodic Kalshi balance polling. Event-driven syncs
         # (post-trade exit, /api/reset-drawdown, ghost cleared, startup,
@@ -598,7 +613,9 @@ class Coordinator:
         breaker = self.paper_breaker
 
         if trader.has_position:
-            exit_reason = self._check_exits_for(state, features, regime, trader)
+            exit_reason = self._check_exits_for(
+                state, features, regime, trader, mode="paper"
+            )
             if exit_reason:
                 exit_price = self._get_exit_price_for(state, trader)
                 if exit_price is not None:
@@ -635,7 +652,9 @@ class Coordinator:
         pm = trader.position_manager
 
         if trader.has_position and not pm.is_busy and not self._live_exit_in_flight:
-            exit_reason = self._check_exits_for(state, features, regime, trader)
+            exit_reason = self._check_exits_for(
+                state, features, regime, trader, mode="live"
+            )
             if exit_reason:
                 exit_price = self._get_exit_price_for(state, trader)
                 if exit_price is not None:
@@ -693,6 +712,13 @@ class Coordinator:
         else:
             self._last_paper_exit_tick = self._tick_count
 
+        position_uid = getattr(trade, "position_uid", "") or ""
+        if position_uid:
+            key = f"{mode}:{position_uid}"
+            self._health_breach_counts.pop(key, None)
+            self._last_position_telemetry_ts.pop(key, None)
+        self._last_health_snapshot[mode] = None
+
         asyncio.create_task(self._persist_and_notify_exit(trade, symbol, mode))
 
     async def _persist_and_notify_exit(self, trade, symbol: str, mode: str) -> None:
@@ -707,6 +733,15 @@ class Coordinator:
 
         if mode == "paper" and not self._ml_data_ready_sent:
             asyncio.create_task(self._check_ml_data_threshold())
+
+        if (
+            mode == "paper"
+            and not self._exit_intel_promotion_sent
+            and settings.bot.exit_intelligence_enabled
+            and settings.bot.exit_intelligence_shadow_only
+            and settings.bot.position_telemetry_enabled
+        ):
+            asyncio.create_task(self._check_exit_intelligence_promotion_threshold())
 
         if mode == "live":
             try:
@@ -808,6 +843,139 @@ class Coordinator:
                 logger.info("coordinator.ml_data_ready_sent", rows=count, win_rate=win_rate)
         except Exception as e:
             logger.warning("coordinator.ml_data_threshold_check_failed", error=str(e))
+
+    async def _check_exit_intelligence_promotion_threshold(self) -> None:
+        """One-time check: fire a Discord alert when paper telemetry coverage
+        is rich enough to evaluate promoting the health-score from shadow
+        mode to an enforced exit driver.
+
+        Criteria (all must be met):
+          * ``EXIT_INTEL_PROMOTION_MIN_PAPER_TRADES`` completed paper trades
+            in the last 30 days that have at least one ``position_telemetry``
+            row with a non-null ``health_score`` inside their
+            entry-to-exit window.
+          * ``EXIT_INTEL_PROMOTION_MIN_REGIMES`` distinct ATR regimes at
+            entry across that cohort (default 2 — typically LOW + MEDIUM).
+          * ``EXIT_INTEL_PROMOTION_MIN_HOURS`` distinct UTC entry hours
+            (default 6 — guards against single-session bias).
+
+        Win/loss min-score split is included in the alert so the operator
+        can immediately see whether the gate is informative.
+        """
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            min_trades = int(settings.bot.exit_intel_promotion_min_paper_trades)
+            min_regimes = int(settings.bot.exit_intel_promotion_min_distinct_regimes)
+            min_hours = int(settings.bot.exit_intel_promotion_min_distinct_hours)
+
+            async with pool.connection() as conn:
+                row = await conn.execute(
+                    """
+                    -- Joins trades to position_telemetry by ``position_uid``.
+                    -- Time-window joins are unsafe because trades.timestamp is
+                    -- written at close time (== closed_at), not entry time —
+                    -- see migration 013_trade_position_uid.sql.
+                    -- Hour-of-day diversity is derived from ``closed_at`` as a
+                    -- close-enough proxy (worst case: trade entered late in
+                    -- one hour and exited just into the next; immaterial for
+                    -- the ``>= 6 distinct hours`` gate).
+                    WITH trade_telemetry AS (
+                        SELECT
+                            t.id AS trade_id,
+                            t.pnl,
+                            t.regime_at_entry,
+                            EXTRACT(HOUR FROM t.closed_at AT TIME ZONE 'UTC')::int AS hour_utc,
+                            MIN(pt.health_score) AS min_health_score,
+                            COUNT(pt.id) AS sample_count
+                        FROM trades t
+                        LEFT JOIN position_telemetry pt
+                          ON pt.position_uid = t.position_uid
+                         AND pt.trading_mode = 'paper'
+                         AND pt.health_score IS NOT NULL
+                        WHERE t.trading_mode = 'paper'
+                          AND t.timestamp > NOW() - INTERVAL '30 days'
+                          AND t.closed_at IS NOT NULL
+                          AND t.position_uid IS NOT NULL
+                        GROUP BY t.id, t.pnl, t.regime_at_entry, t.closed_at
+                    )
+                    SELECT
+                        COUNT(*) FILTER (WHERE sample_count > 0)                                          AS qualifying_trades,
+                        COUNT(DISTINCT regime_at_entry) FILTER (WHERE sample_count > 0)                   AS distinct_regimes,
+                        COUNT(DISTINCT hour_utc) FILTER (WHERE sample_count > 0)                          AS distinct_hours,
+                        COUNT(*) FILTER (WHERE sample_count > 0 AND pnl > 0)                              AS winners_with_telemetry,
+                        COUNT(*) FILTER (WHERE sample_count > 0 AND pnl <= 0)                             AS losers_with_telemetry,
+                        AVG(min_health_score) FILTER (WHERE sample_count > 0 AND pnl > 0)                 AS avg_min_score_winners,
+                        AVG(min_health_score) FILTER (WHERE sample_count > 0 AND pnl <= 0)                AS avg_min_score_losers
+                    FROM trade_telemetry
+                    """
+                )
+                result = await row.fetchone()
+
+            if result is None:
+                return
+
+            (
+                qualifying_trades,
+                distinct_regimes,
+                distinct_hours,
+                winners_with_telemetry,
+                losers_with_telemetry,
+                avg_min_score_winners,
+                avg_min_score_losers,
+            ) = (
+                int(result[0] or 0),
+                int(result[1] or 0),
+                int(result[2] or 0),
+                int(result[3] or 0),
+                int(result[4] or 0),
+                float(result[5]) if result[5] is not None else None,
+                float(result[6]) if result[6] is not None else None,
+            )
+
+            if (
+                qualifying_trades < min_trades
+                or distinct_regimes < min_regimes
+                or distinct_hours < min_hours
+            ):
+                logger.debug(
+                    "coordinator.exit_intel_promotion_pending",
+                    qualifying_trades=qualifying_trades,
+                    distinct_regimes=distinct_regimes,
+                    distinct_hours=distinct_hours,
+                    min_trades=min_trades,
+                    min_regimes=min_regimes,
+                    min_hours=min_hours,
+                )
+                return
+
+            self._exit_intel_promotion_sent = True
+            await self._save_state()
+
+            await get_notifier().exit_intelligence_promotion_ready(
+                qualifying_trades=qualifying_trades,
+                distinct_regimes=distinct_regimes,
+                distinct_hours=distinct_hours,
+                winners_with_telemetry=winners_with_telemetry,
+                losers_with_telemetry=losers_with_telemetry,
+                avg_min_score_winners=avg_min_score_winners,
+                avg_min_score_losers=avg_min_score_losers,
+                current_threshold=float(settings.bot.health_score_threshold),
+                breach_ticks=int(settings.bot.health_score_breach_ticks),
+            )
+            logger.info(
+                "coordinator.exit_intel_promotion_alert_sent",
+                qualifying_trades=qualifying_trades,
+                distinct_regimes=distinct_regimes,
+                distinct_hours=distinct_hours,
+                winners=winners_with_telemetry,
+                losers=losers_with_telemetry,
+                avg_min_score_winners=avg_min_score_winners,
+                avg_min_score_losers=avg_min_score_losers,
+            )
+        except Exception as e:
+            logger.warning("coordinator.exit_intel_promotion_check_failed", error=str(e))
 
     async def _send_post_trade_report(self, trade, symbol: str,
                                        quarantined: bool = False) -> None:
@@ -981,6 +1149,12 @@ class Coordinator:
             self._register_position_ticker(pos.ticker, symbol)
         else:
             asyncio.create_task(self._save_paper_position())
+        position_uid = getattr(pos, "position_uid", "") or ""
+        if position_uid:
+            key = f"{mode}:{position_uid}"
+            self._health_breach_counts[key] = 0
+            self._last_position_telemetry_ts[key] = 0.0
+
         asyncio.create_task(self._persist_signal(state, features, decision, "ENTRY",
                                                     roc_value=roc_val))
         asyncio.create_task(ws_manager.broadcast({
@@ -993,6 +1167,7 @@ class Coordinator:
                 "contracts": pos.contracts,
                 "entry_price": pos.entry_price,
                 "conviction": pos.conviction,
+                "position_uid": position_uid,
             },
         }))
         asyncio.create_task(get_notifier().trade_opened(
@@ -1631,13 +1806,25 @@ class Coordinator:
         finally:
             self._live_entry_in_flight = False
 
-    def _check_exits_for(self, state, features, regime: str, trader) -> Optional[str]:
+    def _position_uid_for(self, pos) -> str:
+        uid = getattr(pos, "position_uid", "") or ""
+        if uid:
+            return str(uid)
+        ticker = getattr(pos, "ticker", "UNKNOWN")
+        entry_time = getattr(pos, "entry_time", "")
+        fallback = f"{ticker}:{entry_time}"
+        try:
+            setattr(pos, "position_uid", fallback)
+        except Exception:
+            pass
+        return fallback
+
+    def _check_exits_for(
+        self, state, features, regime: str, trader, mode: str
+    ) -> Optional[str]:
         """Check exit conditions for a specific trader's position."""
         pos = trader.position
         if pos is None:
-            return None
-
-        if pos.candles_held < 2 and regime != "HIGH":
             return None
 
         current_price = self._get_exit_price_for(state, trader)
@@ -1652,6 +1839,107 @@ class Coordinator:
         pos.max_favorable_excursion = max(pos.max_favorable_excursion, pnl_pct)
         pos.max_adverse_excursion = min(pos.max_adverse_excursion, pnl_pct)
 
+        closes = [c.close for c in self.candle_aggregator.recent(10)]
+        current_roc = calculate_roc(closes, settings.roc.lookback)
+        candle_list = self.candle_aggregator.recent(1)
+        latest_candle = None
+        if candle_list:
+            c = candle_list[0]
+            latest_candle = {
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+            }
+
+        health_exit_reason: Optional[str] = None
+        health_score: Optional[float] = None
+        health_components: Optional[HealthComponents] = None
+        health_breach_count = 0
+        if settings.bot.exit_intelligence_enabled:
+            health_score, health_components = compute_position_health_score(
+                direction=pos.direction,
+                current_obi=features.obi,
+                current_roc=current_roc,
+                entry_roc=pos.entry_roc,
+                atr_regime=regime,
+                regime_at_entry=pos.regime_at_entry,
+                pnl_pct=pnl_pct,
+                max_favorable_excursion=pos.max_favorable_excursion,
+                mini_roc_fast=getattr(features, "spot_roc_30s", None),
+                mini_roc_slow=getattr(features, "spot_roc_60s", None),
+                weight_obi=settings.bot.health_weight_obi,
+                weight_roc=settings.bot.health_weight_roc,
+                weight_regime=settings.bot.health_weight_regime,
+                weight_mfe=settings.bot.health_weight_mfe,
+                weight_momentum=settings.bot.health_weight_momentum,
+            )
+
+            position_key = f"{mode}:{self._position_uid_for(pos)}"
+            threshold = max(0.0, min(100.0, settings.bot.health_score_threshold))
+            if health_score < threshold:
+                health_breach_count = self._health_breach_counts.get(position_key, 0) + 1
+            else:
+                health_breach_count = 0
+            self._health_breach_counts[position_key] = health_breach_count
+
+            breach_ticks_required = max(1, settings.bot.health_score_breach_ticks)
+            self._last_health_snapshot[mode] = {
+                "position_uid": self._position_uid_for(pos),
+                "ticker": pos.ticker,
+                "direction": pos.direction,
+                "score": health_score,
+                "threshold": threshold,
+                "breach_count": health_breach_count,
+                "breach_ticks_required": breach_ticks_required,
+                "shadow_only": settings.bot.exit_intelligence_shadow_only,
+                "components": (
+                    health_components.to_dict() if health_components else None
+                ),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if health_breach_count >= breach_ticks_required:
+                if settings.bot.exit_intelligence_shadow_only:
+                    if health_breach_count == breach_ticks_required:
+                        logger.info(
+                            "coordinator.health_score_breach_shadow",
+                            mode=mode,
+                            ticker=pos.ticker,
+                            score=health_score,
+                            threshold=threshold,
+                            breach_count=health_breach_count,
+                        )
+                else:
+                    health_exit_reason = "HEALTH_SCORE_DECAY"
+                    if health_breach_count == breach_ticks_required:
+                        logger.info(
+                            "coordinator.health_score_exit_triggered",
+                            mode=mode,
+                            ticker=pos.ticker,
+                            score=health_score,
+                            threshold=threshold,
+                            breach_count=health_breach_count,
+                        )
+        else:
+            self._last_health_snapshot[mode] = None
+
+        self._maybe_persist_position_telemetry(
+            mode=mode,
+            pos=pos,
+            state=state,
+            features=features,
+            regime=regime,
+            mark_price=current_price,
+            pnl_pct=pnl_pct,
+            current_roc=current_roc,
+            health_score=health_score,
+            health_components=health_components,
+            health_breach_count=health_breach_count,
+        )
+
+        if pos.candles_held < 2 and regime != "HIGH":
+            return health_exit_reason
+
         exit_reason = check_obi_exit(
             direction=pos.direction,
             current_obi=features.obi,
@@ -1662,14 +1950,6 @@ class Coordinator:
         if exit_reason:
             return exit_reason
 
-        closes = [c.close for c in self.candle_aggregator.recent(10)]
-        current_roc = calculate_roc(closes, settings.roc.lookback)
-        candle_list = self.candle_aggregator.recent(1)
-        latest_candle = None
-        if candle_list:
-            c = candle_list[0]
-            latest_candle = {"open": c.open, "high": c.high, "low": c.low, "close": c.close}
-
         exit_reason = check_roc_exit(
             direction=pos.direction,
             pnl_pct=pnl_pct,
@@ -1678,7 +1958,63 @@ class Coordinator:
             latest_candle=latest_candle,
             candles_held=pos.candles_held,
         )
-        return exit_reason
+        if exit_reason:
+            return exit_reason
+        return health_exit_reason
+
+    def _maybe_persist_position_telemetry(
+        self,
+        *,
+        mode: str,
+        pos,
+        state,
+        features,
+        regime: str,
+        mark_price: Optional[float],
+        pnl_pct: float,
+        current_roc: Optional[float],
+        health_score: Optional[float],
+        health_components: Optional[HealthComponents],
+        health_breach_count: int,
+    ) -> None:
+        if not settings.bot.position_telemetry_enabled:
+            return
+        if self._pool is None:
+            return
+
+        position_uid = self._position_uid_for(pos)
+        cache_key = f"{mode}:{position_uid}"
+        now_ts = time.time()
+        interval_sec = max(1.0, float(settings.bot.position_telemetry_interval_sec))
+        last_ts = self._last_position_telemetry_ts.get(cache_key, 0.0)
+        if now_ts - last_ts < interval_sec:
+            return
+
+        self._last_position_telemetry_ts[cache_key] = now_ts
+        self._spawn_bg_persist(
+            self._persist_position_telemetry(
+                position_uid=position_uid,
+                trading_mode=mode,
+                ticker=pos.ticker,
+                direction=pos.direction,
+                mark_price=mark_price,
+                unrealized_pnl_pct=pnl_pct,
+                mfe_pct=pos.max_favorable_excursion,
+                mae_pct=pos.max_adverse_excursion,
+                health_score=health_score,
+                health_breach_count=health_breach_count,
+                obi=features.obi,
+                roc_15m=current_roc,
+                mini_roc_fast=getattr(features, "spot_roc_30s", None),
+                mini_roc_slow=getattr(features, "spot_roc_60s", None),
+                atr_regime=regime,
+                time_remaining_sec=getattr(state, "time_remaining_sec", None),
+                spot_price=getattr(state, "spot_price", None),
+                health_components=(
+                    health_components.to_dict() if health_components else None
+                ),
+            )
+        )
 
     def _is_near_expiry(self, time_remaining_sec: Optional[int]) -> bool:
         """BUG-028: True when the contract is within the configured expiry
@@ -1928,6 +2264,83 @@ class Coordinator:
                 )
         except Exception as e:
             logger.error("coordinator.persist_candle_failed", error=str(e))
+
+    async def _persist_position_telemetry(
+        self,
+        *,
+        position_uid: str,
+        trading_mode: str,
+        ticker: str,
+        direction: str,
+        mark_price: Optional[float],
+        unrealized_pnl_pct: float,
+        mfe_pct: float,
+        mae_pct: float,
+        health_score: Optional[float],
+        health_breach_count: int,
+        obi: Optional[float],
+        roc_15m: Optional[float],
+        mini_roc_fast: Optional[float],
+        mini_roc_slow: Optional[float],
+        atr_regime: Optional[str],
+        time_remaining_sec: Optional[int],
+        spot_price: Optional[float],
+        health_components: Optional[dict[str, float]],
+    ) -> None:
+        try:
+            pool = self._pool
+            if pool is None:
+                return
+            async with write_gate():
+                async with pool.connection() as conn:
+                    await conn.execute(
+                        """INSERT INTO position_telemetry (
+                               timestamp,
+                               position_uid,
+                               trading_mode,
+                               ticker,
+                               direction,
+                               mark_price,
+                               unrealized_pnl_pct,
+                               mfe_pct,
+                               mae_pct,
+                               health_score,
+                               health_breach_count,
+                               obi,
+                               roc_15m,
+                               mini_roc_fast,
+                               mini_roc_slow,
+                               atr_regime,
+                               time_remaining_sec,
+                               spot_price,
+                               health_components
+                           ) VALUES (
+                               NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                           )""",
+                        (
+                            position_uid,
+                            trading_mode,
+                            ticker,
+                            direction,
+                            mark_price,
+                            unrealized_pnl_pct,
+                            mfe_pct,
+                            mae_pct,
+                            health_score,
+                            health_breach_count,
+                            obi,
+                            roc_15m,
+                            mini_roc_fast,
+                            mini_roc_slow,
+                            atr_regime,
+                            time_remaining_sec,
+                            spot_price,
+                            json.dumps(health_components) if health_components else None,
+                        ),
+                    )
+        except Exception as e:
+            logger.warning("coordinator.persist_position_telemetry_failed", error=str(e))
 
     async def _schedule_tuning(self) -> None:
         """Periodic tuning task — runs every TUNING_INTERVAL_HOURS.
@@ -2562,9 +2975,9 @@ class Coordinator:
                         regime_at_entry, candles_held, entry_obi, entry_roc,
                         signal_driver, closed_at, trading_mode,
                         entry_cost_dollars, exit_cost_dollars,
-                        wallet_pnl, pnl_drift, fill_source)
+                        wallet_pnl, pnl_drift, fill_source, position_uid)
                        VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s,
-                               %s, %s, %s, %s, %s)
+                               %s, %s, %s, %s, %s, %s)
                        RETURNING id""",
                     (
                         trade.ticker, trade.direction,
@@ -2587,6 +3000,10 @@ class Coordinator:
                         # remain identifiable in analytics.
                         (paper_fill_source or "paper_mid_mark") if mode == "paper"
                         else (exit_fill_source if exit_fill_source != "settlement" else entry_fill_source),
+                        # Exit-intelligence join key. Empty string is
+                        # written as NULL so the partial index on
+                        # position_uid stays compact for legacy rows.
+                        (getattr(trade, "position_uid", "") or None) or None,
                     ),
                 )
                 result = await row.fetchone()
@@ -2689,6 +3106,7 @@ class Coordinator:
                 "max_favorable_excursion": pos.max_favorable_excursion,
                 "max_adverse_excursion": pos.max_adverse_excursion,
                 "signal_driver": pos.signal_driver,
+                "position_uid": getattr(pos, "position_uid", ""),
             }
             async with write_gate():
                 async with pool.connection() as conn:
@@ -2757,6 +3175,7 @@ class Coordinator:
                 max_favorable_excursion=float(data.get("max_favorable_excursion") or 0.0),
                 max_adverse_excursion=float(data.get("max_adverse_excursion") or 0.0),
                 signal_driver=data.get("signal_driver", "-"),
+                position_uid=str(data.get("position_uid") or ""),
             )
             logger.info("coordinator.paper_position_restored",
                         ticker=data["ticker"],
@@ -2788,6 +3207,7 @@ class Coordinator:
                 "trading_mode": self.trading_mode,
                 "trading_paused": self.trading_paused,
                 "ml_data_ready_sent": self._ml_data_ready_sent,
+                "exit_intel_promotion_sent": self._exit_intel_promotion_sent,
             }
             async with write_gate():
                 async with pool.connection() as conn:
@@ -2855,6 +3275,9 @@ class Coordinator:
                     if saved_mode in ("paper", "live"):
                         self.trading_mode = saved_mode
                     self._ml_data_ready_sent = state.get("ml_data_ready_sent", False)
+                    self._exit_intel_promotion_sent = state.get(
+                        "exit_intel_promotion_sent", False
+                    )
                     logger.info("coordinator.state_restored",
                                 paper_bankroll=self.paper_sizer.bankroll,
                                 live_bankroll=self.live_sizer.bankroll,
@@ -2968,6 +3391,34 @@ class Coordinator:
             ))
         elif new_orphan_count == 0 and getattr(self, '_last_orphan_count', 0) > 0:
             self._last_orphan_count = 0
+
+    def get_exit_intelligence_state(self) -> dict[str, Any]:
+        return {
+            "enabled": settings.bot.exit_intelligence_enabled,
+            "shadow_only": settings.bot.exit_intelligence_shadow_only,
+            "threshold": settings.bot.health_score_threshold,
+            "breach_ticks": settings.bot.health_score_breach_ticks,
+            "position_telemetry_enabled": settings.bot.position_telemetry_enabled,
+            "position_telemetry_interval_sec": (
+                settings.bot.position_telemetry_interval_sec
+            ),
+            "promotion": {
+                "alert_sent": self._exit_intel_promotion_sent,
+                "min_paper_trades": (
+                    settings.bot.exit_intel_promotion_min_paper_trades
+                ),
+                "min_distinct_regimes": (
+                    settings.bot.exit_intel_promotion_min_distinct_regimes
+                ),
+                "min_distinct_hours": (
+                    settings.bot.exit_intel_promotion_min_distinct_hours
+                ),
+            },
+            "health": {
+                "paper": self._last_health_snapshot.get("paper"),
+                "live": self._last_health_snapshot.get("live"),
+            },
+        }
 
     async def _periodic_reconciliation_wrapper(self) -> None:
         """BUG-032 follow-up wrapper: clears the in-flight flag in

@@ -385,6 +385,57 @@ class BotConfig:
         default_factory=lambda: _env_bool("LADDER_CANCEL_ON_RESTART", False)
     )
 
+    # ── Exit Intelligence (2026-05-04): intra-candle momentum + position
+    # health score + open-position telemetry.
+    exit_intelligence_enabled: bool = field(
+        default_factory=lambda: _env_bool("EXIT_INTELLIGENCE_ENABLED", True)
+    )
+    # Shadow mode computes/logs health score but never routes exits.
+    exit_intelligence_shadow_only: bool = field(
+        default_factory=lambda: _env_bool("EXIT_INTELLIGENCE_SHADOW_ONLY", True)
+    )
+    health_score_threshold: float = field(
+        default_factory=lambda: _env_float("HEALTH_SCORE_THRESHOLD", 35.0)
+    )
+    # Consecutive below-threshold ticks required before triggering.
+    health_score_breach_ticks: int = field(
+        default_factory=lambda: _env_int("HEALTH_SCORE_BREACH_TICKS", 3)
+    )
+    health_weight_obi: float = field(
+        default_factory=lambda: _env_float("HEALTH_WEIGHT_OBI", 0.30)
+    )
+    health_weight_roc: float = field(
+        default_factory=lambda: _env_float("HEALTH_WEIGHT_ROC", 0.20)
+    )
+    health_weight_regime: float = field(
+        default_factory=lambda: _env_float("HEALTH_WEIGHT_REGIME", 0.15)
+    )
+    health_weight_mfe: float = field(
+        default_factory=lambda: _env_float("HEALTH_WEIGHT_MFE", 0.20)
+    )
+    health_weight_momentum: float = field(
+        default_factory=lambda: _env_float("HEALTH_WEIGHT_MOMENTUM", 0.15)
+    )
+    # Open-position telemetry samples are rate-limited by wall-clock seconds.
+    position_telemetry_enabled: bool = field(
+        default_factory=lambda: _env_bool("POSITION_TELEMETRY_ENABLED", True)
+    )
+    position_telemetry_interval_sec: float = field(
+        default_factory=lambda: _env_float("POSITION_TELEMETRY_INTERVAL_SEC", 15.0)
+    )
+    # One-shot Discord alert thresholds for promoting health-score from
+    # shadow mode to enforced exit driver. Fires once per environment, then
+    # latches via bot_state.exit_intel_promotion_sent.
+    exit_intel_promotion_min_paper_trades: int = field(
+        default_factory=lambda: _env_int("EXIT_INTEL_PROMOTION_MIN_PAPER_TRADES", 100)
+    )
+    exit_intel_promotion_min_distinct_regimes: int = field(
+        default_factory=lambda: _env_int("EXIT_INTEL_PROMOTION_MIN_REGIMES", 2)
+    )
+    exit_intel_promotion_min_distinct_hours: int = field(
+        default_factory=lambda: _env_int("EXIT_INTEL_PROMOTION_MIN_HOURS", 6)
+    )
+
     @property
     def is_production(self) -> bool:
         return self.env == "production"
