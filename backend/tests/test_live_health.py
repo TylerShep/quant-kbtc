@@ -432,3 +432,79 @@ def test_cooldown_inside_window():
 def test_cooldown_outside_window():
     long_ago = (NOW - timedelta(hours=20)).isoformat()
     assert live_health._within_cooldown(long_ago, 12, NOW) is False
+
+
+# ─── Pipeline health persistence ───────────────────────────────────────────
+
+def test_count_candle_gaps_detects_large_jumps():
+    candles = [
+        NOW - timedelta(hours=2),
+        NOW - timedelta(hours=1, minutes=20),
+        NOW - timedelta(minutes=20),
+    ]
+    assert live_health._count_candle_gaps(candles) == 2
+
+
+def test_count_candle_gaps_ignores_small_jumps():
+    candles = [
+        NOW - timedelta(minutes=45),
+        NOW - timedelta(minutes=30),
+        NOW - timedelta(minutes=15),
+    ]
+    assert live_health._count_candle_gaps(candles) == 0
+
+
+@pytest.mark.asyncio
+async def test_record_pipeline_health_persists_hourly_row():
+    responses = [
+        (NOW - timedelta(minutes=20),),
+        [
+            (NOW - timedelta(hours=2),),
+            (NOW - timedelta(hours=1, minutes=20),),
+            (NOW - timedelta(minutes=20),),
+        ],
+        (NOW - timedelta(minutes=5),),
+        (345,),
+        (4,),
+    ]
+    pool = FakePool(responses)
+
+    await live_health.record_pipeline_health(pool, now=NOW)
+
+    upserts = [
+        (sql, params)
+        for sql, params in pool.conn._upserts
+        if "INSERT INTO pipeline_health" in sql
+    ]
+    assert len(upserts) == 1
+    _, params = upserts[0]
+    assert params[0] == NOW
+    assert params[1] == "coordinator"
+    assert params[2] == pytest.approx(1200.0)
+    assert params[3] == 2
+    assert params[4] == 345
+    assert params[5] == 4
+
+
+@pytest.mark.asyncio
+async def test_record_pipeline_health_allows_missing_lag_sources():
+    responses = [
+        (None,),
+        [],
+        (None,),
+        (0,),
+        (0,),
+    ]
+    pool = FakePool(responses)
+
+    await live_health.record_pipeline_health(pool, now=NOW)
+
+    upserts = [
+        (sql, params)
+        for sql, params in pool.conn._upserts
+        if "INSERT INTO pipeline_health" in sql
+    ]
+    assert len(upserts) == 1
+    _, params = upserts[0]
+    assert params[2] is None
+    assert params[3] == 0

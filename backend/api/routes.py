@@ -4,6 +4,7 @@ REST API routes — health, status, trade history, equity history.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -54,6 +55,30 @@ _MECHANICAL_FILTER = "AND exit_reason NOT IN ('ORPHAN_SETTLED', 'TICKER_ROLLED',
 # view intentionally does NOT apply this filter -- operators need to see
 # every row, including flagged ones, when investigating individual trades.
 _DATA_QUALITY_FILTER = "AND data_quality_flag IS NULL"
+
+
+def _read_cgroup_memory_limit_bytes() -> int | None:
+    """Return the container memory cgroup limit in bytes, if present."""
+    candidates = (
+        Path("/sys/fs/cgroup/memory.max"),  # cgroup v2
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),  # cgroup v1
+    )
+    for candidate in candidates:
+        try:
+            raw = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # Linux uses huge sentinel values for "effectively unlimited".
+        if value <= 0 or value >= (1 << 60):
+            return None
+        return value
+    return None
 
 
 class TradingModeRequest(BaseModel):
@@ -153,6 +178,8 @@ async def diagnostics():
         "message_count": kalshi_ws.message_count if kalshi_ws else 0,
         "connect_attempts": kalshi_ws.connect_attempts if kalshi_ws else 0,
         "active_tickers": dict(kalshi_ws.active_tickers) if kalshi_ws else {},
+        "watched_position_tickers": dict(kalshi_ws.watched_position_tickers) if kalshi_ws else {},
+        "last_subscribed_tickers": list(getattr(kalshi_ws, "_last_subscribed_tickers", [])) if kalshi_ws else [],
     }
 
     spot_info = {
@@ -168,6 +195,10 @@ async def diagnostics():
 
     state = dm.states.get("BTC")
     book_healthy = coordinator._is_book_healthy(state) if state else False
+    order_book_cache_sizes = {
+        symbol: len(getattr(market_state, "order_books", {}) or {})
+        for symbol, market_state in dm.states.items()
+    }
 
     edge_health: dict[str, Any] = {}
     try:
@@ -216,6 +247,7 @@ async def diagnostics():
         "trading_mode": coordinator.trading_mode,
         "can_trade": coordinator.circuit_breaker.can_trade(),
         "book_healthy": book_healthy,
+        "order_book_cache_sizes": order_book_cache_sizes,
         "dashboard_ws_clients": len(dm._listeners),
         "near_expiry_skips": dict(coordinator._near_expiry_skip_count),
         "edge_profile_health": edge_health,
@@ -524,6 +556,7 @@ async def set_trading_pause(req: TradingPauseRequest):
 async def deploy_check():
     """Pre-deploy safety check: returns whether it's safe to restart the bot."""
     from main import coordinator
+    from config.settings import settings as live_settings
 
     live_position = coordinator.live_trader.has_position
     orphans = len(coordinator.live_trader.orphaned_positions)
@@ -554,6 +587,38 @@ async def deploy_check():
     if pm_busy:
         blockers.append(f"PositionManager busy (state: {pm_state})")
 
+    configured_limit_mb = int(getattr(live_settings.bot, "mem_limit_mb", 0) or 0)
+    configured_reservation_mb = int(
+        getattr(live_settings.bot, "mem_reservation_mb", 0) or 0
+    )
+    if configured_limit_mb <= 0:
+        blockers.append("BOT_MEM_LIMIT_MB must be set > 0")
+    if configured_reservation_mb <= 0:
+        blockers.append("BOT_MEM_RESERVATION_MB must be set > 0")
+    elif configured_limit_mb > 0 and configured_reservation_mb >= configured_limit_mb:
+        blockers.append(
+            "BOT_MEM_RESERVATION_MB must be lower than BOT_MEM_LIMIT_MB"
+        )
+
+    cgroup_limit_bytes = _read_cgroup_memory_limit_bytes()
+    if cgroup_limit_bytes is None:
+        blockers.append("Container memory limit is not set (cgroup reports unlimited)")
+    elif configured_limit_mb > 0:
+        configured_limit_bytes = configured_limit_mb * 1024 * 1024
+        # Allow a small buffer for platform rounding.
+        if abs(cgroup_limit_bytes - configured_limit_bytes) > (64 * 1024 * 1024):
+            blockers.append(
+                "Container memory limit does not match BOT_MEM_LIMIT_MB"
+            )
+
+    if (
+        not live_settings.bot.exit_intelligence_shadow_only
+        and live_settings.bot.health_score_breach_ticks < 3
+    ):
+        blockers.append(
+            "HEALTH_SCORE_BREACH_TICKS must be >= 3 when EXIT_INTELLIGENCE_SHADOW_ONLY=false"
+        )
+
     safe = len(blockers) == 0
 
     return {
@@ -561,6 +626,20 @@ async def deploy_check():
         "trading_mode": coordinator.trading_mode,
         "blockers": blockers,
         "orphans": orphans,
+        "memory_guard": {
+            "configured_limit_mb": configured_limit_mb,
+            "configured_reservation_mb": configured_reservation_mb,
+            "cgroup_limit_mb": (
+                round(cgroup_limit_bytes / (1024 * 1024), 2)
+                if cgroup_limit_bytes is not None
+                else None
+            ),
+        },
+        "exit_intelligence_guard": {
+            "shadow_only": live_settings.bot.exit_intelligence_shadow_only,
+            "health_score_breach_ticks": live_settings.bot.health_score_breach_ticks,
+            "min_required_breach_ticks_when_live": 3,
+        },
         "message": "Safe to deploy" if safe else "BLOCKED: " + "; ".join(blockers),
     }
 

@@ -270,6 +270,8 @@ class KalshiWebSocketClient:
         self.last_message_time: Optional[float] = None
         self.message_count = 0
         self.connect_attempts = 0
+        self._subscribe_lock = asyncio.Lock()
+        self._last_subscribed_tickers: list[str] = []
 
     async def start(self):
         self._running = True
@@ -382,31 +384,47 @@ class KalshiWebSocketClient:
             finally:
                 self.connected = False
 
+    def _subscription_tickers(self) -> list[str]:
+        tickers = set(self.active_tickers.values())
+        tickers.update(self.watched_position_tickers.keys())
+        return sorted(t for t in tickers if t)
+
+    async def refresh_position_subscriptions(self) -> None:
+        if self._ws_is_open() and self._ws is not None:
+            await self._subscribe(self._ws)
+
     async def _subscribe(self, ws):
-        tickers = list(self.active_tickers.values())
-        if tickers:
+        async with self._subscribe_lock:
+            tickers = self._subscription_tickers()
+            if tickers:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "id": 1,
+                            "cmd": "subscribe",
+                            "params": {
+                                "channels": ["orderbook_delta", "ticker", "trade"],
+                                "market_tickers": tickers,
+                            },
+                        }
+                    )
+                )
             await ws.send(
                 json.dumps(
                     {
-                        "id": 1,
+                        "id": 2,
                         "cmd": "subscribe",
-                        "params": {
-                            "channels": ["orderbook_delta", "ticker", "trade"],
-                            "market_tickers": tickers,
-                        },
+                        "params": {"channels": ["market_lifecycle_v2"]},
                     }
                 )
             )
-        await ws.send(
-            json.dumps(
-                {
-                    "id": 2,
-                    "cmd": "subscribe",
-                    "params": {"channels": ["market_lifecycle_v2"]},
-                }
+            self._last_subscribed_tickers = tickers
+            logger.info(
+                "kalshi_ws.subscribed",
+                tickers=tickers,
+                active_tickers=sorted(self.active_tickers.values()),
+                watched_tickers=sorted(self.watched_position_tickers.keys()),
             )
-        )
-        logger.info("kalshi_ws.subscribed", tickers=tickers)
 
     def _handle_message(self, msg: dict):
         msg_type = msg.get("type", "")

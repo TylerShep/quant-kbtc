@@ -34,6 +34,8 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://kalshi:kalshi_secret@db:5432/kbtc
+      BOT_MEM_LIMIT_MB: 1200
+      BOT_MEM_RESERVATION_MB: 800
     ports:
       - "8001:8000"
     volumes:
@@ -45,6 +47,8 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+    mem_limit: 1200m
+    mem_reservation: 800m
     networks:
       - kbtc-net
 

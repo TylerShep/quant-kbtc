@@ -6,6 +6,7 @@ Ported from kalshi-trading-bot with SortedDict book improvement.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
@@ -141,6 +142,7 @@ class MarketState:
     spot_ask: Optional[float] = None
     spot_volume_24h: Optional[float] = None
     order_book: OrderBookState = field(default_factory=OrderBookState)
+    order_books: Dict[str, OrderBookState] = field(default_factory=dict)
     last_trade_price: Optional[float] = None
     last_trade_size: Optional[int] = None
     volume: Optional[int] = None
@@ -154,6 +156,15 @@ class MarketState:
         if self.expiry_time:
             delta = (self.expiry_time - datetime.now(timezone.utc)).total_seconds()
             self.time_remaining_sec = max(0, int(delta))
+
+    def book_for_ticker(self, ticker: Optional[str], *, set_active: bool = False) -> OrderBookState:
+        key = ticker or self.kalshi_ticker or self.symbol
+        if key not in self.order_books:
+            self.order_books[key] = OrderBookState()
+        book = self.order_books[key]
+        if set_active:
+            self.order_book = book
+        return book
 
 
 class DataManager:
@@ -170,6 +181,7 @@ class DataManager:
         self._kalshi_ws = None
         self._spot_ws = None
         self._tick_task: Optional[asyncio.Task] = None
+        self._order_book_last_seen: Dict[str, Dict[str, float]] = {}
 
     def add_listener(self, cb: Callable[[str, MarketState], None]):
         self._listeners.append(cb)
@@ -221,7 +233,7 @@ class DataManager:
         data = update.get("data", {})
 
         if update_type in ("orderbook_snapshot", "orderbook_delta"):
-            self._apply_orderbook(state, update_type, data)
+            self._apply_orderbook(symbol, state, update_type, data)
         elif update_type == "lifecycle_settled":
             res = data.get("result")
             if res in ("yes", "no"):
@@ -251,7 +263,12 @@ class DataManager:
         state.update_time_remaining()
         self._notify(symbol, state)
 
-    def _apply_orderbook(self, state: MarketState, update_type: str, data: dict):
+    def _apply_orderbook(self, symbol: str, state: MarketState, update_type: str, data: dict):
+        ticker = data.get("market_ticker") or state.kalshi_ticker or state.symbol
+        book = state.book_for_ticker(ticker)
+        last_seen = self._order_book_last_seen.setdefault(symbol, {})
+        last_seen[ticker] = time.time()
+
         if update_type == "orderbook_snapshot":
             y_rows = (
                 data.get("yes_dollars_fp")
@@ -263,20 +280,61 @@ class DataManager:
                 or data.get("no_dollars")
                 or data.get("no")
             )
-            state.order_book.apply_snapshot(y_rows or [], n_rows or [])
+            book.apply_snapshot(y_rows or [], n_rows or [])
         else:
             if "price_dollars" in data and "delta_fp" in data:
                 raw_cents = int(round(float(data["price_dollars"]) * 100))
                 delta_sz = int(float(data["delta_fp"]))
                 side = data.get("side", "yes")
-                state.order_book.apply_delta(side, raw_cents, delta_sz)
+                book.apply_delta(side, raw_cents, delta_sz)
             else:
                 for entry in data.get("yes", []):
                     price, size = int(entry[0]), int(entry[1])
-                    state.order_book.apply_level("yes", price, size)
+                    book.apply_level("yes", price, size)
                 for entry in data.get("no", []):
                     price, size = int(entry[0]), int(entry[1])
-                    state.order_book.apply_level("no", price, size)
+                    book.apply_level("no", price, size)
+
+        if ticker == state.kalshi_ticker:
+            state.order_book = book
+        self._trim_order_books(symbol, state)
+
+    def _trim_order_books(self, symbol: str, state: MarketState) -> None:
+        max_cached = max(1, int(getattr(settings.bot, "max_cached_order_books", 12)))
+        if len(state.order_books) <= max_cached:
+            return
+
+        keep: set[str] = set()
+        if state.kalshi_ticker:
+            keep.add(state.kalshi_ticker)
+        if self._kalshi_ws is not None:
+            keep.update(
+                ticker
+                for ticker, ticker_symbol in self._kalshi_ws.watched_position_tickers.items()
+                if ticker_symbol == symbol
+            )
+
+        last_seen = self._order_book_last_seen.setdefault(symbol, {})
+        removable = sorted(
+            (
+                (last_seen.get(ticker, 0.0), ticker)
+                for ticker in state.order_books.keys()
+                if ticker not in keep
+            ),
+            key=lambda item: item[0],
+        )
+
+        while len(state.order_books) > max_cached and removable:
+            _, ticker = removable.pop(0)
+            state.order_books.pop(ticker, None)
+            last_seen.pop(ticker, None)
+            logger.info(
+                "data_manager.order_book_evicted",
+                symbol=symbol,
+                ticker=ticker,
+                cached_books=len(state.order_books),
+                max_cached=max_cached,
+            )
 
     def _notify(self, symbol: str, state: MarketState):
         if self._kalshi_ws:
@@ -295,6 +353,9 @@ class DataManager:
                 if state.kalshi_ticker is not None and state.kalshi_ticker != tk:
                     state.expiry_time = None
                 state.kalshi_ticker = tk
+                state.book_for_ticker(tk, set_active=True)
+                self._order_book_last_seen.setdefault(symbol, {})[tk] = time.time()
+                self._trim_order_books(symbol, state)
 
             # BUG-028 layer-4 (root cause). Seed ``state.expiry_time`` from the
             # REST ``close_time`` that ``_resolve_tickers`` has already

@@ -143,6 +143,7 @@ class RiskConfig:
     weekly_loss_limit_pct: float = field(default_factory=lambda: _env_float("WEEKLY_LOSS_LIMIT_PCT", 0.15))
     max_drawdown_pct: float = field(default_factory=lambda: _env_float("MAX_DRAWDOWN_PCT", 0.20))
     stop_loss_pct: float = field(default_factory=lambda: _env_float("STOP_LOSS_PCT", 0.02))
+    hard_stop_loss_pct: float = field(default_factory=lambda: _env_float("HARD_STOP_LOSS_PCT", 0.10))
     profit_target_mult: float = field(default_factory=lambda: _env_float("PROFIT_TARGET_MULT", 1.5))
     high_conviction_mult: float = field(default_factory=lambda: _env_float("HIGH_CONVICTION_MULT", 1.3))
     normal_conviction_mult: float = field(default_factory=lambda: _env_float("NORMAL_CONVICTION_MULT", 1.0))
@@ -166,7 +167,7 @@ class RiskConfig:
     short_trend_lookback_candles: int = field(default_factory=lambda: _env_int("SHORT_TREND_LOOKBACK_CANDLES", 4))
     short_trend_soften_rise_pct: float = field(default_factory=lambda: _env_float("SHORT_TREND_SOFTEN_RISE_PCT", 0.20))
     short_trend_block_rise_pct: float = field(default_factory=lambda: _env_float("SHORT_TREND_BLOCK_RISE_PCT", 0.35))
-    min_candles_before_early_exit: int = field(default_factory=lambda: _env_int("MIN_CANDLES_BEFORE_EARLY_EXIT", 2))
+    min_candles_before_early_exit: int = field(default_factory=lambda: _env_int("MIN_CANDLES_BEFORE_EARLY_EXIT", 1))
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,30 @@ class BotConfig:
     discord_live_trades_webhook: str = field(default_factory=lambda: _env("DISCORD_LIVE_TRADES_WEBHOOK"))
     tuning_interval_hours: int = field(
         default_factory=lambda: _env_int("TUNING_INTERVAL_HOURS", 6)
+    )
+    mem_limit_mb: int = field(
+        default_factory=lambda: _env_int("BOT_MEM_LIMIT_MB", 1200)
+    )
+    mem_reservation_mb: int = field(
+        default_factory=lambda: _env_int("BOT_MEM_RESERVATION_MB", 800)
+    )
+    rss_watchdog_enabled: bool = field(
+        default_factory=lambda: _env_bool("RSS_WATCHDOG_ENABLED", True)
+    )
+    rss_watchdog_threshold_pct: float = field(
+        default_factory=lambda: _env_float("RSS_WATCHDOG_THRESHOLD_PCT", 0.85)
+    )
+    rss_watchdog_poll_sec: float = field(
+        default_factory=lambda: _env_float("RSS_WATCHDOG_POLL_SEC", 30.0)
+    )
+    rss_watchdog_tracemalloc_interval_sec: float = field(
+        default_factory=lambda: _env_float("RSS_WATCHDOG_TRACEMALLOC_INTERVAL_SEC", 300.0)
+    )
+    max_cached_order_books: int = field(
+        default_factory=lambda: _env_int("MAX_CACHED_ORDER_BOOKS", 12)
+    )
+    max_strike_distance_dollars: float = field(
+        default_factory=lambda: _env_float("MAX_STRIKE_DISTANCE_DOLLARS", 100.0)
     )
     cors_origins: str = field(
         default_factory=lambda: _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")

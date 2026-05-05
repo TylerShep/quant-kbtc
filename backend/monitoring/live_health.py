@@ -48,6 +48,7 @@ SKIP_RATIO_COOLDOWN_HOURS = 12
 IMBALANCE_RATIO = 5.0
 IMBALANCE_MIN_SHORT_REJECTIONS = 50
 IMBALANCE_COOLDOWN_HOURS = 24
+PIPELINE_CANDLE_GAP_SEC = 30 * 60
 
 
 async def _get_bot_state(pool, key: str) -> Optional[dict]:
@@ -80,6 +81,142 @@ async def _save_bot_state(pool, key: str, value: dict) -> None:
             )
     except Exception as e:
         logger.error("live_health.bot_state_save_failed", key=key, error=str(e))
+
+
+def _to_utc(ts: Optional[datetime]) -> Optional[datetime]:
+    """Normalize DB timestamps to timezone-aware UTC."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _count_candle_gaps(
+    candle_timestamps: list[datetime], *, gap_threshold_sec: int = PIPELINE_CANDLE_GAP_SEC
+) -> int:
+    """Count large timestamp jumps between consecutive candles."""
+    if len(candle_timestamps) < 2:
+        return 0
+
+    ordered = sorted(
+        (ts for ts in (_to_utc(t) for t in candle_timestamps) if ts is not None)
+    )
+    gaps = 0
+    for prev, curr in zip(ordered[:-1], ordered[1:]):
+        if (curr - prev).total_seconds() > gap_threshold_sec:
+            gaps += 1
+    return gaps
+
+
+async def _query_pipeline_health_inputs(pool) -> dict:
+    """Collect raw inputs used to persist hourly pipeline_health rows."""
+    try:
+        async with pool.connection() as conn:
+            row = await conn.execute(
+                """SELECT MAX(timestamp) FROM candles
+                   WHERE source = 'live_spot'"""
+            )
+            latest_candle_row = await row.fetchone()
+            latest_candle_ts = latest_candle_row[0] if latest_candle_row else None
+
+            row = await conn.execute(
+                """SELECT timestamp FROM candles
+                   WHERE source = 'live_spot'
+                     AND timestamp > NOW() - INTERVAL '48 hours'
+                   ORDER BY timestamp DESC
+                   LIMIT 400"""
+            )
+            candle_rows = await row.fetchall()
+            candle_timestamps = [r[0] for r in candle_rows if r and r[0] is not None]
+
+            row = await conn.execute("SELECT MAX(timestamp) FROM ob_snapshots")
+            latest_ob_row = await row.fetchone()
+            latest_ob_ts = latest_ob_row[0] if latest_ob_row else None
+
+            row = await conn.execute(
+                """SELECT COUNT(*) FROM ob_snapshots
+                   WHERE timestamp > NOW() - INTERVAL '1 hour'"""
+            )
+            ob_count_row = await row.fetchone()
+            ob_snapshot_count = int(ob_count_row[0]) if ob_count_row else 0
+
+            row = await conn.execute(
+                """SELECT COUNT(*) FROM errored_trades
+                   WHERE flagged_at > NOW() - INTERVAL '1 hour'
+                     AND (
+                         error_reason ILIKE '%VALIDATION%'
+                         OR error_reason ILIKE 'DATA_%'
+                         OR error_reason ILIKE 'TRADE_ANOMALY:%'
+                     )"""
+            )
+            validation_row = await row.fetchone()
+            validation_errors = int(validation_row[0]) if validation_row else 0
+    except Exception as e:
+        logger.error("live_health.pipeline_health_query_failed", error=str(e))
+        return {"error": str(e)}
+
+    return {
+        "latest_candle_ts": latest_candle_ts,
+        "candle_timestamps": candle_timestamps,
+        "latest_ob_ts": latest_ob_ts,
+        "ob_snapshot_count": ob_snapshot_count,
+        "validation_errors": validation_errors,
+    }
+
+
+async def record_pipeline_health(pool, *, now: Optional[datetime] = None) -> None:
+    """Persist a point-in-time row to pipeline_health.
+
+    This table was created in schema/migrations but had no writer path in
+    runtime code, which left it empty and made uptime/restart diagnostics
+    impossible over rolling windows.
+    """
+    now = now or _now()
+    inputs = await _query_pipeline_health_inputs(pool)
+    if "error" in inputs:
+        return
+
+    lag_candidates: list[float] = []
+    latest_candle_ts = _to_utc(inputs.get("latest_candle_ts"))
+    if latest_candle_ts is not None:
+        lag_candidates.append((now - latest_candle_ts).total_seconds())
+
+    latest_ob_ts = _to_utc(inputs.get("latest_ob_ts"))
+    if latest_ob_ts is not None:
+        lag_candidates.append((now - latest_ob_ts).total_seconds())
+
+    lag_seconds = round(max(lag_candidates), 2) if lag_candidates else None
+    candle_gaps = _count_candle_gaps(inputs.get("candle_timestamps", []))
+    ob_snapshot_count = int(inputs.get("ob_snapshot_count", 0) or 0)
+    validation_errors = int(inputs.get("validation_errors", 0) or 0)
+
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """INSERT INTO pipeline_health
+                   (timestamp, source, lag_seconds, candle_gaps,
+                    ob_snapshot_count, validation_errors)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    now,
+                    "coordinator",
+                    lag_seconds,
+                    candle_gaps,
+                    ob_snapshot_count,
+                    validation_errors,
+                ),
+            )
+        logger.info(
+            "live_health.pipeline_health_persisted",
+            source="coordinator",
+            lag_seconds=lag_seconds,
+            candle_gaps=candle_gaps,
+            ob_snapshot_count=ob_snapshot_count,
+            validation_errors=validation_errors,
+        )
+    except Exception as e:
+        logger.error("live_health.pipeline_health_persist_failed", error=str(e))
 
 
 def _now() -> datetime:
@@ -593,3 +730,4 @@ async def run_live_health_checks(
     await check_direction_imbalance(
         pool, notifier, trading_mode=trading_mode, now=now,
     )
+    await record_pipeline_health(pool, now=now)

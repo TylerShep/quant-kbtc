@@ -11,10 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import time
+import tracemalloc
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
+import psutil
 import structlog
 
 from config import settings
@@ -46,7 +51,7 @@ from filters.edge_profile import evaluate as evaluate_edge_profile
 from ml.feature_capture import extract_features, save_features, label_trade
 from ml.inference import ml_gate
 from data.historical_sync import HistoricalSync
-from monitoring.live_health import run_live_health_checks
+from monitoring.live_health import record_pipeline_health, run_live_health_checks
 
 logger = structlog.get_logger(__name__)
 
@@ -205,6 +210,9 @@ class Coordinator:
         self._last_bankroll_sync_ts: float = 0.0
         self._bankroll_sync_min_interval_sec: float = 30.0
 
+        self._rss_watchdog_task: Optional[asyncio.Task] = None
+        self._last_watchdog_tracemalloc_ts: float = 0.0
+
         self.historical_sync = HistoricalSync()
 
 
@@ -298,12 +306,23 @@ class Coordinator:
         asyncio.create_task(self._schedule_weekly_digest())
         asyncio.create_task(self._schedule_paper_sizer_resets())
         asyncio.create_task(self._schedule_live_health())
+        if settings.bot.rss_watchdog_enabled:
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(25)
+            self._rss_watchdog_task = asyncio.create_task(self._rss_watchdog_loop())
         await self.historical_sync.start(self._pool)
         logger.info("coordinator.started",
                     fill_stream_enabled=self.fill_stream is not None)
 
     async def stop(self):
         await self._save_state()
+        if self._rss_watchdog_task is not None:
+            self._rss_watchdog_task.cancel()
+            try:
+                await self._rss_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._rss_watchdog_task = None
         if self.fill_stream is not None:
             try:
                 await self.fill_stream.stop()
@@ -374,6 +393,7 @@ class Coordinator:
                 self._spawn_bg_persist(self._save_paper_position())
             if self.live_trader.has_position:
                 self.live_trader.position.candles_held += 1
+                self._spawn_bg_persist(self.live_trader.position_manager._persist_state())
 
             if self._last_regime is not None and new_regime != old_regime:
                 atr_val = (
@@ -1221,7 +1241,13 @@ class Coordinator:
             pos = self.live_trader.position
             if pos is None:
                 return
-            ob = state.order_book
+            ob = self._get_order_book_for_ticker(state, pos.ticker)
+            if ob is None:
+                logger.info(
+                    "coordinator.pre_expiry_ladder_no_book",
+                    ticker=pos.ticker,
+                )
+                return
             try:
                 result = await self.live_trader.position_manager.try_passive_limit_ladder(
                     best_yes_bid=ob.best_yes_bid,
@@ -1709,6 +1735,27 @@ class Coordinator:
                         return
 
                 ticker = state.kalshi_ticker or symbol
+                strike_distance = self._entry_strike_distance(ticker, state.spot_price)
+                max_strike_distance = max(0.0, float(settings.bot.max_strike_distance_dollars))
+                if strike_distance is not None and strike_distance > max_strike_distance:
+                    logger.info(
+                        "coordinator.entry_skipped_otm",
+                        mode=mode,
+                        ticker=ticker,
+                        strike=self._parse_b_band_strike(ticker),
+                        spot_price=state.spot_price,
+                        distance=round(strike_distance, 4),
+                        max_distance=max_strike_distance,
+                    )
+                    if self._tick_count % 60 == 0:
+                        self._spawn_bg_persist(self._persist_signal(
+                            state,
+                            features,
+                            decision,
+                            "MAX_STRIKE_DISTANCE_BLOCK",
+                            roc_value=roc_val,
+                        ))
+                    return
 
                 if mode == "live":
                     # BUG-022 follow-up: don't even spin up the entry task
@@ -1770,11 +1817,26 @@ class Coordinator:
         kalshi_ws = self.data_manager._kalshi_ws
         if kalshi_ws and ticker:
             kalshi_ws.watched_position_tickers[ticker] = symbol
+            logger.info(
+                "position_manager.position_book_subscribed",
+                ticker=ticker,
+                symbol=symbol,
+                watched_count=len(kalshi_ws.watched_position_tickers),
+            )
+            if kalshi_ws._ws_is_open():
+                asyncio.create_task(kalshi_ws.refresh_position_subscriptions())
 
     def _unregister_position_ticker(self, ticker: str) -> None:
         kalshi_ws = self.data_manager._kalshi_ws
         if kalshi_ws and ticker:
             kalshi_ws.watched_position_tickers.pop(ticker, None)
+            logger.info(
+                "position_manager.position_book_unsubscribed",
+                ticker=ticker,
+                watched_count=len(kalshi_ws.watched_position_tickers),
+            )
+            if kalshi_ws._ws_is_open():
+                asyncio.create_task(kalshi_ws.refresh_position_subscriptions())
 
     async def _handle_live_entry(self, trader, ticker, decision, entry_price,
                                   regime, features, roc_val, symbol, state) -> None:
@@ -1937,7 +1999,23 @@ class Coordinator:
             health_breach_count=health_breach_count,
         )
 
-        if pos.candles_held < 2 and regime != "HIGH":
+        hard_stop_pct = max(0.0, float(settings.risk.hard_stop_loss_pct))
+        if hard_stop_pct > 0.0 and pnl_pct <= -hard_stop_pct:
+            logger.warning(
+                "coordinator.hard_stop_loss_triggered",
+                mode=mode,
+                ticker=pos.ticker,
+                pnl_pct=round(pnl_pct, 6),
+                threshold=hard_stop_pct,
+                candles_held=pos.candles_held,
+                regime=regime,
+            )
+            return "HARD_STOP_LOSS"
+
+        min_candles_before_early_exit = max(
+            0, int(settings.risk.min_candles_before_early_exit)
+        )
+        if pos.candles_held < min_candles_before_early_exit and regime != "HIGH":
             return health_exit_reason
 
         exit_reason = check_obi_exit(
@@ -2081,6 +2159,37 @@ class Coordinator:
 
         return True
 
+    @staticmethod
+    def _parse_b_band_strike(ticker: str) -> Optional[float]:
+        """Extract strike from KX* ``-B<strike>`` contracts."""
+        if "-B" not in ticker:
+            return None
+        try:
+            raw = ticker.split("-B", 1)[1].replace(",", "")
+            return float(raw)
+        except (ValueError, IndexError):
+            return None
+
+    def _entry_strike_distance(self, ticker: str, spot_price: Optional[float]) -> Optional[float]:
+        if spot_price is None:
+            return None
+        strike = self._parse_b_band_strike(ticker)
+        if strike is None:
+            return None
+        return abs(strike - spot_price)
+
+    @staticmethod
+    def _get_order_book_for_ticker(state, ticker: str):
+        order_books = getattr(state, "order_books", None)
+        if isinstance(order_books, dict):
+            book = order_books.get(ticker)
+            if book is None:
+                return None
+            if book.best_yes_bid is None and book.best_yes_ask is None:
+                return None
+            return book
+        return state.order_book
+
     def _get_entry_price(self, state, direction) -> Optional[float]:
         """Get entry price: buy YES at ask for LONG, buy NO (sell YES at bid) for SHORT."""
         if direction == Direction.LONG:
@@ -2102,12 +2211,15 @@ class Coordinator:
         pos = trader.position
         if pos is None:
             return None
-        mid = state.order_book.mid
+        book = self._get_order_book_for_ticker(state, pos.ticker)
+        if book is None:
+            return None
+        mid = book.mid
         if mid is not None:
             return mid
         if pos.direction == "long":
-            return state.order_book.best_yes_bid
-        return state.order_book.best_yes_ask
+            return book.best_yes_bid
+        return book.best_yes_ask
 
     def _get_executable_exit_price_for(self, state, trader) -> Optional[float]:
         """Reason-aware exit price for paper guards near contract close.
@@ -2127,7 +2239,9 @@ class Coordinator:
         pos = trader.position
         if pos is None:
             return None
-        ob = state.order_book
+        ob = self._get_order_book_for_ticker(state, pos.ticker)
+        if ob is None:
+            return None
         if pos.direction == "long":
             return ob.best_yes_bid
         ask = ob.best_yes_ask
@@ -2716,9 +2830,18 @@ class Coordinator:
         and persists its own cooldown in bot_state, so a restart can't
         accidentally re-fire alarms that were already in cooldown.
 
-        First run is delayed 5 minutes so the bot has a chance to load
-        state and start ticking before we measure anything.
+        First alarm run is delayed 5 minutes so the bot has a chance to
+        load state and start ticking before we measure anything.
+        Pipeline-health row persistence runs once immediately at startup
+        so the table is never empty after restarts.
         """
+        try:
+            pool = self._pool
+            if pool is not None:
+                await record_pipeline_health(pool)
+        except Exception as e:
+            logger.error("coordinator.pipeline_health_bootstrap_failed", error=str(e))
+
         await asyncio.sleep(300)
         while True:
             try:
@@ -2733,6 +2856,125 @@ class Coordinator:
                 logger.error("coordinator.live_health_check_failed",
                              error=str(e))
             await asyncio.sleep(3600)
+
+    @staticmethod
+    def _read_cgroup_memory_limit_bytes() -> Optional[int]:
+        candidates = (
+            Path("/sys/fs/cgroup/memory.max"),  # cgroup v2
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),  # cgroup v1
+        )
+        for candidate in candidates:
+            try:
+                raw = candidate.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not raw or raw == "max":
+                return None
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value <= 0 or value >= (1 << 60):
+                return None
+            return value
+        return None
+
+    def _resolve_watchdog_memory_limit_bytes(self) -> Optional[int]:
+        configured_mb = int(getattr(settings.bot, "mem_limit_mb", 0) or 0)
+        configured_bytes = configured_mb * 1024 * 1024 if configured_mb > 0 else None
+        cgroup_bytes = self._read_cgroup_memory_limit_bytes()
+        if configured_bytes and cgroup_bytes:
+            return min(configured_bytes, cgroup_bytes)
+        return configured_bytes or cgroup_bytes
+
+    async def _rss_watchdog_log_tracemalloc(self, rss_bytes: int, limit_bytes: int) -> None:
+        if not tracemalloc.is_tracing():
+            return
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics("lineno")[:10]
+            top_frames = [
+                {
+                    "frame": str(stat.traceback[0]),
+                    "size_kib": round(stat.size / 1024, 2),
+                    "count": stat.count,
+                }
+                for stat in top_stats
+            ]
+            current_alloc, peak_alloc = tracemalloc.get_traced_memory()
+            order_book_cache_sizes: dict[str, int] = {}
+            for symbol, market_state in self.data_manager.states.items():
+                books = getattr(market_state, "order_books", None)
+                if isinstance(books, dict):
+                    order_book_cache_sizes[symbol] = len(books)
+            logger.info(
+                "coordinator.rss_watchdog_tracemalloc",
+                rss_mib=round(rss_bytes / (1024 * 1024), 2),
+                limit_mib=round(limit_bytes / (1024 * 1024), 2),
+                current_alloc_mib=round(current_alloc / (1024 * 1024), 2),
+                peak_alloc_mib=round(peak_alloc / (1024 * 1024), 2),
+                bg_persist_queue=len(self._bg_persist_tasks),
+                bg_persist_dropped=self._bg_persist_dropped,
+                ws_clients=len(getattr(ws_manager, "_clients", [])),
+                order_book_cache_sizes=order_book_cache_sizes,
+                top_frames=top_frames,
+            )
+        except Exception as e:
+            logger.warning("coordinator.rss_watchdog_tracemalloc_failed", error=str(e))
+
+    async def _rss_watchdog_loop(self) -> None:
+        poll_sec = max(5.0, float(settings.bot.rss_watchdog_poll_sec))
+        threshold_pct = float(settings.bot.rss_watchdog_threshold_pct)
+        threshold_pct = min(max(threshold_pct, 0.10), 0.99)
+        tracemalloc_interval_sec = max(
+            30.0, float(settings.bot.rss_watchdog_tracemalloc_interval_sec)
+        )
+        limit_bytes = self._resolve_watchdog_memory_limit_bytes()
+        if not limit_bytes:
+            logger.warning("coordinator.rss_watchdog_disabled_no_limit")
+            return
+        logger.info(
+            "coordinator.rss_watchdog_started",
+            limit_mib=round(limit_bytes / (1024 * 1024), 2),
+            threshold_pct=threshold_pct,
+            poll_sec=poll_sec,
+        )
+        process = psutil.Process()
+        while True:
+            try:
+                rss_bytes = process.memory_info().rss
+                usage_ratio = rss_bytes / limit_bytes
+                now_ts = time.time()
+
+                if (
+                    now_ts - self._last_watchdog_tracemalloc_ts
+                    >= tracemalloc_interval_sec
+                ):
+                    self._last_watchdog_tracemalloc_ts = now_ts
+                    await self._rss_watchdog_log_tracemalloc(rss_bytes, limit_bytes)
+
+                if usage_ratio >= threshold_pct:
+                    logger.error(
+                        "coordinator.rss_watchdog_threshold_breached",
+                        rss_mib=round(rss_bytes / (1024 * 1024), 2),
+                        limit_mib=round(limit_bytes / (1024 * 1024), 2),
+                        usage_ratio=round(usage_ratio, 4),
+                        threshold_pct=threshold_pct,
+                    )
+                    await self._save_state()
+                    await self.live_trader.position_manager._persist_state()
+                    await self._save_paper_position()
+                    logger.warning(
+                        "coordinator.rss_watchdog_exit_requested",
+                        reason="rss_threshold",
+                    )
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("coordinator.rss_watchdog_failed", error=str(e))
+            await asyncio.sleep(poll_sec)
 
     async def _warmup_atr(self) -> None:
         """Pre-seed ATR filter from historical candles so regime and atr_pct
@@ -3208,6 +3450,10 @@ class Coordinator:
                 "trading_paused": self.trading_paused,
                 "ml_data_ready_sent": self._ml_data_ready_sent,
                 "exit_intel_promotion_sent": self._exit_intel_promotion_sent,
+                "health_breach_counts": {
+                    str(key): max(0, int(value))
+                    for key, value in self._health_breach_counts.items()
+                },
             }
             async with write_gate():
                 async with pool.connection() as conn:
@@ -3278,12 +3524,24 @@ class Coordinator:
                     self._exit_intel_promotion_sent = state.get(
                         "exit_intel_promotion_sent", False
                     )
+                    raw_health_counts = state.get("health_breach_counts", {})
+                    if isinstance(raw_health_counts, dict):
+                        restored_health_counts: dict[str, int] = {}
+                        for key, value in raw_health_counts.items():
+                            try:
+                                restored_health_counts[str(key)] = max(0, int(value))
+                            except (TypeError, ValueError):
+                                continue
+                        self._health_breach_counts = restored_health_counts
+                    else:
+                        self._health_breach_counts = {}
                     logger.info("coordinator.state_restored",
                                 paper_bankroll=self.paper_sizer.bankroll,
                                 live_bankroll=self.live_sizer.bankroll,
                                 trading_mode=self.trading_mode)
                 else:
                     self._apply_sizer_state(self.paper_sizer, state)
+                    self._health_breach_counts = {}
                     logger.info("coordinator.state_restored_legacy",
                                 bankroll=self.paper_sizer.bankroll)
             else:
