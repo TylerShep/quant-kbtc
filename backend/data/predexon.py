@@ -5,6 +5,7 @@ Used exclusively for bootstrapping ob_snapshots on first startup.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Optional
 
@@ -17,6 +18,10 @@ logger = structlog.get_logger(__name__)
 
 PAGE_LIMIT = 200
 RATE_SLEEP = 0.25  # 4 req/s conservative
+
+# Module-level dedup cache for predexon.fetch_failed logs. See call site
+# below in iter_ob_snapshots for rationale.
+_PREDEXON_LOG_DEDUP: dict = {}
 
 
 class PredexonClient:
@@ -56,7 +61,31 @@ class PredexonClient:
                     r.raise_for_status()
                     data = r.json()
                 except Exception as e:
-                    logger.error("predexon.fetch_failed", ticker=ticker, error=str(e))
+                    # 2026-05-06 (BUG-035 follow-up): rate-limit to once
+                    # per (ticker, error_class) per 5 min. Pre-fix, when
+                    # Predexon's API returned 429s for many stale tickers,
+                    # this fired ~141 times in 5 minutes (one per stale
+                    # ticker per sync iteration), each line carrying the
+                    # full URL + MDN docs string. Combined with structlog
+                    # JSON encoding overhead per call, it noticeably
+                    # added to the event-loop pressure that the BUG-035
+                    # incident investigation was already chasing.
+                    err_class = type(e).__name__
+                    err_str = str(e)
+                    # Cheap status-code bucket so 429 vs 422 are dedup'd
+                    # separately even for the same ticker.
+                    if "429" in err_str:
+                        err_class += ":429"
+                    elif "422" in err_str:
+                        err_class += ":422"
+                    elif "401" in err_str or "403" in err_str:
+                        err_class += ":auth"
+                    log_key = (ticker, err_class)
+                    last = _PREDEXON_LOG_DEDUP.get(log_key)
+                    now_t = time.time()
+                    if last is None or (now_t - last) > 300.0:
+                        _PREDEXON_LOG_DEDUP[log_key] = now_t
+                        logger.error("predexon.fetch_failed", ticker=ticker, error=err_str)
                     break
                 for snap in data.get("snapshots", []):
                     yield snap

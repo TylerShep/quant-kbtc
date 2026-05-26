@@ -88,6 +88,22 @@ class KalshiRESTClient:
             if not markets:
                 return None
 
+            # 2026-05-06 (BUG-035 follow-up): Kalshi's ``status=open`` filter
+            # is not strict enough -- the API has been observed returning
+            # markets whose ``close_time`` is several hours in the past
+            # (still in "open but settling" state). Picking the soonest of
+            # those resolves to a dead contract, the bot subscribes to a
+            # quiet ticker, and no entries can fire. Strict-filter to
+            # close_time strictly in the future before picking.
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            markets = [
+                m for m in markets
+                if m.get("close_time") and m["close_time"] > now_iso
+            ]
+            if not markets:
+                return None
+
             spot = await self._fetch_spot(symbol)
             soonest = min(m.get("close_time", "9999") for m in markets)
             batch = [m for m in markets if m.get("close_time") == soonest]

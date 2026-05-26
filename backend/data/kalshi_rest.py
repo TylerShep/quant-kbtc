@@ -181,6 +181,69 @@ class KalshiHistoricalClient:
         if page >= max_pages:
             logger.warning("kalshi_live.trades_max_pages_reached", max_pages=max_pages)
 
+    async def iter_settled_markets(
+        self,
+        series_ticker: str = SERIES,
+        min_close_time: Optional[datetime] = None,
+        max_pages: int = DEFAULT_MAX_PAGES,
+    ) -> AsyncIterator[tuple[dict, str]]:
+        """Paginate GET /markets?status=settled for series_ticker.
+
+        Supplements iter_historical_markets() — the /historical/markets
+        endpoint lags ~2 months behind present, so recent settlements
+        (April 2026 onwards as of May 2026) require this endpoint instead.
+
+        Returns markets newest-first. Stops early once close_time drops
+        below min_close_time so the caller can bound the scan.
+        """
+        cursor = None
+        page = 0
+        while page < max_pages:
+            params: dict = {
+                "series_ticker": series_ticker,
+                "status": "settled",
+                "limit": PAGE_LIMIT,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            data = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    data = await self._get("/markets", params)
+                    break
+                except Exception as e:
+                    logger.warning("kalshi_live.settled_fetch_retry",
+                                   attempt=attempt, error=str(e))
+                    if attempt == MAX_RETRIES:
+                        logger.error("kalshi_live.settled_fetch_failed",
+                                     error=str(e), page=page)
+                        return
+                    await asyncio.sleep(2 ** attempt)
+
+            next_cursor = data.get("cursor", "")
+            stop = False
+            for m in data.get("markets", []):
+                if min_close_time:
+                    ct_str = m.get("close_time") or m.get("latest_expiration_time", "")
+                    if ct_str:
+                        ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                        if ct < min_close_time:
+                            stop = True
+                            break
+                yield m, next_cursor
+
+            if stop:
+                break
+            cursor = next_cursor
+            if not cursor:
+                break
+            page += 1
+            await asyncio.sleep(RATE_LIMIT_SLEEP)
+
+        if page >= max_pages:
+            logger.warning("kalshi_live.settled_max_pages_reached", max_pages=max_pages)
+
     async def get_active_tickers(self, series_ticker: str = SERIES) -> list[str]:
         """Fetch currently active (non-settled) KXBTC tickers from Kalshi API."""
         tickers = []

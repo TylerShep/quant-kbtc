@@ -27,6 +27,9 @@ MAX_SHIFT = {
     "risk_per_trade_pct": 0.005,
     "stop_loss_pct": 0.005,
     "profit_target_mult": 0.25,
+    "hard_stop_loss_pct": 0.20,
+    "paper_same_side_cooldown_sec": 120.0,
+    "health_score_threshold": 20.0,
 }
 
 MIN_EDGE_CONSISTENCY = 0.5
@@ -58,6 +61,9 @@ def get_current_params() -> dict:
         "risk_per_trade_pct": settings.risk.risk_per_trade_pct,
         "stop_loss_pct": settings.risk.stop_loss_pct,
         "profit_target_mult": settings.risk.profit_target_mult,
+        "hard_stop_loss_pct": settings.risk.hard_stop_loss_pct,
+        "paper_same_side_cooldown_sec": settings.bot.paper_same_side_cooldown_sec,
+        "health_score_threshold": settings.bot.health_score_threshold,
     }
 
 
@@ -66,6 +72,21 @@ def build_param_space(current: dict) -> dict:
     def _range(val, step, n=2):
         return sorted(set(round(val + step * i, 6) for i in range(-n, n + 1)))
 
+    hs_vals = [
+        max(0.0, min(0.5, v))
+        for v in _range(current["hard_stop_loss_pct"], 0.1, n=2)
+    ]
+    cooldown_vals = sorted(
+        set(
+            max(0.0, current["paper_same_side_cooldown_sec"] + 30.0 * i)
+            for i in range(-2, 3)
+        )
+    )
+    health_vals = [
+        max(0.0, min(100.0, v))
+        for v in _range(current["health_score_threshold"], 5.0, n=2)
+    ]
+
     return {
         "risk_per_trade_pct": _range(current["risk_per_trade_pct"], 0.005),
         "stop_loss_pct": _range(current["stop_loss_pct"], 0.005),
@@ -73,6 +94,9 @@ def build_param_space(current: dict) -> dict:
         "short_threshold": _range(current["short_threshold"], 0.025),
         "roc_lookback": list(range(max(1, current["roc_lookback"] - 2),
                                    current["roc_lookback"] + 3)),
+        "hard_stop_loss_pct": hs_vals,
+        "paper_same_side_cooldown_sec": cooldown_vals,
+        "health_score_threshold": health_vals,
     }
 
 
@@ -184,7 +208,7 @@ async def persist_recommendation(pool, result: TuningResult) -> None:
 
 async def run_tuning_cycle(
     candles: list[dict],
-    ob_history: dict,
+    contract_timelines: dict,
     pool=None,
     auto_apply: bool = False,
 ) -> TuningResult:
@@ -210,9 +234,14 @@ async def run_tuning_cycle(
             logger.warning("auto_tuner.data_load_failed", error=str(e))
 
     optimizer = WalkForwardOptimizer(
-        candles, ob_history,
+        candles, contract_timelines,
         settlement_data=settlement_data,
         tfi_history=tfi_history,
+        base_config={
+            "mode": "paper",
+            "ml_gate_mode": "disabled",
+            "exit_fill_mode": "mark",
+        },
     )
     results = optimizer.run(param_space, objective="sharpe_ratio")
 

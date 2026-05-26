@@ -47,7 +47,7 @@ from database.connection import write_gate
 from notifications import get_notifier
 from filters.price_guard import PriceGuard
 from filters.trend_guard import TrendGuard
-from filters.edge_profile import evaluate as evaluate_edge_profile
+from filters.edge_profile import evaluate as evaluate_edge_profile, evaluate_paper as evaluate_paper_edge
 from ml.feature_capture import extract_features, save_features, label_trade
 from ml.inference import ml_gate
 from data.historical_sync import HistoricalSync
@@ -79,6 +79,86 @@ def _bg_persist_max_env_default() -> int:
         return v if v > 0 else 96
     except ValueError:
         return 96
+
+
+# 2026-05-05 (BUG-035): parse the ticker-encoded close time so we can tell
+# whether a restored / orphaned position belongs to a contract that has
+# already settled. The Kalshi format is reliable enough for this purpose:
+#   KX{SYMBOL}-{YY}{MMM}{DD}{HH}-{B|T}{strike}
+# e.g. ``KXBTC-26MAY0510-B81350`` closes at 10:00 *ET* on 2026-05-05,
+# which is 14:00 UTC during EDT or 15:00 UTC during EST.
+#
+# 2026-05-06 (BUG-035 follow-up): the encoded HOUR is in **Eastern Time**,
+# not UTC. The earlier UTC interpretation made every ticker appear 4-5
+# hours earlier than its actual Kalshi ``close_time``, which caused the
+# entry-side guard to reject all valid markets for the entire window
+# (4-5 hours per session) and the paper-side watchdog to prematurely
+# force-close 9 paper positions on 2026-05-06 (-$130 net synthetic loss).
+# Use ``zoneinfo("America/New_York")`` so DST handoffs are automatic.
+# Returns ``None`` for any ticker that doesn't match the expected shape so
+# callers can fall back to "treat as live" instead of mis-parsing into a
+# false stale verdict.
+import re as _re_ticker_close
+from functools import lru_cache
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo  # py>=3.9 stdlib
+    _ET_TZ = _ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - fallback if tzdata missing
+    _ET_TZ = timezone(timedelta(hours=-5))  # conservative EST fallback
+
+_TICKER_CLOSE_RE = _re_ticker_close.compile(
+    r"^KX[A-Z]+-(\d{2})([A-Z]{3})(\d{2})(\d{2})-[BT].+$"
+)
+_MONTH_ABBR_TO_NUM = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+# 2026-05-06 (BUG-035 follow-up #2): the parser was being called on
+# *every* market tick from two hot paths -- the paper-position watchdog
+# in ``_run_settlement_guards`` and the entry-side stale-ticker guard in
+# ``_evaluate_entry_for``. py-spy showed it eating ~20% of MainThread
+# CPU after the BUG-035 fixes shipped (regex match + str.upper() +
+# ZoneInfo datetime + .astimezone() per call), pushing the loop over
+# budget so the Coinbase WS couldn't service its keepalive ping. The
+# function is pure -- same ticker string in, same UTC datetime out --
+# so an LRU cache is correct. Tickers are bounded (96/day per symbol)
+# so 256 entries is comfortably oversized; older entries are auto-evicted.
+@lru_cache(maxsize=256)
+def _ticker_close_time(ticker: str) -> Optional[datetime]:
+    """Parse the close time from a Kalshi ticker string. Returns None on any
+    parse failure (unknown format, bad month abbrev, invalid date).
+
+    The encoded hour is **Eastern Time** (with DST). Returned datetime is
+    always normalised to UTC so downstream comparisons against
+    ``datetime.now(timezone.utc)`` are correct year-round.
+
+    Cached: same ticker string always yields the same close time, so the
+    LRU cache (size 256) keeps this O(1) on the hot per-tick paths.
+    """
+    if not ticker:
+        return None
+    m = _TICKER_CLOSE_RE.match(ticker.upper())
+    if not m:
+        return None
+    yy, mmm, dd, hh = m.groups()
+    month = _MONTH_ABBR_TO_NUM.get(mmm)
+    if month is None:
+        return None
+    try:
+        et_dt = datetime(
+            year=2000 + int(yy),
+            month=month,
+            day=int(dd),
+            hour=int(hh),
+            minute=0,
+            second=0,
+            tzinfo=_ET_TZ,
+        )
+    except ValueError:
+        return None
+    return et_dt.astimezone(timezone.utc)
 
 
 class Coordinator:
@@ -120,6 +200,23 @@ class Coordinator:
         self._last_live_decision = None
         self._last_paper_exit_tick = -999
         self._last_live_exit_tick = -999
+        # BUG-035 (2026-05-05): wall-clock companion to ``_last_paper_exit_tick``.
+        # The tick-based gate (``ticks_since_exit > 100``) was ~3s at 30Hz
+        # tick rate, which left a HARD_STOP_LOSS rapid-fire loop free to
+        # re-enter immediately on the next favourable ask. The wall-clock
+        # cooldown is bounded by ``settings.bot.paper_reentry_cooldown_sec``
+        # (default 5s) so the book has time to breathe.
+        self._last_paper_exit_wall_ts: float = 0.0
+        # BUG-036 (2026-05-06): per-(ticker, direction) cooldown for paper
+        # re-entries. The 5s wall-clock cooldown above is global ("don't
+        # re-enter ANY paper trade for 5s") which the 17:04-17:05 incident
+        # showed was insufficient — the bot lost the same KXBTC long 7
+        # times in 86s because OBI stayed pinned bullish on the same
+        # ticker every 8-30s. We now also require ``paper_same_side_cooldown_sec``
+        # (default 60s) between exits and re-entries on the same
+        # (ticker, direction) tuple. Keys are tuples; values are the
+        # wall-clock ts of the last exit on that pair.
+        self._last_paper_exit_per_pair: dict[tuple[str, str], float] = {}
         self._last_regime: Optional[str] = None
         self._cb_was_halted = False
         self._recent_exit_times: list[float] = []
@@ -153,9 +250,10 @@ class Coordinator:
         # broadcasting every tick (up to ~30 Hz during ticker rotation)
         # was queueing serialized snapshots that the dashboard would just
         # collapse + drop client-side anyway, while pinning RSS in the
-        # bg-persist queue. 5 Hz keeps the UI fluid without the spam.
+        # bg-persist queue. 1 Hz is plenty for a human dashboard and
+        # keeps the event loop from saturating on JSON serialisation.
         self._last_broadcast_ts: float = 0.0
-        self._broadcast_min_interval_sec: float = 0.2  # 5 Hz
+        self._broadcast_min_interval_sec: float = 1.0  # 1 Hz
 
         # 2026-05-04 (BUG-032 follow-up): generic rate-limit cache for
         # noisy per-tick log lines. A sustained signal during the
@@ -498,6 +596,50 @@ class Coordinator:
         is_live = mode == "live"
         pm_busy = is_live and self.live_trader.position_manager.is_busy
 
+        # 2026-05-05 (BUG-035): "outlived contract" watchdog. Settlement
+        # below requires ``pos.ticker == state.kalshi_ticker``, but the
+        # data layer rotates ``state.kalshi_ticker`` to the new active
+        # contract on every tick (manager._notify, line ~355) -- so a
+        # ``lifecycle_settled`` event for the *old* contract races with
+        # the rotation and is overwritten before this guard can match.
+        # When that happens the position becomes permanently un-settleable
+        # and the EXPIRY_GUARD branch below spams ``skip_no_liquidity``
+        # at ~23 Hz forever, saturating the event loop.
+        #
+        # Fail-safe: parse the position's ticker-encoded close_time. Once
+        # the contract has been closed for a small grace window (gives the
+        # normal settlement path a chance to land first) and we still hold
+        # the position, force-close it as a no-PnL synthetic settlement so
+        # the lane unblocks. Live lane is handled by the position manager's
+        # orphan/reconciliation paths -- this watchdog is paper-only.
+        if (not is_live and trader.has_position and not pm_busy):
+            pos = trader.position
+            close_time = _ticker_close_time(pos.ticker) if pos else None
+            if close_time is not None:
+                age_sec = (datetime.now(timezone.utc) - close_time).total_seconds()
+                if age_sec > settings.bot.stale_paper_grace_sec:
+                    logger.warning(
+                        "coordinator.paper_position_stale_cleanup",
+                        ticker=pos.ticker,
+                        contract_close_utc=close_time.isoformat(),
+                        closed_seconds_ago=int(age_sec),
+                        direction=pos.direction,
+                        contracts=pos.contracts,
+                        entry_price=pos.entry_price,
+                        mode=mode,
+                    )
+                    # Exit at entry price (zero PnL before fees) so attribution
+                    # isn't polluted by a fictional outcome. Tag with a
+                    # dedicated reason so dashboards / attribution can filter.
+                    trade = trader.exit(
+                        pos.entry_price,
+                        "STALE_TICKER_CLEANUP",
+                        fill_source="paper_stale_cleanup",
+                    )
+                    if trade:
+                        self._on_trade_exit(trade, symbol, mode)
+                    return
+
         if state.resolved and trader.has_position and not pm_busy:
             pos = trader.position
             settled_ticker = state.kalshi_ticker
@@ -546,9 +688,20 @@ class Coordinator:
                     # close the trade through the normal settlement path.
                     exec_price = self._get_executable_exit_price_for(state, trader)
                     if exec_price is None:
-                        logger.info("coordinator.short_settlement_guard.skip_no_liquidity",
-                                    ticker=pos.ticker, entry=pos.entry_price,
-                                    remaining_sec=state.time_remaining_sec, mode=mode)
+                        # BUG-035: rate-limit to 30s/key. The 2026-05-05
+                        # incident saw the EXPIRY_GUARD sibling spam ~23
+                        # lines/sec for hours when a paper position
+                        # outlived its contract; the watchdog above now
+                        # cleans those up but the rate-limit is defense
+                        # in depth against any future tight loop.
+                        log_key = ("paper_short_guard_skip", pos.ticker, mode)
+                        last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                        now_t = time.time()
+                        if last_logged is None or (now_t - last_logged) > 30.0:
+                            self._tfi_downgrade_log_cache[log_key] = now_t
+                            logger.info("coordinator.short_settlement_guard.skip_no_liquidity",
+                                        ticker=pos.ticker, entry=pos.entry_price,
+                                        remaining_sec=state.time_remaining_sec, mode=mode)
                     elif exec_price > pos.entry_price:
                         logger.info("coordinator.short_settlement_guard",
                                     ticker=pos.ticker, entry=pos.entry_price,
@@ -613,9 +766,22 @@ class Coordinator:
                     # synthetic fill and let settlement resolve the trade.
                     exec_price = self._get_executable_exit_price_for(state, trader)
                     if exec_price is None:
-                        logger.info("coordinator.expiry_guard.skip_no_liquidity",
-                                    ticker=pos.ticker, entry=pos.entry_price,
-                                    remaining_sec=state.time_remaining_sec, mode=mode)
+                        # BUG-035: rate-limit to 30s/key. Pre-fix, this log
+                        # spammed ~23 lines/sec for ~7.5h when a paper
+                        # position outlived its contract -- driving CPU
+                        # to 100%, breaking websocket keepalives, and
+                        # starving the DB pool. The watchdog at the top
+                        # of this function now cleans up the root cause;
+                        # this rate-limit prevents any future tight loop
+                        # in the same code path from melting the bot.
+                        log_key = ("paper_expiry_guard_skip", pos.ticker, mode)
+                        last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                        now_t = time.time()
+                        if last_logged is None or (now_t - last_logged) > 30.0:
+                            self._tfi_downgrade_log_cache[log_key] = now_t
+                            logger.info("coordinator.expiry_guard.skip_no_liquidity",
+                                        ticker=pos.ticker, entry=pos.entry_price,
+                                        remaining_sec=state.time_remaining_sec, mode=mode)
                     else:
                         trade = trader.exit(
                             exec_price,
@@ -655,7 +821,16 @@ class Coordinator:
         if not trader.has_position and not near_expiry:
             ticks_since_exit = self._tick_count - self._last_paper_exit_tick
             book_healthy = self._is_book_healthy(state)
-            if ticks_since_exit > 100 and book_healthy:
+            # BUG-035 (2026-05-05): wall-clock cooldown in addition to
+            # the tick-count gate. The 100-tick gate is only ~3s at
+            # 30Hz which left a HARD_STOP_LOSS rapid-fire loop free to
+            # re-enter on the next favourable ask; the resulting trade
+            # storm pinned CPU at 100%. Default 5s; tunable via
+            # PAPER_REENTRY_COOLDOWN_SEC.
+            now_t = time.time()
+            cooldown_ok = (now_t - self._last_paper_exit_wall_ts
+                           >= settings.bot.paper_reentry_cooldown_sec)
+            if ticks_since_exit > 100 and book_healthy and cooldown_ok:
                 self._evaluate_entry_for(
                     symbol, state, features, regime,
                     trader, sizer, breaker, "paper",
@@ -731,6 +906,16 @@ class Coordinator:
                 }))
         else:
             self._last_paper_exit_tick = self._tick_count
+            # BUG-035: wall-clock cooldown so HARD_STOP_LOSS rapid-fire
+            # loops can't whip the bot into 100% CPU.
+            now_ts = time.time()
+            self._last_paper_exit_wall_ts = now_ts
+            # BUG-036: also remember per-(ticker, direction) so the
+            # entry guard can refuse re-entry on the same losing setup.
+            ticker = getattr(trade, "ticker", "") or ""
+            direction = getattr(trade, "direction", "") or ""
+            if ticker and direction:
+                self._last_paper_exit_per_pair[(ticker, direction)] = now_ts
 
         position_uid = getattr(trade, "position_uid", "") or ""
         if position_uid:
@@ -1489,6 +1674,32 @@ class Coordinator:
     def _evaluate_entry_for(self, symbol: str, state, features, regime: str,
                             trader, sizer: PositionSizer,
                             breaker: CircuitBreaker, mode: str) -> None:
+        # BUG-035 (2026-05-05) entry-side hardening: reject any active
+        # ticker whose ticker-encoded close_time is in the past. This
+        # closes a feedback loop where ``kalshi_ws._resolve_tickers`` can
+        # transiently surface a just-closed contract as "active" (e.g.
+        # during the gap between expiring contracts overnight, or while a
+        # fresh contract is still being created server-side). Without this
+        # guard the bot enters → BUG-035 watchdog cleans up → entry path
+        # immediately retries → spin loop. We log at WARNING with a 30s
+        # rate limit so a long stale window is observable but not noisy.
+        active_ticker = state.kalshi_ticker if hasattr(state, "kalshi_ticker") else None
+        close_time = _ticker_close_time(active_ticker) if active_ticker else None
+        if close_time is not None and close_time <= datetime.now(timezone.utc):
+            log_key = ("stale_active_ticker_skip", active_ticker, mode)
+            last_logged = self._tfi_downgrade_log_cache.get(log_key)
+            now_t = time.time()
+            if last_logged is None or (now_t - last_logged) > 30.0:
+                self._tfi_downgrade_log_cache[log_key] = now_t
+                logger.warning(
+                    "coordinator.entry_skip_stale_active_ticker",
+                    ticker=active_ticker,
+                    contract_close_utc=close_time.isoformat(),
+                    closed_seconds_ago=int((datetime.now(timezone.utc) - close_time).total_seconds()),
+                    mode=mode,
+                )
+            return
+
         can_trade, halt_reason = breaker.can_trade()
 
         if mode == "live":
@@ -1664,6 +1875,108 @@ class Coordinator:
                     logger.info("coordinator.edge_profile_rejected",
                                 reason=edge_reason, mode=mode, direction=pre_dir,
                                 driver=decision.signal_driver)
+
+        # Paper-lane edge gate (P1/P2 fix, 2026-05-26).
+        # When EDGE_PAPER_LONG_ONLY=true and/or EDGE_PAPER_ALLOWED_DRIVERS is
+        # set, the paper lane mirrors the live edge profile so paper PnL is a
+        # realistic proxy for what the live bot would earn.  By default both
+        # flags are unset and this block is a no-op (paper collects full-
+        # strategy data for ML training).
+        if (
+            mode == "paper"
+            and decision.should_trade_in(mode)
+            and (
+                settings.edge_profile.paper_long_only
+                or settings.edge_profile.paper_allowed_drivers
+                or settings.edge_profile.paper_blocked_hours_utc
+            )
+        ):
+            paper_ok, paper_reason = evaluate_paper_edge(
+                decision=decision,
+                now_utc=datetime.fromtimestamp(time.time(), tz=timezone.utc),
+            )
+            if not paper_ok:
+                pre_dir = decision.direction.value if decision.direction else None
+                decision = decision.with_conviction(
+                    Conviction.NONE, skip_reason=paper_reason,
+                )
+                log_key = ("paper_edge", mode, pre_dir, paper_reason)
+                last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                now_t = time.time()
+                if last_logged is None or (now_t - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache[log_key] = now_t
+                    logger.info(
+                        "coordinator.paper_edge_rejected",
+                        reason=paper_reason,
+                        mode=mode,
+                        direction=pre_dir,
+                        driver=decision.signal_driver,
+                    )
+
+        # BUG-036 (2026-05-06): per-(ticker, direction) re-entry cooldown.
+        # The 2026-05-06 incident saw the bot lose the same long on
+        # KXBTC-26MAY0614-B81650 seven times in 86 seconds because the
+        # global 5s wall-clock cooldown didn't prevent re-entering the
+        # same losing setup once OBI re-pinned bullish on the same book.
+        # Once HARD_STOP_LOSS was the dominant exit reason, this turned a
+        # single losing thesis into 7 realised losses. Gate paper
+        # re-entries on the same (ticker, direction) tuple by a longer
+        # wall-clock cooldown (default 60s == one full ATR cycle on the
+        # 15-min binary). Live lane is supervised and uses live_trade_limit
+        # so we don't add the same gate there.
+        if (mode == "paper"
+                and decision.should_trade_in(mode)
+                and decision.direction is not None):
+            ticker = getattr(state, "kalshi_ticker", "") or ""
+            direction = decision.direction.value.strip().lower()
+            (
+                same_thesis_allowed,
+                lock_age_sec,
+                same_side_cooldown_sec,
+                unlocked_by_flip,
+                unlocked_by_expiry,
+            ) = self._paper_same_thesis_gate(ticker, direction)
+            if unlocked_by_flip:
+                log_key = ("paper_thesis_flip_unlock", ticker, direction)
+                last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                now_t = time.time()
+                if last_logged is None or (now_t - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache[log_key] = now_t
+                    logger.info(
+                        "coordinator.paper_thesis_lock_released_flip",
+                        ticker=ticker,
+                        direction=direction,
+                        mode=mode,
+                    )
+            if unlocked_by_expiry:
+                log_key = ("paper_thesis_expiry_unlock", ticker, direction)
+                last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                now_t = time.time()
+                if last_logged is None or (now_t - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache[log_key] = now_t
+                    logger.info(
+                        "coordinator.paper_thesis_lock_released_expiry",
+                        ticker=ticker,
+                        direction=direction,
+                        cooldown_sec=same_side_cooldown_sec,
+                        mode=mode,
+                    )
+            if not same_thesis_allowed:
+                log_key = ("paper_same_side_cooldown",
+                           ticker, direction)
+                last_logged = self._tfi_downgrade_log_cache.get(log_key)
+                now_t = time.time()
+                if last_logged is None or (now_t - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache[log_key] = now_t
+                    logger.info(
+                        "coordinator.paper_same_side_cooldown_skip",
+                        ticker=ticker,
+                        direction=direction,
+                        seconds_since_exit=round(lock_age_sec, 1),
+                        cooldown_sec=same_side_cooldown_sec,
+                        mode=mode,
+                    )
+                return
 
         if decision.should_trade_in(mode):
             entry_price = self._get_entry_price(state, decision.direction)
@@ -1918,6 +2231,8 @@ class Coordinator:
         health_score: Optional[float] = None
         health_components: Optional[HealthComponents] = None
         health_breach_count = 0
+        health_confirmation_required = bool(settings.bot.health_exit_confirmation_enabled)
+        health_confirmation_met = not health_confirmation_required
         if settings.bot.exit_intelligence_enabled:
             health_score, health_components = compute_position_health_score(
                 direction=pos.direction,
@@ -1946,6 +2261,12 @@ class Coordinator:
             self._health_breach_counts[position_key] = health_breach_count
 
             breach_ticks_required = max(1, settings.bot.health_score_breach_ticks)
+            if health_breach_count >= breach_ticks_required:
+                health_confirmation_met = self._health_exit_confirmation_met(
+                    pos=pos,
+                    current_obi=features.obi,
+                    current_roc=current_roc,
+                )
             self._last_health_snapshot[mode] = {
                 "position_uid": self._position_uid_for(pos),
                 "ticker": pos.ticker,
@@ -1955,6 +2276,8 @@ class Coordinator:
                 "breach_count": health_breach_count,
                 "breach_ticks_required": breach_ticks_required,
                 "shadow_only": settings.bot.exit_intelligence_shadow_only,
+                "confirmation_required": health_confirmation_required,
+                "confirmation_met": health_confirmation_met,
                 "components": (
                     health_components.to_dict() if health_components else None
                 ),
@@ -1972,15 +2295,29 @@ class Coordinator:
                             breach_count=health_breach_count,
                         )
                 else:
-                    health_exit_reason = "HEALTH_SCORE_DECAY"
-                    if health_breach_count == breach_ticks_required:
+                    if health_confirmation_met:
+                        health_exit_reason = "HEALTH_SCORE_DECAY"
+                        if health_breach_count == breach_ticks_required:
+                            logger.info(
+                                "coordinator.health_score_exit_triggered",
+                                mode=mode,
+                                ticker=pos.ticker,
+                                score=health_score,
+                                threshold=threshold,
+                                breach_count=health_breach_count,
+                            )
+                    elif health_breach_count == breach_ticks_required:
                         logger.info(
-                            "coordinator.health_score_exit_triggered",
+                            "coordinator.health_score_breach_waiting_confirmation",
                             mode=mode,
                             ticker=pos.ticker,
                             score=health_score,
                             threshold=threshold,
                             breach_count=health_breach_count,
+                            current_obi=features.obi,
+                            current_roc=current_roc,
+                            entry_obi=pos.entry_obi,
+                            entry_roc=pos.entry_roc,
                         )
         else:
             self._last_health_snapshot[mode] = None
@@ -2145,14 +2482,25 @@ class Coordinator:
         if kalshi_ws and kalshi_ws.last_message_time is not None:
             age = now - kalshi_ws.last_message_time
             if age > 60:
-                logger.warning("coordinator.kalshi_stale", age_sec=round(age, 1))
+                # BUG-035: rate-limit at 30s/key. Pre-fix, when the WS
+                # connection died this fired ~14/sec from every entry
+                # evaluation tick, contributing to the same CPU saturation
+                # the rest of BUG-035 was designed to prevent.
+                last_logged = self._tfi_downgrade_log_cache.get("kalshi_stale")
+                if last_logged is None or (now - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache["kalshi_stale"] = now
+                    logger.warning("coordinator.kalshi_stale", age_sec=round(age, 1))
                 return False
 
         spot_ws = self.data_manager._spot_ws
         if spot_ws and spot_ws.last_message_time is not None:
             age = now - spot_ws.last_message_time
             if age > 60:
-                logger.warning("coordinator.spot_stale", age_sec=round(age, 1))
+                # Same rate-limit treatment as kalshi_stale above.
+                last_logged = self._tfi_downgrade_log_cache.get("spot_stale")
+                if last_logged is None or (now - last_logged) > 30.0:
+                    self._tfi_downgrade_log_cache["spot_stale"] = now
+                    logger.warning("coordinator.spot_stale", age_sec=round(age, 1))
                 return False
         elif spot_ws and spot_ws.last_message_time is None:
             return False
@@ -2177,6 +2525,76 @@ class Coordinator:
         if strike is None:
             return None
         return abs(strike - spot_price)
+
+    @staticmethod
+    def _opposite_direction(direction: str) -> Optional[str]:
+        d = (direction or "").strip().lower()
+        if d == "long":
+            return "short"
+        if d == "short":
+            return "long"
+        return None
+
+    def _paper_same_thesis_gate(self, ticker: str, direction: str) -> tuple[bool, float, float, bool, bool]:
+        """
+        Returns:
+            (allowed, age_sec, cooldown_sec, unlocked_by_flip, unlocked_by_expiry)
+        """
+        cooldown_sec = max(0.0, float(settings.bot.paper_same_side_cooldown_sec))
+        if (
+            not ticker
+            or direction not in {"long", "short"}
+            or cooldown_sec <= 0.0
+        ):
+            return True, 0.0, cooldown_sec, False, False
+
+        now_t = time.time()
+        unlocked_by_flip = False
+        if settings.bot.paper_thesis_flip_unlock_enabled:
+            opposite = self._opposite_direction(direction)
+            if opposite is not None:
+                opposite_key = (ticker, opposite)
+                if opposite_key in self._last_paper_exit_per_pair:
+                    self._last_paper_exit_per_pair.pop(opposite_key, None)
+                    unlocked_by_flip = True
+
+        pair_key = (ticker, direction)
+        last_pair_exit = self._last_paper_exit_per_pair.get(pair_key)
+        if last_pair_exit is None:
+            return True, 0.0, cooldown_sec, unlocked_by_flip, False
+
+        age = now_t - float(last_pair_exit)
+        if age >= cooldown_sec:
+            self._last_paper_exit_per_pair.pop(pair_key, None)
+            return True, age, cooldown_sec, unlocked_by_flip, True
+        return False, age, cooldown_sec, unlocked_by_flip, False
+
+    def _health_exit_confirmation_met(self, pos, current_obi: float, current_roc: Optional[float]) -> bool:
+        if not settings.bot.health_exit_confirmation_enabled:
+            return True
+
+        roc_delta = max(0.0, float(settings.bot.health_exit_confirmation_roc_delta))
+        obi_delta = max(0.0, float(settings.bot.health_exit_confirmation_obi_delta))
+        neutral_obi = max(
+            0.0,
+            min(1.0, float(settings.bot.health_exit_confirmation_neutral_obi)),
+        )
+        entry_obi = float(getattr(pos, "entry_obi", neutral_obi))
+        entry_roc = float(getattr(pos, "entry_roc", 0.0))
+        roc_now = (
+            float(current_roc)
+            if isinstance(current_roc, (int, float))
+            else None
+        )
+
+        if pos.direction == "long":
+            roc_deteriorated = roc_now is not None and roc_now <= (entry_roc - roc_delta)
+            obi_deteriorated = current_obi <= min(neutral_obi, entry_obi - obi_delta)
+            return roc_deteriorated or obi_deteriorated
+
+        roc_deteriorated = roc_now is not None and roc_now >= (entry_roc + roc_delta)
+        obi_deteriorated = current_obi >= max(neutral_obi, entry_obi + obi_delta)
+        return roc_deteriorated or obi_deteriorated
 
     @staticmethod
     def _get_order_book_for_ticker(state, ticker: str):
@@ -2492,7 +2910,11 @@ class Coordinator:
                 pool = self._pool
                 if pool is None:
                     continue
-                from backtesting.data_loader import load_candles_db, load_ob_snapshots_db
+                from backtesting.data_loader import (
+                    load_candles_db,
+                    load_contract_timelines_db,
+                    load_settlement_outcomes_db,
+                )
                 candles = await load_candles_db(pool, symbol="BTC", source="live_spot,binance")
                 if len(candles) < min_candles:
                     logger.info("coordinator.tuning_skipped", reason="insufficient_candles",
@@ -2506,10 +2928,30 @@ class Coordinator:
                     last_summary_date = datetime.now(timezone.utc).date()
                     continue
 
-                ob_history = await load_ob_snapshots_db(pool)
+                start_ts = candles[0]["timestamp"]
+                end_ts = candles[-1]["timestamp"] + 900.0
+                contract_timelines = await load_contract_timelines_db(
+                    pool,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    series="KXBTC",
+                )
+                settlement_data = await load_settlement_outcomes_db(
+                    pool,
+                    start_ts=start_ts - 86400.0,
+                    end_ts=end_ts + 86400.0,
+                    series="KXBTC",
+                )
+                for ticker, meta in settlement_data.items():
+                    timeline = contract_timelines.get(ticker)
+                    if timeline is None:
+                        continue
+                    timeline.close_time = meta.get("close_time")
+                    timeline.result = meta.get("result")
+                    timeline.expiration_value = meta.get("expiration_value")
                 from backtesting.auto_tuner import run_tuning_cycle
                 result = await run_tuning_cycle(
-                    candles, ob_history, pool=pool, auto_apply=False,
+                    candles, contract_timelines, pool=pool, auto_apply=False,
                 )
 
                 health_alerts: list[str] = []
@@ -3210,6 +3652,10 @@ class Coordinator:
             # DBs without migration 006 will still throw -- that is OK
             # because the migration runs as part of the same deploy.
             async with pool.connection() as conn:
+                # Use the actual entry time so that the parity checker and any
+                # analytics that join on trades.timestamp get the open time,
+                # not the close time.  closed_at still captures the close time.
+                entry_time_val = getattr(trade, "entry_time", None)
                 row = await conn.execute(
                     """INSERT INTO trades
                        (timestamp, ticker, direction, side, contracts, entry_price,
@@ -3218,10 +3664,11 @@ class Coordinator:
                         signal_driver, closed_at, trading_mode,
                         entry_cost_dollars, exit_cost_dollars,
                         wallet_pnl, pnl_drift, fill_source, position_uid)
-                       VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s,
+                       VALUES (COALESCE(%s, NOW()), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s,
                                %s, %s, %s, %s, %s, %s)
                        RETURNING id""",
                     (
+                        entry_time_val,
                         trade.ticker, trade.direction,
                         "yes" if trade.direction == "long" else "no",
                         trade.contracts, trade.entry_price, trade.exit_price,
@@ -3379,15 +3826,26 @@ class Coordinator:
         """Reconstruct the paper position from bot_state on startup.
 
         Best-effort: any exception is logged and the bot starts FLAT. Stale
-        entries (for tickers that have already settled) are dropped so we
-        don't try to manage a dead position.
+        entries (for tickers whose close_time has already passed) are dropped
+        so we don't try to manage a dead position.
+
+        2026-05-05 (BUG-035): the staleness drop used to be promised by the
+        docstring but was not implemented. The 2026-05-05 incident saw a
+        paper position on ``KXBTC-26MAY0515-B81350`` (closed 18:15 UTC)
+        survive a restart 2.5h *after* its contract had settled, then sit
+        unmanaged for another 5h while the EXPIRY_GUARD branch of
+        ``_run_settlement_guards`` spammed ``skip_no_liquidity`` ~23×/sec
+        every time a *different* (live) contract entered its own pre-close
+        window. The CPU saturation broke every websocket keepalive and
+        starved the DB pool. The ticker-encoded close time is the authoritative
+        signal here -- once it's in the past the position can never be
+        managed via normal exit/settlement paths.
         """
         try:
             pool = self._pool
             if pool is None:
                 return
             import json
-            from datetime import datetime
             async with pool.connection() as conn:
                 row = await conn.execute(
                     "SELECT value FROM bot_state WHERE key = 'paper_open_position'"
@@ -3396,6 +3854,23 @@ class Coordinator:
             if not result:
                 return
             data = result[0] if isinstance(result[0], dict) else json.loads(result[0])
+
+            ticker = data.get("ticker", "")
+            close_time = _ticker_close_time(ticker)
+            now = datetime.now(timezone.utc)
+            if close_time is not None and close_time <= now:
+                age_h = (now - close_time).total_seconds() / 3600.0
+                logger.warning(
+                    "coordinator.paper_position_stale_dropped",
+                    ticker=ticker,
+                    contract_close_utc=close_time.isoformat(),
+                    closed_hours_ago=round(age_h, 2),
+                    direction=data.get("direction"),
+                    contracts=data.get("contracts"),
+                    entry_price=data.get("entry_price"),
+                )
+                await self._clear_paper_position()
+                return
 
             try:
                 entry_time = datetime.fromisoformat(data["entry_time"])
@@ -3454,6 +3929,15 @@ class Coordinator:
                     str(key): max(0, int(value))
                     for key, value in self._health_breach_counts.items()
                 },
+                "paper_exit_per_pair": [
+                    {
+                        "ticker": ticker,
+                        "direction": direction,
+                        "exit_ts": float(exit_ts),
+                    }
+                    for (ticker, direction), exit_ts in self._last_paper_exit_per_pair.items()
+                    if ticker and direction
+                ],
             }
             async with write_gate():
                 async with pool.connection() as conn:
@@ -3535,6 +4019,21 @@ class Coordinator:
                         self._health_breach_counts = restored_health_counts
                     else:
                         self._health_breach_counts = {}
+                    raw_pair_exits = state.get("paper_exit_per_pair", [])
+                    restored_pair_exits: dict[tuple[str, str], float] = {}
+                    if isinstance(raw_pair_exits, list):
+                        for row in raw_pair_exits:
+                            if not isinstance(row, dict):
+                                continue
+                            ticker = str(row.get("ticker", "")).strip()
+                            direction = str(row.get("direction", "")).strip().lower()
+                            try:
+                                exit_ts = float(row.get("exit_ts"))
+                            except (TypeError, ValueError):
+                                continue
+                            if ticker and direction in {"long", "short"}:
+                                restored_pair_exits[(ticker, direction)] = exit_ts
+                    self._last_paper_exit_per_pair = restored_pair_exits
                     logger.info("coordinator.state_restored",
                                 paper_bankroll=self.paper_sizer.bankroll,
                                 live_bankroll=self.live_sizer.bankroll,
@@ -3542,6 +4041,7 @@ class Coordinator:
                 else:
                     self._apply_sizer_state(self.paper_sizer, state)
                     self._health_breach_counts = {}
+                    self._last_paper_exit_per_pair = {}
                     logger.info("coordinator.state_restored_legacy",
                                 bankroll=self.paper_sizer.bankroll)
             else:

@@ -35,7 +35,7 @@ Kalshi Order Book ──┘        │              │                         
 | `backend/risk/` | Position sizer (fixed fractional) and circuit breaker (daily/weekly/drawdown limits) |
 | `backend/execution/` | Paper trader (simulated fills) and live trader (Kalshi REST API) |
 | `backend/data/` | Kalshi WebSocket, Coinbase spot feed, candle aggregator |
-| `backend/backtesting/` | Simulation engine, walk-forward optimizer, auto-tuner, attribution, reports |
+| `backend/backtesting/` | Contract-price simulation engine, walk-forward optimizer, auto-tuner, attribution, reports |
 | `backend/monitoring/` | Signal health/decay monitoring (IC, win rate drift, Sharpe drift) |
 | `backend/api/` | FastAPI REST endpoints and WebSocket feed for the dashboard |
 | `frontend/` | React + TypeScript + Tailwind CSS dashboard with TradingView charts |
@@ -120,7 +120,7 @@ The bot's backtesting and tuning capabilities mature as more live data accumulat
 
 | Milestone | Data Required | What Unlocks |
 |-----------|--------------|--------------|
-| **Now** | Binance CSV (6 months, included) | Backtest strategy logic against spot BTC data; validate signal generation works |
+| **Now** | `candles` + `ob_snapshots` + `kalshi_trades` from DB | Backtest strategy logic on Kalshi contract prices (1-99c) with production guard parity |
 | **~3 weeks** | 2,000+ live candles | Auto-tuner activates (runs every 6h); walk-forward with 1 window |
 | **~2 months** | 8,000+ live candles | Walk-forward with multiple windows; statistically meaningful parameter optimization |
 | **~3 months** | 12,000+ live candles + daily attribution history | Signal drift detection; session/regime profitability trends; full attribution time series |
@@ -130,14 +130,14 @@ The bot's backtesting and tuning capabilities mature as more live data accumulat
 ```bash
 cd backend
 
-# Backtest against Binance historical data
+# Run the contract-price backtester from DB data (default path)
+python -m backtesting run --from-db --symbol BTC --series KXBTC --source live_spot,binance
+
+# Optional: CSV-only candle replay (no contract timeline unless --ob-csv is supplied)
 python -m backtesting run --csv ../data/candles_btc_15m.csv
 
-# Backtest against live collected data (once enough accumulates)
-python -m backtesting run --from-db --symbol BTC --source live_spot,binance
-
 # Walk-forward optimization
-python -m backtesting walk-forward --csv ../data/candles_btc_15m.csv
+python -m backtesting walk-forward --from-db --symbol BTC --series KXBTC
 
 # Manual tuning cycle
 python -m backtesting tune --from-db
@@ -147,6 +147,28 @@ python -m backtesting report --input backtest_reports/latest.json
 ```
 
 Results land in `backend/backtest_reports/` and are visible in the dashboard's **Backtest Results** panel. Full interactive HTML reports are accessible via the "Open full HTML report" button.
+
+Legacy spot-price simulation is retained only for reference at `backend/backtesting/spot_backtester.py` and is marked deprecated.
+
+### Contract-Price Validation Utilities
+
+```bash
+# Replay paper trades and score parity
+python ../scripts/backtest_parity_check.py \
+  --start 2026-05-05 --end 2026-05-07 \
+  --output ../backtest_reports/parity_check_latest.json
+
+# HARD_STOP sweep + counterfactual analysis
+python ../scripts/backtest_hard_stop_sweep_v2.py \
+  --start 2026-04-16 --end 2026-05-06 \
+  --counterfactual-start 2026-05-05 --counterfactual-end 2026-05-07 \
+  --output ../backtest_reports/hard_stop_sweep_v2.json
+
+# Joint walk-forward optimization for hard stop / cooldown / health threshold
+python ../scripts/walk_forward_contract_optimizer.py \
+  --start 2026-04-16 --end 2026-05-06 \
+  --output ../backtest_reports/walk_forward_contract_joint.json
+```
 
 ### Auto-Tuner (Automated)
 

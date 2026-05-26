@@ -3,11 +3,13 @@
 Backtesting CLI — run backtests, walk-forward optimization, auto-tune, and generate reports.
 
 Usage:
+    python -m backtesting run --from-db --symbol BTC --series KXBTC
     python -m backtesting run --csv data/candles_btc_15m.csv
-    python -m backtesting run --from-db --symbol BTC
-    python -m backtesting walk-forward --csv data/candles_btc_15m.csv
+    python -m backtesting walk-forward --from-db --symbol BTC --series KXBTC
     python -m backtesting tune --from-db --symbol BTC
     python -m backtesting report --input backtest_reports/latest.json
+
+`Backtester` points to the contract-price engine by default.
 """
 from __future__ import annotations
 
@@ -19,8 +21,8 @@ import time
 from pathlib import Path
 
 
-def _load_data(args) -> tuple[list[dict], dict]:
-    """Load candle + OB data from CSV or DB based on CLI flags."""
+def _load_data(args) -> tuple[list[dict], dict, dict]:
+    """Load candle + contract timeline + settlement data."""
     if getattr(args, "from_db", False):
         return _load_from_db(args)
 
@@ -37,18 +39,45 @@ def _load_data(args) -> tuple[list[dict], dict]:
         if not getattr(args, "force", False):
             sys.exit(1)
 
-    ob_history: dict = {}
+    contract_timelines: dict = {}
+    settlement_data: dict = {}
     if getattr(args, "ob_csv", None):
         print(f"Loading OB snapshots from {args.ob_csv}...")
         ob_history = _load_ob_csv(args.ob_csv)
-        print(f"  Loaded {len(ob_history)} snapshots")
+        from backtesting.contract_timeline import ContractTick, ContractTimeline
 
-    return candles, ob_history
+        ticker = getattr(args, "contract_ticker", "SIM-CONTRACT")
+        timeline = ContractTimeline(ticker=ticker)
+        for ts, snap in sorted(ob_history.items()):
+            timeline.add_tick(
+                ContractTick(
+                    timestamp=ts,
+                    ticker=ticker,
+                    mid_cents=snap.get("mid_cents"),
+                    best_bid=snap.get("best_bid"),
+                    best_ask=snap.get("best_ask"),
+                    spread_cents=snap.get("spread_cents"),
+                    obi=snap.get("obi", 0.5),
+                    total_bid_vol=snap.get("total_bid_vol", 0.0),
+                    total_ask_vol=snap.get("total_ask_vol", 0.0),
+                    source="ob_mid",
+                )
+            )
+        timeline.finalize()
+        contract_timelines[ticker] = timeline
+        print(f"  Loaded {len(timeline.ticks)} contract ticks")
+
+    return candles, contract_timelines, settlement_data
 
 
-def _load_from_db(args) -> tuple[list[dict], dict]:
-    """Load candle + OB data from the live Postgres DB."""
-    from backtesting.data_loader import load_candles_db, load_ob_snapshots_db, validate_candles
+def _load_from_db(args) -> tuple[list[dict], dict, dict]:
+    """Load candle + contract data from the live Postgres DB."""
+    from backtesting.data_loader import (
+        load_candles_db,
+        load_contract_timelines_db,
+        load_settlement_outcomes_db,
+        validate_candles,
+    )
 
     async def _fetch():
         from database import get_pool, close_pool
@@ -56,30 +85,55 @@ def _load_from_db(args) -> tuple[list[dict], dict]:
         try:
             symbol = getattr(args, "symbol", "BTC")
             source = getattr(args, "source", "live_spot,binance")
+            series = getattr(args, "series", "KXBTC")
             candles = await load_candles_db(pool, symbol=symbol, source=source)
-            ob = await load_ob_snapshots_db(pool)
-            return candles, ob
+            if not candles:
+                return candles, {}, {}
+            start_ts = candles[0]["timestamp"]
+            end_ts = candles[-1]["timestamp"] + 900.0
+            timelines = await load_contract_timelines_db(
+                pool,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                series=series,
+            )
+            settlements = await load_settlement_outcomes_db(
+                pool,
+                start_ts=start_ts - 86400.0,
+                end_ts=end_ts + 86400.0,
+                series=series,
+            )
+            for ticker, meta in settlements.items():
+                timeline = timelines.get(ticker)
+                if timeline is None:
+                    continue
+                timeline.close_time = meta.get("close_time")
+                timeline.result = meta.get("result")
+                timeline.expiration_value = meta.get("expiration_value")
+            return candles, timelines, settlements
         finally:
             await close_pool()
 
-    candles, ob_history = asyncio.run(_fetch())
+    candles, contract_timelines, settlement_data = asyncio.run(_fetch())
     validation = validate_candles(candles)
     print(f"  Loaded {validation['total_candles']} candles from DB, "
           f"{validation['date_range_days']} days, {validation['gaps']} gaps")
-    print(f"  Loaded {len(ob_history)} OB snapshots from DB")
+    total_ticks = sum(len(t.ticks) for t in contract_timelines.values())
+    print(f"  Loaded {len(contract_timelines)} contract timelines ({total_ticks} ticks)")
+    print(f"  Loaded {len(settlement_data)} settlement rows")
 
     if not validation["valid"]:
         print(f"  WARNING: insufficient candles ({validation['total_candles']})")
         if not getattr(args, "force", False):
             sys.exit(1)
 
-    return candles, ob_history
+    return candles, contract_timelines, settlement_data
 
 
 def cmd_run(args):
     from backtesting.backtester import Backtester
 
-    candles, ob_history = _load_data(args)
+    candles, contract_timelines, settlement_data = _load_data(args)
 
     config = {}
     if args.config:
@@ -87,7 +141,12 @@ def cmd_run(args):
 
     print(f"Running backtest with bankroll=${args.bankroll:,.0f}...")
     start = time.time()
-    bt = Backtester(candles, ob_history, config)
+    bt = Backtester(
+        candles,
+        contract_timelines,
+        config,
+        settlement_data=settlement_data,
+    )
     results = bt.run(bankroll=args.bankroll)
     elapsed = time.time() - start
 
@@ -127,7 +186,7 @@ def cmd_run(args):
 def cmd_walk_forward(args):
     from backtesting.walk_forward import WalkForwardOptimizer
 
-    candles, ob_history = _load_data(args)
+    candles, contract_timelines, settlement_data = _load_data(args)
 
     param_space = _default_param_space()
     if args.params:
@@ -141,7 +200,16 @@ def cmd_walk_forward(args):
     print(f"  Total combinations per window: {combos}")
 
     start = time.time()
-    optimizer = WalkForwardOptimizer(candles, ob_history)
+    optimizer = WalkForwardOptimizer(
+        candles,
+        contract_timelines,
+        settlement_data=settlement_data,
+        base_config={
+            "mode": "paper",
+            "ml_gate_mode": "disabled",
+            "exit_fill_mode": "mark",
+        },
+    )
     results = optimizer.run(param_space, objective=args.objective)
     elapsed = time.time() - start
 
@@ -213,7 +281,7 @@ def cmd_walk_forward(args):
 def cmd_tune(args):
     from backtesting.auto_tuner import run_tuning_cycle
 
-    candles, ob_history = _load_data(args)
+    candles, contract_timelines, _settlement_data = _load_data(args)
 
     auto_apply = getattr(args, "auto_apply", False)
 
@@ -224,7 +292,7 @@ def cmd_tune(args):
             pool = await get_pool()
         try:
             return await run_tuning_cycle(
-                candles, ob_history, pool=pool, auto_apply=auto_apply,
+                candles, contract_timelines, pool=pool, auto_apply=auto_apply,
             )
         finally:
             if pool:
@@ -283,11 +351,9 @@ def cmd_report(args):
 
 def _default_param_space() -> dict:
     return {
-        "risk_per_trade_pct": [0.01, 0.015, 0.02, 0.025, 0.03],
-        "stop_loss_pct": [0.015, 0.02, 0.025, 0.03],
-        "long_threshold": [0.60, 0.65, 0.70],
-        "short_threshold": [0.30, 0.35, 0.40],
-        "roc_lookback": [2, 3, 4, 5],
+        "hard_stop_loss_pct": [0.0, 0.10, 0.20, 0.30, 0.50],
+        "paper_same_side_cooldown_sec": [30.0, 60.0, 90.0, 120.0],
+        "health_score_threshold": [25.0, 35.0, 45.0],
     }
 
 
@@ -399,6 +465,7 @@ def _add_data_flags(parser):
     group.add_argument("--from-db", action="store_true", help="Load data from Postgres DB")
     parser.add_argument("--ob-csv", help="Path to OB snapshots CSV (CSV mode only)")
     parser.add_argument("--symbol", default="BTC", help="Symbol for DB queries (default: BTC)")
+    parser.add_argument("--series", default="KXBTC", help="Kalshi ticker prefix (default: KXBTC)")
     parser.add_argument("--source", default="live_spot,binance",
                         help="Comma-separated sources for DB queries (default: live_spot,binance)")
     parser.add_argument("--force", action="store_true", help="Run even with insufficient data")

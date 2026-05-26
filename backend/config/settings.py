@@ -282,6 +282,47 @@ class BotConfig:
     expiry_guard_fill_poll_timeout_sec: float = field(
         default_factory=lambda: _env_float("EXPIRY_GUARD_FILL_POLL_TIMEOUT_SEC", 5.0)
     )
+    # BUG-035 (2026-05-05): grace window after a paper position's
+    # ticker-encoded close_time before the "outlived contract" watchdog
+    # in ``_run_settlement_guards`` force-closes it. 300s gives the
+    # normal lifecycle_settled / settlement-guard path ample time to
+    # land first; only positions still open after this window become
+    # candidates for the synthetic STALE_TICKER_CLEANUP exit.
+    stale_paper_grace_sec: int = field(
+        default_factory=lambda: _env_int("STALE_PAPER_GRACE_SEC", 300)
+    )
+    # BUG-035 (2026-05-05): minimum wall-clock seconds between a paper
+    # position's exit and the next paper entry on the same symbol.
+    # The 2026-05-05 incident also surfaced a HARD_STOP_LOSS rapid-fire
+    # loop (>20 trades in 40s) when restart-time conditions had the
+    # OBI signal pinned and the inside ask sitting one tick above where
+    # the entry would clear. The existing ``ticks_since_exit > 100``
+    # gate is only ~3s at 30Hz, not enough. 5s wall-clock is short
+    # enough not to interfere with healthy trading but long enough to
+    # let the book breathe between identical entries.
+    paper_reentry_cooldown_sec: float = field(
+        default_factory=lambda: _env_float("PAPER_REENTRY_COOLDOWN_SEC", 5.0)
+    )
+
+    # BUG-036 (2026-05-06): minimum wall-clock seconds between a paper
+    # exit and re-entry on the *same (ticker, direction) pair*. Companion
+    # to ``paper_reentry_cooldown_sec`` (which is global across all
+    # tickers / directions). The 2026-05-06 incident saw the bot lose
+    # the same KXBTC long 7 times in 86s because the global 5s cooldown
+    # didn't prevent re-entering the same losing setup once OBI re-pinned
+    # bullish. 60s is roughly one full ATR cycle on the 15-min binary,
+    # giving the contract price time to either resolve or for the OBI
+    # signal to genuinely change. Tunable via PAPER_SAME_SIDE_COOLDOWN_SEC.
+    paper_same_side_cooldown_sec: float = field(
+        default_factory=lambda: _env_float("PAPER_SAME_SIDE_COOLDOWN_SEC", 60.0)
+    )
+    # Day-4 entry/exit recovery: allow a new same-ticker thesis in the
+    # opposite direction to immediately clear the old same-side lock.
+    # Example: long thesis stopped out, signal flips short 8s later. With
+    # this enabled, the short side is allowed without waiting full cooldown.
+    paper_thesis_flip_unlock_enabled: bool = field(
+        default_factory=lambda: _env_bool("PAPER_THESIS_FLIP_UNLOCK_ENABLED", True)
+    )
 
     # ── Phase 2 (Expiry Exit Reliability, 2026-05-04): live retry widening
     # for EXPIRY_GUARD / SHORT_SETTLEMENT_GUARD only. The existing live
@@ -425,6 +466,23 @@ class BotConfig:
     # Consecutive below-threshold ticks required before triggering.
     health_score_breach_ticks: int = field(
         default_factory=lambda: _env_int("HEALTH_SCORE_BREACH_TICKS", 3)
+    )
+    # Day-4 hysteresis: after breach persistence is reached, require a
+    # confirming deterioration signal before routing HEALTH_SCORE_DECAY.
+    health_exit_confirmation_enabled: bool = field(
+        default_factory=lambda: _env_bool("HEALTH_EXIT_CONFIRMATION_ENABLED", True)
+    )
+    # Confirmation threshold: minimum adverse ROC move from entry ROC.
+    health_exit_confirmation_roc_delta: float = field(
+        default_factory=lambda: _env_float("HEALTH_EXIT_CONFIRMATION_ROC_DELTA", 0.05)
+    )
+    # Confirmation threshold: minimum adverse OBI move from entry OBI.
+    health_exit_confirmation_obi_delta: float = field(
+        default_factory=lambda: _env_float("HEALTH_EXIT_CONFIRMATION_OBI_DELTA", 0.05)
+    )
+    # Fallback neutral OBI anchor used when entry_obi is unavailable.
+    health_exit_confirmation_neutral_obi: float = field(
+        default_factory=lambda: _env_float("HEALTH_EXIT_CONFIRMATION_NEUTRAL_OBI", 0.5)
     )
     health_weight_obi: float = field(
         default_factory=lambda: _env_float("HEALTH_WEIGHT_OBI", 0.30)
@@ -582,6 +640,56 @@ class EdgeProfileConfig:
         default_factory=lambda: _env_bool("EDGE_LIVE_AUTO_APPLY_ENABLED", False)
     )
 
+    # ── Paper-lane edge gates (optional, default OFF for backward compat).
+    # When set, the paper lane mirrors the live edge profile so paper PnL
+    # is a realistic proxy for what the live bot would have earned.
+    # Default OFF: paper collects full-strategy data for ML training unless
+    # the operator explicitly opts in.
+    paper_long_only: bool = field(
+        default_factory=lambda: _env_bool("EDGE_PAPER_LONG_ONLY", False)
+    )
+    # Comma-separated driver allow-list for the paper lane. Empty string =
+    # all drivers allowed. Example: "OBI,OBI+ROC,ROC" blocks ROC/TIGHT and
+    # OBI/TIGHT, matching the live EDGE_LIVE_ALLOWED_DRIVERS default.
+    paper_allowed_drivers: str = field(
+        default_factory=lambda: _env(
+            "EDGE_PAPER_ALLOWED_DRIVERS",
+            "",  # empty = all drivers pass (backward-compat default)
+        )
+    )
+    # Comma-separated UTC hours to block in the paper lane. Empty = no hour
+    # filter. Mirror of EDGE_LIVE_BLOCKED_HOURS_UTC for the paper lane.
+    paper_blocked_hours_utc: str = field(
+        default_factory=lambda: _env("EDGE_PAPER_BLOCKED_HOURS_UTC", "")
+    )
+
+    @property
+    def paper_blocked_hours_set(self) -> set[int]:
+        """Parse comma-separated paper hour block list into a set of ints (0-23)."""
+        out: set[int] = set()
+        for h in self.paper_blocked_hours_utc.split(","):
+            h = h.strip()
+            if not h:
+                continue
+            try:
+                hi = int(h)
+                if 0 <= hi <= 23:
+                    out.add(hi)
+            except ValueError:
+                continue
+        return out
+
+    @property
+    def paper_allowed_drivers_set(self) -> set[str]:
+        """Parse comma-separated paper driver list into a set.
+
+        Returns an empty set when ``paper_allowed_drivers`` is not configured,
+        which the caller interprets as "all drivers allowed".
+        """
+        if not self.paper_allowed_drivers:
+            return set()
+        return {d.strip() for d in self.paper_allowed_drivers.split(",") if d.strip()}
+
     @property
     def allowed_drivers_set(self) -> set[str]:
         """Parse comma-separated driver list into a set of base labels."""
@@ -629,6 +737,12 @@ class MLConfig:
     gate_enabled: bool = field(default_factory=lambda: _env_bool("ML_GATE_ENABLED", False))
     gate_paper: bool = field(default_factory=lambda: _env_bool("ML_GATE_PAPER", True))
     gate_live: bool = field(default_factory=lambda: _env_bool("ML_GATE_LIVE", False))
+    # Single-source threshold semantics:
+    # - "artifact": use threshold embedded in model metadata (default)
+    # - "config": use ML_MIN_P_WIN from environment
+    threshold_source: str = field(
+        default_factory=lambda: os.getenv("ML_THRESHOLD_SOURCE", "artifact").strip().lower()
+    )
     min_p_win: float = field(default_factory=lambda: _env_float("ML_MIN_P_WIN", 0.0))
 
 

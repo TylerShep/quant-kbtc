@@ -316,6 +316,10 @@ class HistoricalSync:
         while True:
             try:
                 await self._sync_settlements()
+                # /historical/markets lags ~2 months; supplement with the
+                # live /markets?status=settled endpoint so April-May data
+                # is always available for backtesting.
+                await self._sync_recent_settlements()
                 if first:
                     first = False
                     logger.info("historical_sync.settlements_complete")
@@ -411,6 +415,41 @@ class HistoricalSync:
                     count=inserted, skipped=skipped,
                     broke_early=broke_early,
                     has_more=bool(last_cursor) and not broke_early)
+
+    async def _sync_recent_settlements(self) -> None:
+        """Supplement _sync_settlements() with data from /markets?status=settled.
+
+        Kalshi's /historical/markets endpoint lags ~2 months behind present.
+        This method calls /markets?status=settled to pick up any markets
+        newer than the newest close_time already in the DB (e.g. April-May
+        2026 data that /historical/markets does not yet expose).
+        """
+        from data.kalshi_rest import KalshiHistoricalClient
+        client = KalshiHistoricalClient()
+
+        cutoff_time = await self._newest_market_close_time()
+        if cutoff_time is not None:
+            cutoff_time = cutoff_time - timedelta(hours=6)
+
+        inserted = 0
+        batch: list[tuple] = []
+        async for market, _cursor in client.iter_settled_markets(
+            min_close_time=cutoff_time
+        ):
+            row = self._parse_settlement_row(market)
+            if row is None:
+                continue
+            if cutoff_time is not None:
+                row_close_time = row[3]
+                if row_close_time is not None and row_close_time < cutoff_time:
+                    continue
+            batch.append(row)
+            if len(batch) >= BATCH_SIZE:
+                inserted += await self._flush_settlement_batch(batch)
+                batch.clear()
+        if batch:
+            inserted += await self._flush_settlement_batch(batch)
+        logger.info("historical_sync.recent_settlements_inserted", count=inserted)
 
     async def _newest_market_close_time(self) -> Optional[datetime]:
         """Return the newest close_time in ``kalshi_markets`` (or None).

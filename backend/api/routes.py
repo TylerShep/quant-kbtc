@@ -39,8 +39,8 @@ class _TTLCache:
 
 _cache = _TTLCache()
 
-_EQUITY_TTL = 10.0
-_STATS_TTL = 10.0
+_EQUITY_TTL = 60.0
+_STATS_TTL = 30.0
 _TRADES_TTL = 5.0
 _DAILY_TTL = 15.0
 _REGIME_TTL = 15.0
@@ -883,6 +883,16 @@ async def equity(mode: str = Query(None), days: int = Query(30)):
     ``(trading_mode, timestamp DESC)`` index, the bounded query now
     returns in <50ms on the same dataset. ``days=0`` keeps the legacy
     full-history behavior for one-off ad-hoc requests.
+
+    2026-05-05 (BUG-035): the bounded query was still pinning the event
+    loop on a 30-day window with 2M+ rows because (a) the ``days=30``
+    cap was advisory only and the table now contains 2M rows in 30 days
+    after the rapid-fire-loop incidents, and (b) ``fetchall()`` of
+    even 100K rows blocks asyncio for 5-10s. Now the query returns at
+    most ~3000 points by SQL-side ``time_bucket`` downsampling: the
+    default 30-day window picks the *last* sample per 15-minute bucket,
+    so the chart loses no shape. ``days=0`` is preserved but capped at
+    100K rows to bound worst-case event-loop block time.
     """
     from datetime import datetime, timezone, timedelta
     from main import coordinator
@@ -893,23 +903,39 @@ async def equity(mode: str = Query(None), days: int = Query(30)):
     if cached is not None:
         return cached
 
+    target_points = 3000
+
     pool = await get_pool()
     async with pool.connection() as conn:
         if days and days > 0:
             since = datetime.now(timezone.utc) - timedelta(days=days)
+            window_seconds = max(int(days * 86400), 1)
+            bucket_seconds = max(window_seconds // target_points, 60)
             rows = await conn.execute(
-                """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
-                   FROM bankroll_history
-                   WHERE trading_mode = %s AND timestamp >= %s
-                   ORDER BY timestamp ASC""",
-                (active_mode, since),
+                """SELECT bucket AS timestamp, bankroll, peak_bankroll,
+                          drawdown_pct, daily_pnl, trade_count
+                   FROM (
+                       SELECT
+                           time_bucket(make_interval(secs => %s), timestamp) AS bucket,
+                           last(bankroll, timestamp) AS bankroll,
+                           last(peak_bankroll, timestamp) AS peak_bankroll,
+                           last(drawdown_pct, timestamp) AS drawdown_pct,
+                           last(daily_pnl, timestamp) AS daily_pnl,
+                           last(trade_count, timestamp) AS trade_count
+                       FROM bankroll_history
+                       WHERE trading_mode = %s AND timestamp >= %s
+                       GROUP BY bucket
+                   ) sub
+                   ORDER BY bucket ASC""",
+                (bucket_seconds, active_mode, since),
             )
         else:
             rows = await conn.execute(
                 """SELECT timestamp, bankroll, peak_bankroll, drawdown_pct, daily_pnl, trade_count
                    FROM bankroll_history
                    WHERE trading_mode = %s
-                   ORDER BY timestamp ASC""",
+                   ORDER BY timestamp ASC
+                   LIMIT 100000""",
                 (active_mode,),
             )
         results = await rows.fetchall()

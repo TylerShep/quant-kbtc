@@ -32,10 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
+    brier_score_loss,
     classification_report,
     precision_recall_curve,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit, cross_val_predict
 from xgboost import XGBClassifier
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "backend" / "ml" / "models"
@@ -64,6 +65,52 @@ ENTRY_FEATURES = [
 # alongside the >=200 MIN_ROWS used by retrain_promote for the default
 # (both-mode) trainer.
 MIN_LIVE_ROWS_FOR_LIVE_MODE = 50
+MIN_PRECISION_FLOOR = 0.58
+
+
+def _build_model() -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42,
+    )
+
+
+def _pick_threshold(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    *,
+    min_precision: float,
+) -> tuple[float, float, float, float]:
+    precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+
+    best_threshold = 0.5
+    best_f1 = 0.0
+    best_precision = 0.0
+    best_recall = 0.0
+    for p, r, t in zip(precision[:-1], recall[:-1], thresholds):
+        if p < min_precision:
+            continue
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(t)
+            best_precision = float(p)
+            best_recall = float(r)
+
+    if best_f1 == 0.0:
+        y_pred_default = (y_proba >= best_threshold).astype(int)
+        report_default = classification_report(
+            y_true, y_pred_default, output_dict=True, zero_division=0
+        )
+        best_precision = float(report_default.get("1", {}).get("precision", 0.0))
+        best_recall = float(report_default.get("1", {}).get("recall", 0.0))
+
+    return best_threshold, best_precision, best_recall, best_f1
 
 
 def load_data(
@@ -133,6 +180,9 @@ def train(
     output_name: str = "xgb_entry_v1.pkl",
     *,
     training_mode: str = "both",
+    eval_mode: str = "stratified_kfold",
+    time_holdout_fraction: float = 0.20,
+    time_splits: int = 5,
 ) -> dict:
     """Train an XGBoost entry-gate model on ``df``.
 
@@ -151,9 +201,8 @@ def train(
             "Run the migration / re-export trade_features."
         )
     available_features = list(ENTRY_FEATURES)
-
     X = df[available_features].fillna(0)
-    y = df["binary_label"]
+    y = df["binary_label"].astype(int)
 
     print(f"\n{'=' * 60}")
     print(f"Training XGBoost entry gate")
@@ -162,46 +211,136 @@ def train(
     print(f"  Win rate: {y.mean():.1%}")
     print(f"{'=' * 60}\n")
 
-    model = XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="logloss",
-        random_state=42,
-    )
+    if eval_mode not in {"stratified_kfold", "time_ordered"}:
+        raise ValueError(f"Unknown eval_mode {eval_mode!r}")
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    threshold_selection_precision = 0.0
+    threshold_selection_recall = 0.0
+    threshold_selection_f1 = 0.0
+    threshold_selection_rows = len(df)
+    holdout_rows = 0
+    holdout_precision = 0.0
+    holdout_recall = 0.0
+    oos_brier = 0.0
+    promotion_metric_source = "cv"
 
-    y_proba = cross_val_predict(model, X, y, cv=skf, method="predict_proba")[:, 1]
+    if eval_mode == "stratified_kfold":
+        model = _build_model()
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        y_proba = cross_val_predict(model, X, y, cv=skf, method="predict_proba")[:, 1]
+        best_threshold, threshold_selection_precision, threshold_selection_recall, threshold_selection_f1 = (
+            _pick_threshold(
+                y.to_numpy(),
+                y_proba,
+                min_precision=MIN_PRECISION_FLOOR,
+            )
+        )
+        y_pred = (y_proba >= best_threshold).astype(int)
+        report = classification_report(
+            y,
+            y_pred,
+            output_dict=True,
+            zero_division=0,
+        )
+        oos_precision = float(report.get("1", {}).get("precision", 0))
+        oos_recall = float(report.get("1", {}).get("recall", 0))
+        oos_brier = float(brier_score_loss(y, y_proba))
+        print(f"Threshold source: stratified CV predictions ({len(y)} rows)")
+        print(f"Optimal threshold: {best_threshold:.3f}")
+        print(f"OOS precision (class 1): {oos_precision:.3f}")
+        print(f"OOS recall (class 1): {oos_recall:.3f}")
+        print(f"OOS brier score: {oos_brier:.4f}")
+        print(f"\n{classification_report(y, y_pred, zero_division=0)}")
+        model.fit(X, y)
+    else:
+        if "timestamp" not in df.columns:
+            raise ValueError(
+                "time_ordered eval mode requires a 'timestamp' column in trade_features."
+            )
+        ordered = df.copy()
+        ordered["timestamp"] = pd.to_datetime(
+            ordered["timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+        ordered = ordered[ordered["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+        if len(ordered) < 200:
+            raise ValueError(
+                "time_ordered eval mode needs at least 200 rows after timestamp sort."
+            )
+        holdout_size = max(50, int(len(ordered) * max(0.10, min(0.40, time_holdout_fraction))))
+        train_size = len(ordered) - holdout_size
+        if train_size < 100:
+            raise ValueError(
+                "Not enough rows left for threshold-tuning train split after holdout carve-out."
+            )
 
-    precision, recall, thresholds = precision_recall_curve(y, y_proba)
+        train_df = ordered.iloc[:train_size].copy()
+        holdout_df = ordered.iloc[train_size:].copy()
+        X_train = train_df[available_features].fillna(0)
+        y_train = train_df["binary_label"].astype(int)
+        X_holdout = holdout_df[available_features].fillna(0)
+        y_holdout = holdout_df["binary_label"].astype(int)
 
-    best_threshold = 0.5
-    best_f1 = 0.0
-    for p, r, t in zip(precision, recall, thresholds):
-        if p < 0.58:
-            continue
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = float(t)
+        split_count = max(2, min(time_splits, 8))
+        tss = TimeSeriesSplit(n_splits=split_count)
+        val_probs: list[np.ndarray] = []
+        val_labels: list[np.ndarray] = []
+        for train_idx, val_idx in tss.split(X_train):
+            y_train_fold = y_train.iloc[train_idx]
+            if y_train_fold.nunique() < 2:
+                continue
+            fold_model = _build_model()
+            fold_model.fit(X_train.iloc[train_idx], y_train_fold)
+            fold_probs = fold_model.predict_proba(X_train.iloc[val_idx])[:, 1]
+            val_probs.append(fold_probs)
+            val_labels.append(y_train.iloc[val_idx].to_numpy())
 
-    y_pred = (y_proba >= best_threshold).astype(int)
-    report = classification_report(y, y_pred, output_dict=True)
+        if not val_probs:
+            split_at = int(len(X_train) * 0.75)
+            if split_at <= 0 or split_at >= len(X_train):
+                raise ValueError("Unable to create fallback forward validation split.")
+            fallback_model = _build_model()
+            fallback_model.fit(X_train.iloc[:split_at], y_train.iloc[:split_at])
+            val_probs = [fallback_model.predict_proba(X_train.iloc[split_at:])[:, 1]]
+            val_labels = [y_train.iloc[split_at:].to_numpy()]
 
-    oos_precision = report.get("1", {}).get("precision", 0)
-    print(f"Optimal threshold: {best_threshold:.3f}")
-    print(f"OOS precision (class 1): {oos_precision:.3f}")
-    print(f"OOS recall (class 1): {report.get('1', {}).get('recall', 0):.3f}")
-    print(f"\n{classification_report(y, y_pred)}")
+        y_val = np.concatenate(val_labels)
+        p_val = np.concatenate(val_probs)
+        threshold_selection_rows = int(len(y_val))
+        best_threshold, threshold_selection_precision, threshold_selection_recall, threshold_selection_f1 = (
+            _pick_threshold(y_val, p_val, min_precision=MIN_PRECISION_FLOOR)
+        )
 
-    if oos_precision < 0.58:
-        print(f"\nWARNING: OOS precision {oos_precision:.3f} < 0.58 threshold.")
+        promotion_metric_source = "holdout"
+        model = _build_model()
+        model.fit(X_train, y_train)
+        holdout_proba = model.predict_proba(X_holdout)[:, 1]
+        holdout_pred = (holdout_proba >= best_threshold).astype(int)
+        holdout_report_dict = classification_report(
+            y_holdout,
+            holdout_pred,
+            output_dict=True,
+            zero_division=0,
+        )
+        holdout_rows = int(len(y_holdout))
+        holdout_precision = float(holdout_report_dict.get("1", {}).get("precision", 0.0))
+        holdout_recall = float(holdout_report_dict.get("1", {}).get("recall", 0.0))
+        oos_brier = float(brier_score_loss(y_holdout, holdout_proba))
+        oos_precision = holdout_precision
+        oos_recall = holdout_recall
+        print("Threshold source: forward-only validation from pre-holdout segment")
+        print(f"Threshold tuning rows: {threshold_selection_rows}")
+        print(f"Holdout rows: {holdout_rows}")
+        print(f"Optimal threshold: {best_threshold:.3f}")
+        print(f"Holdout precision (class 1): {holdout_precision:.3f}")
+        print(f"Holdout recall (class 1): {holdout_recall:.3f}")
+        print(f"Holdout brier score: {oos_brier:.4f}")
+        print(f"\n{classification_report(y_holdout, holdout_pred, zero_division=0)}")
+
+    if oos_precision < MIN_PRECISION_FLOOR:
+        print(f"\nWARNING: OOS precision {oos_precision:.3f} < {MIN_PRECISION_FLOOR:.2f} threshold.")
         print("The signal may not be strong enough yet. Consider collecting more data.")
-
-    model.fit(X, y)
 
     importance = dict(zip(available_features, model.feature_importances_.tolist()))
     sorted_imp = sorted(importance.items(), key=lambda x: x[1], reverse=True)
@@ -223,6 +362,8 @@ def train(
             "features": available_features,
             "threshold": best_threshold,
             "training_mode": training_mode,
+            "threshold_source": promotion_metric_source,
+            "eval_mode": eval_mode,
         }
         joblib.dump(artifact, output_path)
     except ImportError:
@@ -232,6 +373,8 @@ def train(
             "features": available_features,
             "threshold": best_threshold,
             "training_mode": training_mode,
+            "threshold_source": promotion_metric_source,
+            "eval_mode": eval_mode,
         }
         with open(output_path, "wb") as f:
             pickle.dump(artifact, f)
@@ -243,8 +386,18 @@ def train(
         "features": available_features,
         "threshold": best_threshold,
         "training_mode": training_mode,
+        "eval_mode": eval_mode,
+        "threshold_source": promotion_metric_source,
+        "threshold_selection_rows": threshold_selection_rows,
+        "threshold_selection_precision": round(threshold_selection_precision, 4),
+        "threshold_selection_recall": round(threshold_selection_recall, 4),
+        "threshold_selection_f1": round(threshold_selection_f1, 4),
+        "holdout_rows": holdout_rows,
+        "holdout_precision": round(holdout_precision, 4),
+        "holdout_recall": round(holdout_recall, 4),
         "oos_precision": round(oos_precision, 4),
-        "oos_recall": round(report.get("1", {}).get("recall", 0), 4),
+        "oos_recall": round(oos_recall, 4),
+        "oos_brier": round(oos_brier, 6),
         "win_rate": round(float(y.mean()), 4),
         "feature_importance": {k: round(v, 4) for k, v in sorted_imp},
     }
@@ -274,6 +427,27 @@ def main():
             "operator can't accidentally ship a model trained on noise."
         ),
     )
+    parser.add_argument(
+        "--eval-mode",
+        choices=("stratified_kfold", "time_ordered"),
+        default="stratified_kfold",
+        help=(
+            "Evaluation protocol: stratified_kfold (legacy) or time_ordered "
+            "(forward-only threshold tuning + held-out final scoring)."
+        ),
+    )
+    parser.add_argument(
+        "--time-holdout-fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of newest rows reserved as final holdout in time_ordered mode.",
+    )
+    parser.add_argument(
+        "--time-splits",
+        type=int,
+        default=5,
+        help="Forward splits used for threshold tuning in time_ordered mode.",
+    )
     args = parser.parse_args()
 
     if not args.csv and not args.db_url:
@@ -284,7 +458,14 @@ def main():
     if len(df) < 100:
         print(f"WARNING: Only {len(df)} labeled rows. Recommended minimum is 500.", file=sys.stderr)
 
-    train(df, output_name=args.output, training_mode=args.mode)
+    train(
+        df,
+        output_name=args.output,
+        training_mode=args.mode,
+        eval_mode=args.eval_mode,
+        time_holdout_fraction=args.time_holdout_fraction,
+        time_splits=args.time_splits,
+    )
 
 
 if __name__ == "__main__":

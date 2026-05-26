@@ -13,23 +13,24 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Optional
+from typing import Callable, Optional
 
 from config import settings
 
 
 class SpreadRegimeFilter:
-    def __init__(self):
+    def __init__(self, time_fn: Optional[Callable[[], float]] = None):
         cfg = settings.spread_div
         self._history: deque[float] = deque(maxlen=cfg.baseline_window * 3)
         self._last_update: float = 0.0
+        self._time_fn = time_fn or time.time
 
     def update(self, spread_cents: Optional[float]) -> None:
         """Called every tick when a new FeatureSnapshot is produced."""
         if spread_cents is None or spread_cents <= 0:
             return
         self._history.append(float(spread_cents))
-        self._last_update = time.time()
+        self._last_update = self._time_fn()
 
     def spread_history(self) -> list[float]:
         """Return the spread history list.
@@ -40,7 +41,7 @@ class SpreadRegimeFilter:
         cfg = settings.spread_div
         if self._last_update == 0:
             return []
-        if time.time() - self._last_update > cfg.staleness_sec:
+        if self._time_fn() - self._last_update > cfg.staleness_sec:
             return []
         return list(self._history)
 
@@ -56,7 +57,7 @@ class SpreadRegimeFilter:
                 self._history.append(float(v))
                 consumed += 1
         if self._history:
-            self._last_update = time.time()
+            self._last_update = self._time_fn()
         return consumed
 
     def get_state(self) -> dict:
@@ -69,5 +70,5 @@ class SpreadRegimeFilter:
         return {
             "baseline_cents": round(baseline, 2),
             "history_len": len(history),
-            "last_update_age_sec": round(time.time() - self._last_update, 1),
+            "last_update_age_sec": round(self._time_fn() - self._last_update, 1),
         }

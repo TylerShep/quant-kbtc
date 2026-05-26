@@ -5,8 +5,12 @@ Per the backtesting-framework skill.
 from __future__ import annotations
 
 import csv
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from backtesting.contract_timeline import ContractTick, ContractTimeline
 
 MIN_CANDLES = 2000
 RECOMMENDED_CANDLES = 17520
@@ -118,6 +122,200 @@ async def load_ob_snapshots_db(pool, ticker: Optional[str] = None,
                 "total_bid_vol": float(r[2]) if r[2] else 0,
                 "total_ask_vol": float(r[3]) if r[3] else 0,
                 "spread_cents": float(r[4]) if r[4] is not None else None,
+            }
+            for r in result
+        }
+
+
+def _parse_book_levels(raw_levels) -> list[tuple[float, float]]:
+    """Parse OB side JSON into [(price, size), ...]."""
+    if raw_levels is None:
+        return []
+    levels = raw_levels
+    if isinstance(levels, str):
+        try:
+            levels = json.loads(levels)
+        except json.JSONDecodeError:
+            return []
+    out: list[tuple[float, float]] = []
+    if not isinstance(levels, list):
+        return out
+    for row in levels:
+        if isinstance(row, dict):
+            price = row.get("price")
+            size = row.get("size")
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            price, size = row[0], row[1]
+        else:
+            continue
+        try:
+            out.append((float(price), float(size)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def derive_mid_from_book(
+    bids_jsonb,
+    asks_jsonb,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Return (mid, best_bid, best_ask, spread) from JSONB book columns."""
+    bids = _parse_book_levels(bids_jsonb)
+    asks = _parse_book_levels(asks_jsonb)
+    best_bid = max((p for p, s in bids if s > 0), default=None)
+    best_ask = min((p for p, s in asks if s > 0), default=None)
+    if best_bid is not None and best_ask is not None:
+        spread = best_ask - best_bid
+        return (best_bid + best_ask) / 2.0, best_bid, best_ask, spread
+    if best_bid is not None:
+        return best_bid, best_bid, None, None
+    if best_ask is not None:
+        return best_ask, None, best_ask, None
+    return None, None, None, None
+
+
+async def load_contract_timelines_db(
+    pool,
+    start_ts: float,
+    end_ts: float,
+    tickers: Optional[list[str]] = None,
+    series: str = "KXBTC",
+) -> dict[str, ContractTimeline]:
+    """Load per-ticker contract timelines from OB snapshots + trade prints."""
+    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    timelines: dict[str, ContractTimeline] = {}
+
+    where_parts = ["timestamp >= %s", "timestamp <= %s"]
+    params: list = [start_dt, end_dt]
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        where_parts.append(f"ticker IN ({placeholders})")
+        params.extend(tickers)
+    else:
+        where_parts.append("ticker LIKE %s")
+        params.append(f"{series}%")
+
+    query = f"""
+        SELECT timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents
+        FROM ob_snapshots
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY timestamp ASC
+    """
+
+    async with pool.connection() as conn:
+        rows = await conn.execute(query, params)
+        result = await rows.fetchall()
+
+    for row in result:
+        ts = row[0].timestamp()
+        ticker = row[1]
+        mid, best_bid, best_ask, spread = derive_mid_from_book(row[2], row[3])
+        spread_cents = float(row[7]) if row[7] is not None else spread
+        timeline = timelines.setdefault(ticker, ContractTimeline(ticker=ticker))
+        timeline.add_tick(
+            ContractTick(
+                timestamp=ts,
+                ticker=ticker,
+                mid_cents=mid,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread_cents=spread_cents,
+                obi=float(row[4]) if row[4] is not None else 0.5,
+                total_bid_vol=float(row[5]) if row[5] is not None else 0.0,
+                total_ask_vol=float(row[6]) if row[6] is not None else 0.0,
+                source="ob_mid",
+            )
+        )
+
+    trades_where_parts = ["created_time >= %s", "created_time <= %s"]
+    trades_params: list = [start_dt, end_dt]
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        trades_where_parts.append(f"ticker IN ({placeholders})")
+        trades_params.extend(tickers)
+    else:
+        trades_where_parts.append("ticker LIKE %s")
+        trades_params.append(f"{series}%")
+
+    trades_query = f"""
+        SELECT created_time, ticker, yes_price
+        FROM kalshi_trades
+        WHERE {" AND ".join(trades_where_parts)}
+        ORDER BY created_time ASC
+    """
+    async with pool.connection() as conn:
+        rows = await conn.execute(trades_query, trades_params)
+        trades = await rows.fetchall()
+
+    for row in trades:
+        if row[2] is None:
+            continue
+        ts = row[0].timestamp()
+        ticker = row[1]
+        yes_price = float(row[2])
+        timeline = timelines.setdefault(ticker, ContractTimeline(ticker=ticker))
+        timeline.add_tick(
+            ContractTick(
+                timestamp=ts,
+                ticker=ticker,
+                mid_cents=yes_price,
+                best_bid=None,
+                best_ask=None,
+                spread_cents=None,
+                obi=0.5,
+                total_bid_vol=0.0,
+                total_ask_vol=0.0,
+                source="yes_price",
+            )
+        )
+
+    for timeline in timelines.values():
+        timeline.finalize()
+    return timelines
+
+
+async def load_settlement_outcomes_db(
+    pool,
+    tickers: Optional[list[str]] = None,
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    series: str = "KXBTC",
+) -> dict[str, dict]:
+    """Load settled contract outcomes keyed by ticker."""
+    where_parts = ["result IS NOT NULL"]
+    params: list = []
+    if start_ts is not None:
+        where_parts.append("close_time >= %s")
+        params.append(datetime.fromtimestamp(start_ts, tz=timezone.utc))
+    if end_ts is not None:
+        where_parts.append("close_time <= %s")
+        params.append(datetime.fromtimestamp(end_ts, tz=timezone.utc))
+    if tickers:
+        placeholders = ",".join(["%s"] * len(tickers))
+        where_parts.append(f"ticker IN ({placeholders})")
+        params.extend(tickers)
+    else:
+        where_parts.append("ticker LIKE %s")
+        params.append(f"{series}%")
+
+    query = f"""
+        SELECT ticker, close_time, result, expiration_value, last_price, volume
+        FROM kalshi_markets
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY close_time ASC
+    """
+
+    async with pool.connection() as conn:
+        rows = await conn.execute(query, params)
+        result = await rows.fetchall()
+        return {
+            r[0]: {
+                "close_time": r[1].timestamp() if r[1] else None,
+                "result": r[2],
+                "expiration_value": float(r[3]) if r[3] is not None else None,
+                "last_price": float(r[4]) if r[4] is not None else None,
+                "volume": float(r[5]) if r[5] is not None else None,
             }
             for r in result
         }

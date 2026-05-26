@@ -26,12 +26,24 @@ cron @ 04:00 UTC Sun
        ├─ docker exec kbtc-db pg_dump trade_features  →  data/retrain/trade_features_<ts>.csv
        ├─ row count check (>= 200)
        ├─ docker run --rm --user 1000:1000 kbtc-bot:latest python /scripts/retrain_promote.py
-       │    ├─ scripts/train_xgb.py train()                  # 5-fold CV, threshold tuned on PR curve
+       │    ├─ scripts/train_xgb.py train()                  # time-safe mode: forward threshold tuning + held-out final scoring
        │    ├─ promotion gate (rows / abs floor / regression tolerance)
        │    ├─ archive incumbent → backend/ml/models/archive/xgb_entry_v1_<ts>.pkl
        │    └─ atomic replace → backend/ml/models/xgb_entry_v1.pkl
        └─ post outcome to Discord errors webhook
 ```
+
+## Time-Safe Evaluation Protocol (Required)
+
+For go/no-go decisions, use `train_xgb.py --eval-mode time_ordered`:
+
+1. Sort rows by `trade_features.timestamp`.
+2. Carve out newest tail as untouched holdout (`--time-holdout-fraction`, default 20%).
+3. Tune threshold only on forward-only validation slices from the pre-holdout segment.
+4. Fit final model on the pre-holdout segment.
+5. Score once on holdout with locked threshold.
+
+This prevents leakage from shuffled folds and keeps threshold selection separate from final holdout scoring.
 
 ## Promotion gate
 
@@ -115,6 +127,18 @@ ssh "$KBTC_DEPLOY_HOST"
 /home/botuser/kbtc/scripts/retrain_xgb_cron.sh
 ```
 
+### Recommended manual training command (time-safe)
+
+```bash
+python scripts/train_xgb.py \
+  --db-url "$DATABASE_URL" \
+  --mode both \
+  --eval-mode time_ordered \
+  --time-holdout-fraction 0.20 \
+  --time-splits 5 \
+  --output xgb_entry_v1.pkl
+```
+
 ### Rolling back a bad promotion
 
 If a promoted model behaves badly in production and you want to revert:
@@ -164,6 +188,11 @@ for now. If it gets unwieldy, prune entries older than 6 months.
 - **Bot restart is manual.** This avoids automated restarts colliding with
   open positions, but it means a promoted model can sit idle for days if the
   operator doesn't notice the Discord alert. Monitor the channel.
+- **Threshold source must be explicit.** Runtime gate threshold is controlled by
+  `ML_THRESHOLD_SOURCE`:
+  - `artifact` (default): use model artifact threshold.
+  - `config`: use `ML_MIN_P_WIN` from environment.
+  Keep one source active to avoid ambiguous promotion outcomes.
 
 ## Related files
 

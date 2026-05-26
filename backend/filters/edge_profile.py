@@ -178,3 +178,46 @@ def evaluate(
             return False, f"EDGE_PRICE_CAP_{entry_price:.0f}c>{cfg.max_entry_price:.0f}c"
 
     return True, None
+
+
+def evaluate_paper(
+    *,
+    decision: TradeDecision,
+    now_utc: Optional[datetime] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Paper-lane edge gate.
+
+    Optional companion to ``evaluate()``. Only active when at least one of
+    ``EDGE_PAPER_LONG_ONLY``, ``EDGE_PAPER_ALLOWED_DRIVERS``, or
+    ``EDGE_PAPER_BLOCKED_HOURS_UTC`` is set in the environment. Returns
+    ``(True, None)`` when none are configured so the paper lane continues
+    collecting full-strategy training data by default.
+
+    Gates checked (in order):
+      1. ``paper_long_only`` — blocks any short entry.
+      2. ``paper_allowed_drivers`` — blocks drivers not in the allow-list.
+      3. ``paper_blocked_hours_utc`` — blocks entries in dead-zone UTC hours.
+
+    No entry-price gate is applied to avoid stripping ML training data.
+    """
+    cfg = settings.edge_profile
+
+    if decision.direction is None or decision.conviction == Conviction.NONE:
+        return True, None
+
+    if cfg.paper_long_only and decision.direction != Direction.LONG:
+        return False, "PAPER_SHORT_BLOCKED"
+
+    allowed = cfg.paper_allowed_drivers_set
+    if allowed:
+        driver = _driver_base(decision)
+        if driver not in allowed:
+            return False, f"PAPER_DRIVER_BLOCKED_{driver}"
+
+    blocked_hours = cfg.paper_blocked_hours_set
+    if blocked_hours:
+        now = now_utc or datetime.now(timezone.utc)
+        if now.hour in blocked_hours:
+            return False, f"PAPER_HOUR_BLOCKED_{now.hour:02d}UTC"
+
+    return True, None

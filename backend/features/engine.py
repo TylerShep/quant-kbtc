@@ -58,6 +58,24 @@ class OBISmoother:
     book is noisy (high OBI stdev) the window expands; when stable it
     contracts — so the signal responds quickly in calm markets but
     resists whipsaw in noisy ones.
+
+    2026-05-06 (BUG-035 follow-up #2): the original implementation
+    rebuilt the mean and variance over the full 60s stdev buffer on
+    every tick (two O(n) passes via list comp + generator), eating
+    ~55% of MainThread CPU at the 20+ Hz market-tick rate. py-spy
+    consistently pinned line 88 (variance generator) as the dominant
+    hot frame, which was starving the Coinbase WS keepalive.
+
+    The fix: keep running ``sum`` and ``sum_of_squares`` so each
+    update is O(1) — appends add to the sums, evictions subtract.
+    Variance is then ``E[X^2] - E[X]^2``. The numerical drift from
+    accumulated float error is bounded by the 60s/2000-entry window
+    (the buffer naturally rolls over fast enough that errors don't
+    compound), and the comparison thresholds (0.15, 0.05) are coarse
+    enough that the last-ULP differences don't change which branch
+    we take. We periodically reseed the running sums from the buffer
+    contents to keep drift bounded if the loop ever stalls long
+    enough for a single value to dominate the accumulator history.
     """
 
     STDEV_LOOKBACK_SEC = 60.0
@@ -65,27 +83,68 @@ class OBISmoother:
     STABLE_THRESHOLD = 0.05
     EXPAND_MULT = 1.5
     CONTRACT_MULT = 0.75
+    # Reseed running sums from the buffer every N evictions to bound
+    # accumulated float error. Cheap (one O(n) pass per ~1000 ticks
+    # vs one O(n) pass per tick before).
+    _RESEED_EVERY = 1000
 
     def __init__(self, base_window_sec: float = 5.0, min_samples: int = 3):
         self._base_window = base_window_sec
         self._min_samples = min_samples
         self._buffer: deque[tuple[float, float]] = deque(maxlen=2000)
         self._stdev_buffer: deque[tuple[float, float]] = deque(maxlen=2000)
+        # Incremental moments over ``_stdev_buffer`` so variance is O(1).
+        self._stdev_sum: float = 0.0
+        self._stdev_sum_sq: float = 0.0
+        self._evictions_since_reseed: int = 0
+
+    def _reseed_stdev_moments(self) -> None:
+        """Recompute running sums from buffer contents to bound float drift."""
+        s = 0.0
+        ss = 0.0
+        for _, v in self._stdev_buffer:
+            s += v
+            ss += v * v
+        self._stdev_sum = s
+        self._stdev_sum_sq = ss
+        self._evictions_since_reseed = 0
 
     def update(self, obi: float) -> float:
         now = time.time()
         self._buffer.append((now, obi))
-        self._stdev_buffer.append((now, obi))
 
+        # Append to stdev buffer + maintain running moments incrementally.
+        # If maxlen evicts an element implicitly we still need to subtract
+        # it from the running sums; capture the would-be-evicted value
+        # before append.
+        evicted_val: Optional[float] = None
+        if len(self._stdev_buffer) == self._stdev_buffer.maxlen:
+            evicted_val = self._stdev_buffer[0][1]
+        self._stdev_buffer.append((now, obi))
+        if evicted_val is not None:
+            self._stdev_sum -= evicted_val
+            self._stdev_sum_sq -= evicted_val * evicted_val
+            self._evictions_since_reseed += 1
+        self._stdev_sum += obi
+        self._stdev_sum_sq += obi * obi
+
+        # Evict everything outside the 60s lookback and adjust moments.
         stdev_cutoff = now - self.STDEV_LOOKBACK_SEC
         while self._stdev_buffer and self._stdev_buffer[0][0] < stdev_cutoff:
-            self._stdev_buffer.popleft()
+            _, v = self._stdev_buffer.popleft()
+            self._stdev_sum -= v
+            self._stdev_sum_sq -= v * v
+            self._evictions_since_reseed += 1
+
+        if self._evictions_since_reseed >= self._RESEED_EVERY:
+            self._reseed_stdev_moments()
 
         window = self._base_window
-        if len(self._stdev_buffer) >= 5:
-            vals = [v for _, v in self._stdev_buffer]
-            mean = sum(vals) / len(vals)
-            variance = sum((v - mean) ** 2 for v in vals) / len(vals)
+        n = len(self._stdev_buffer)
+        if n >= 5:
+            mean = self._stdev_sum / n
+            # E[X^2] - E[X]^2; clamp to 0 to absorb float underflow.
+            variance = max(0.0, self._stdev_sum_sq / n - mean * mean)
             stdev = math.sqrt(variance)
             if stdev > self.NOISY_THRESHOLD:
                 window = self._base_window * self.EXPAND_MULT
