@@ -374,6 +374,13 @@ async def run(args) -> dict[str, Any]:
                     "health_score_threshold": args.health_score_threshold,
                     "ml_gate_mode": args.ml_gate_mode,
                     "exit_fill_mode": args.exit_fill_mode,
+                    # Exit Intelligence fires on every OB tick in production
+                    # (sub-second), but the backtester uses 30-60s OB snapshots.
+                    # N breach_ticks = N seconds live vs N minutes in sim, so
+                    # the health-score exit is not frequency-comparable.
+                    # Shadow it here so parity measures the reproducible exits
+                    # (STOP_LOSS, TAKE_PROFIT, EXPIRY_GUARD, SIGNAL_DECAY, etc.).
+                    "exit_intelligence_shadow_only": not args.enable_exit_intelligence,
                     "disable_signal_entries": True,
                     "forced_entry": {
                         "ticker": ticker,
@@ -482,6 +489,18 @@ def main() -> int:
         help="Exit fill mode used during replay simulation.",
     )
     parser.add_argument("--target-parity", type=float, default=0.90)
+    parser.add_argument(
+        "--enable-exit-intelligence",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Exit Intelligence health-score exits during replay. "
+            "OFF by default: the breach_ticks counter fires after N OB "
+            "snapshots (30-60s each) in sim vs N sub-second ticks in "
+            "production, making the exit frequency-dependent and "
+            "incomparable. Only enable to study health-score behavior."
+        ),
+    )
     parser.add_argument(
         "--output",
         default="backtest_reports/parity_check_latest.json",

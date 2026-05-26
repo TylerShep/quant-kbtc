@@ -538,7 +538,23 @@ class ContractBacktester:
                         time_remaining_sec is not None
                         and time_remaining_sec < settings.bot.expiry_guard_trigger_sec
                     ):
-                        guard_price = self._exit_price_from_tick(position, pos_tick)
+                        # Use the OB price anchored to the trigger point
+                        # (close_time - guard_sec), NOT the latest tick.
+                        # The latest tick may be from seconds before settlement
+                        # when prices have already collapsed near 0 or 100,
+                        # which causes the sim to exit at settlement prices
+                        # instead of the pre-collapse market mid. The live bot
+                        # fires at exactly (close_time - guard_sec) when prices
+                        # are still at the pre-collapse level.
+                        anchor_ts = (close_time or 0) - settings.bot.expiry_guard_trigger_sec
+                        anchor_tl = self.contract_timelines.get(position.ticker)
+                        anchor_tick = (
+                            anchor_tl.latest_tick_before(anchor_ts)
+                            if anchor_tl is not None
+                            else None
+                        )
+                        guard_tick = anchor_tick if anchor_tick is not None else pos_tick
+                        guard_price = self._exit_price_from_tick(position, guard_tick)
                         if guard_price is not None:
                             current_bankroll = self._close_position(
                                 position=position,
