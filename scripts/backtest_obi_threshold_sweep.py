@@ -259,6 +259,7 @@ async def run(args) -> dict[str, Any]:
             start_ts=lookback_start,
             end_ts=end_ts + 900.0,
             series=args.series,
+            bucket_sec=args.bucket_sec,
         )
         settlements = await load_settlement_outcomes_db(
             pool,
@@ -413,6 +414,11 @@ def _main():
                         dest="health_score_threshold")
     parser.add_argument("--health-score-breach-ticks", type=int, default=3,
                         dest="health_score_breach_ticks")
+    parser.add_argument(
+        "--bucket-sec", type=int, default=0, dest="bucket_sec",
+        help="Thin OB snapshots to one per N-second bucket per ticker. "
+             "Use 10-30 for multi-week windows to avoid OOM. Default 0 = full resolution.",
+    )
     parser.add_argument(
         "--output",
         default="backtest_reports/obi_threshold_sweep.json",

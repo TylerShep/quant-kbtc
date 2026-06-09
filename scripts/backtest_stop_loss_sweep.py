@@ -248,6 +248,7 @@ async def run(args) -> dict[str, Any]:
             start_ts=lookback_start,
             end_ts=end_ts + 900.0,
             series=args.series,
+            bucket_sec=args.bucket_sec,
         )
         settlements = await load_settlement_outcomes_db(
             pool,
@@ -290,7 +291,7 @@ async def run(args) -> dict[str, Any]:
     print(f"  {len(stop_trades)} actual STOP_LOSS long trades for counterfactual "
           f"({args.cf_start} → {args.cf_end}).")
 
-    # Base config mirrors production (hard stop off, long-only, 60s cooldown).
+    # Base config mirrors production.
     base_cfg = {
         "mode": "paper",
         "hard_stop_loss_pct": 0.0,
@@ -300,18 +301,22 @@ async def run(args) -> dict[str, Any]:
         "paper_thesis_flip_unlock_enabled": True,
         "health_score_threshold": args.health_score_threshold,
         "health_score_breach_ticks": args.health_score_breach_ticks,
+        # Shadow Exit Intelligence by default: at 15s OB bucket resolution,
+        # 3 breach_ticks = 45s vs sub-second in production, causing severe
+        # EI over-firing that masks the stop-loss signal. Use --no-shadow-ei
+        # to restore EI for comparison.
         "exit_intelligence_enabled": True,
-        "exit_intelligence_shadow_only": False,
+        "exit_intelligence_shadow_only": not args.no_shadow_ei,
         "health_exit_confirmation_enabled": True,
         "health_exit_confirmation_roc_delta": 0.05,
         "health_exit_confirmation_obi_delta": 0.05,
         "health_exit_confirmation_neutral_obi": 0.50,
         "exit_fill_mode": "mark",
         "ml_gate_mode": "disabled",
-        # Block hour 17 UTC (matches today's deployed change).
-        "blocked_hours_utc": [17],
-        # OBI long threshold at current production value.
-        "long_threshold": 0.65,
+        # Block hours 14 and 17 UTC (8am and 11am CT, both deployed in production).
+        "blocked_hours_utc": [14, 17],
+        # OBI long threshold updated to 0.68 (deployed 2026-05-26).
+        "long_threshold": 0.68,
     }
 
     stop_values = [round(v, 2) for v in args.stop_values]
@@ -494,8 +499,15 @@ def _main():
         "--stop-values",
         nargs="+",
         type=float,
-        default=[0.02, 0.10, 0.20, 0.30, 0.40, 0.50],
+        default=[0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 999.0],
         dest="stop_values",
+    )
+    parser.add_argument(
+        "--no-shadow-ei",
+        action="store_true",
+        default=False,
+        dest="no_shadow_ei",
+        help="Disable EI shadowing (not recommended at 15s bucket resolution).",
     )
     parser.add_argument("--bankroll", type=float, default=10000.0)
     parser.add_argument("--paper-cooldown-sec", type=float, default=60.0,
@@ -504,6 +516,11 @@ def _main():
                         dest="health_score_threshold")
     parser.add_argument("--health-score-breach-ticks", type=int, default=3,
                         dest="health_score_breach_ticks")
+    parser.add_argument(
+        "--bucket-sec", type=int, default=0, dest="bucket_sec",
+        help="Thin OB snapshots to one per N-second bucket per ticker. "
+             "Use 10-30 for multi-week windows to avoid OOM. Default 0 = full resolution.",
+    )
     parser.add_argument(
         "--output",
         default="backtest_reports/stop_loss_sweep.json",

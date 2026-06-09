@@ -180,8 +180,17 @@ async def load_contract_timelines_db(
     end_ts: float,
     tickers: Optional[list[str]] = None,
     series: str = "KXBTC",
+    bucket_sec: int = 0,
 ) -> dict[str, ContractTimeline]:
-    """Load per-ticker contract timelines from OB snapshots + trade prints."""
+    """Load per-ticker contract timelines from OB snapshots + trade prints.
+
+    Args:
+        bucket_sec: If > 0, thin the OB data to one snapshot per
+            ``bucket_sec``-second window per ticker (first row in bucket).
+            Use 10-30 for multi-week sweep workloads that would OOM at full
+            1-4s resolution.  Parity-replay and short windows should keep
+            the default of 0 (full resolution).
+    """
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
     timelines: dict[str, ContractTimeline] = {}
@@ -196,12 +205,35 @@ async def load_contract_timelines_db(
         where_parts.append("ticker LIKE %s")
         params.append(f"{series}%")
 
-    query = f"""
-        SELECT timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents
-        FROM ob_snapshots
-        WHERE {" AND ".join(where_parts)}
-        ORDER BY timestamp ASC
-    """
+    where_clause = " AND ".join(where_parts)
+    if bucket_sec > 0:
+        # Use TimescaleDB time_bucket + first() to downsample to one row per
+        # bucket per ticker. This is far cheaper than ROW_NUMBER CTEs on large
+        # hypertables because TimescaleDB can scan chunks in order and the
+        # first() aggregate is optimised for ordered time-series data.
+        interval_literal = f"{int(bucket_sec)} seconds"
+        query = f"""
+            SELECT
+                time_bucket('{interval_literal}', timestamp) AS timestamp,
+                ticker,
+                first(bids,         timestamp) AS bids,
+                first(asks,         timestamp) AS asks,
+                first(obi,          timestamp) AS obi,
+                first(total_bid_vol, timestamp) AS total_bid_vol,
+                first(total_ask_vol, timestamp) AS total_ask_vol,
+                first(spread_cents,  timestamp) AS spread_cents
+            FROM ob_snapshots
+            WHERE {where_clause}
+            GROUP BY 1, 2
+            ORDER BY timestamp ASC
+        """
+    else:
+        query = f"""
+            SELECT timestamp, ticker, bids, asks, obi, total_bid_vol, total_ask_vol, spread_cents
+            FROM ob_snapshots
+            WHERE {where_clause}
+            ORDER BY timestamp ASC
+        """
 
     async with pool.connection() as conn:
         rows = await conn.execute(query, params)
