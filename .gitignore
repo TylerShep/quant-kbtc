@@ -43,6 +43,9 @@ frontend/dist/
 # Local AI agent transcripts
 .agent-transcripts/
 
+# Operational documentation with sensitive details
+HANDOFF.md
+
 # Logs
 *.log
 logs/
