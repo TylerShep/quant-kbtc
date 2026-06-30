@@ -40,6 +40,9 @@ frontend/dist/
 *.swp
 *.swo
 
+# Local AI agent transcripts
+.agent-transcripts/
+
 # Logs
 *.log
 logs/
