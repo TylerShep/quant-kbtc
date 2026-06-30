@@ -73,3 +73,7 @@ backend/ml/models/*
 *.pt
 *.pth
 *.parquet
+
+# Docker compose files for production/canary environments
+docker-compose.prod.yml
+docker-compose.canary.yml
